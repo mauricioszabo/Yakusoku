@@ -1,0 +1,185 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+(ns yakusoku.exec-test
+  (:require [clojure.test :refer [deftest testing is]]
+            [yakusoku.core :as p]
+            [yakusoku.exec :as exec]
+            [yakusoku.impl :as impl]))
+
+(defn- wait-for
+  "Polls pred until it holds or ms elapses. Returns true if it held, so a broken pool
+   fails the test rather than hanging it."
+  [ms pred]
+  (loop [remaining ms]
+    (cond
+      (pred) true
+      (neg? remaining) false
+      :else (do (cpp/clojure.core_native.sleep 10)
+                (recur (- remaining 10))))))
+
+(deftest executors
+  (testing "the inline executor runs on the calling thread"
+    (let [where (atom nil)
+          here (cpp/yakusoku.thread_id)]
+      (exec/exec! (exec/inline-executor)
+                  (fn [] (reset! where (cpp/yakusoku.thread_id))))
+      (is (= here (deref where)))))
+
+  (testing "the thread executor runs elsewhere"
+    (let [done (promise)
+          here (cpp/yakusoku.thread_id)]
+      (exec/exec! (exec/thread-executor)
+                  (fn [] (deliver done (= here (cpp/yakusoku.thread_id)))))
+      (is (false? (deref done)))))
+
+  (testing "executor? recognises executors"
+    (is (exec/executor? (exec/inline-executor)))
+    (is (not (exec/executor? {:kind :nope})))
+    (is (not (exec/executor? 42))))
+
+  (testing "available-parallelism reports something usable"
+    (is (pos? (exec/available-parallelism)))))
+
+(deftest pool-execution
+  (testing "a pool runs far more tasks than it has workers"
+    (let [pool (exec/pool 3)
+          done (atom 0)]
+      (try
+        (dotimes [_ 500]
+          (exec/exec! pool (fn [] (swap! done inc))))
+        (is (wait-for 5000 (fn [] (= 500 (deref done)))))
+        (finally
+          (exec/shutdown! pool)))))
+
+  (testing "work spreads across workers"
+    (let [pool (exec/pool 4)
+          threads (atom #{})
+          done (atom 0)]
+      (dotimes [_ 200]
+        (exec/exec! pool (fn []
+                           (swap! threads conj (cpp/yakusoku.thread_id))
+                           (cpp/clojure.core_native.sleep 1)
+                           (swap! done inc))))
+      (exec/shutdown! pool)
+      (is (= 200 (deref done)))
+      (is (< 1 (count (deref threads)))
+          "more than one worker should have participated")))
+
+  (testing "shutdown! drains queued work before returning"
+    (let [pool (exec/pool 2)
+          done (atom 0)]
+      (dotimes [_ 100]
+        (exec/exec! pool (fn [] (cpp/clojure.core_native.sleep 1) (swap! done inc))))
+      (exec/shutdown! pool)
+      (is (= 100 (deref done)) "every queued task must have run before shutdown returned")))
+
+  (testing "a task that throws does not take down its worker"
+    (let [pool (exec/pool 2)
+          done (atom 0)]
+      (try
+        (dotimes [_ 20]
+          (exec/exec! pool (fn [] (throw (ex-info "task blew up" {})))))
+        (dotimes [_ 20]
+          (exec/exec! pool (fn [] (swap! done inc))))
+        (is (wait-for 5000 (fn [] (= 20 (deref done))))
+            "the pool must keep working after a task throws")
+        (finally
+          (exec/shutdown! pool))))))
+
+(deftest scheduling
+  (testing "scheduled work runs after the delay, not before"
+    (let [pool (exec/pool 1)
+          fired (atom false)]
+      (try
+        (exec/schedule! pool 150 (fn [] (reset! fired true)))
+        (cpp/clojure.core_native.sleep 50)
+        (is (false? (deref fired)) "must not fire early")
+        (is (wait-for 2000 (fn [] (deref fired))) "must fire eventually")
+        (finally
+          (exec/shutdown! pool)))))
+
+  (testing "timers fire in deadline order, not submission order"
+    (let [pool (exec/pool 1)
+          order (atom [])]
+      (try
+        (exec/schedule! pool 200 (fn [] (swap! order conj :third)))
+        (exec/schedule! pool 50 (fn [] (swap! order conj :first)))
+        (exec/schedule! pool 120 (fn [] (swap! order conj :second)))
+        (is (wait-for 3000 (fn [] (= 3 (count (deref order))))))
+        (is (= [:first :second :third] (deref order)))
+        (finally
+          (exec/shutdown! pool))))))
+
+(deftest promises-across-pool-threads
+  (testing "promises resolved from pool workers are seen by the waiting thread"
+    (let [pool (exec/pool 4)]
+      (try
+        (let [ps (doall (clojure.core/map (fn [i]
+                                            (let [d (p/deferred)]
+                                              (exec/exec! pool (fn [] (p/resolve! d (* i 2))))
+                                              d))
+                                          (range 200)))]
+          (is (= (vec (clojure.core/map (fn [i] (* i 2)) (range 200)))
+                 (p/await-for! (p/all ps) 10000 ::timeout))))
+        (finally
+          (exec/shutdown! pool)))))
+
+  (testing "callbacks can be dispatched onto an executor"
+    (let [pool (exec/pool 2)]
+      (try
+        (let [ran-on (atom nil)
+              here (cpp/yakusoku.thread_id)
+              out (p/then (p/resolved 1)
+                          (fn [v] (reset! ran-on (= here (cpp/yakusoku.thread_id))) v)
+                          pool)]
+          (is (= 1 (p/await-for! out 5000 ::timeout)))
+          (is (false? (deref ran-on)) "the callback should have run on a pool thread"))
+        (finally
+          (exec/shutdown! pool))))))
+
+(deftest gc-stress
+  ;; The native layer keeps queued jank values alive with GC_MALLOC_UNCOLLECTABLE. If that
+  ;; discipline were wrong, a collection landing while tasks sit in Asio's queue would
+  ;; free values still in flight -- so this forces exactly that situation.
+  (testing "queued values survive collections happening mid-flight"
+    (let [pool (exec/pool 4)
+          n 2000
+          ;; Record which task indices ran and how many times each did, rather than only
+          ;; counting: that distinguishes a task that ran twice from one that never ran,
+          ;; and either from a corrupted payload.
+          runs (atom {})
+          bad (atom 0)]
+      (dotimes [i n]
+        (let [expected (str "payload-" i)]
+          (exec/exec! pool (fn []
+                             (when (not= expected (str "payload-" i))
+                               (swap! bad inc))
+                             (swap! runs (fn [m] (assoc m i (inc (get m i 0))))))))
+        (when (zero? (mod i 200))
+          (cpp/GC_gcollect)))
+      (exec/shutdown! pool)
+      (cpp/GC_gcollect)
+      (let [counts (deref runs)
+            ran-twice (filter (fn [i] (< 1 (get counts i 0))) (range n))
+            never-ran (filter (fn [i] (zero? (get counts i 0))) (range n))]
+        (is (empty? ran-twice) (str "tasks executed more than once: " (vec (take 5 ran-twice))))
+        (is (empty? never-ran) (str "tasks never executed: " (vec (take 5 never-ran))))
+        (is (zero? (deref bad)) "no queued value may be corrupted by a collection"))))
+
+  (testing "promise chains survive collections"
+    (let [pool (exec/pool 4)]
+      (try
+        (let [ps (doall (clojure.core/map
+                          (fn [i]
+                            (p/then (p/via pool (str "chain-" i))
+                                    (fn [s] (str s "-done"))))
+                          (range 300)))]
+          (cpp/GC_gcollect)
+          (let [result (p/await-for! (p/all ps) 15000 ::timeout)]
+            (is (not= ::timeout result))
+            (is (= "chain-0-done" (first result)))
+            (is (= 300 (count result)))))
+        (finally
+          (exec/shutdown! pool))))))

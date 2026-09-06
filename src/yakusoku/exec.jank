@@ -1,0 +1,122 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+(ns yakusoku.exec
+  "Executors and scheduling.
+
+   An executor is a plain map carrying a ::kind, dispatched by an ordinary function --
+   jank has no protocols, and none are needed for three cases.
+
+   The pool is Asio's io_context. Its worker threads are jank futures, not threads Asio
+   made for itself: jank's `future` registers the thread with the garbage collector and
+   conveys dynamic bindings, and borrowing it means Yakusoku inherits both instead of
+   reimplementing them."
+  (:refer-clojure :exclude [pool])
+  (:require [yakusoku.impl :as impl]))
+
+;; No #include here on purpose. jank's C++ environment is global -- yakusoku.impl, which
+;; this namespace requires, has already brought the header in, and including it a second
+;; time leaves jank's incremental parser mid-expression and miscompiles the next form.
+
+(defn executor?
+  "True if x is a Yakusoku executor."
+  [x]
+  (and (map? x) (contains? x ::kind)))
+
+(defn inline-executor
+  "An executor that runs each task immediately, on the calling thread. This is the
+   default: a promise chain should not cost a thread hop per link unless asked to."
+  []
+  {::kind :inline})
+
+(defn thread-executor
+  "An executor that runs each task on its own thread, via clojure.core/future.
+
+   jank's `future` spawns a raw std::thread per call with no pooling, so this costs one
+   OS thread per task. Use it for a handful of blocking operations; use a pool for
+   anything with volume."
+  []
+  {::kind :thread})
+
+(defn available-parallelism
+  "The reported core count, or 4 when the platform will not say."
+  []
+  (let [n (cpp/yakusoku.hardware_threads)]
+    (if (pos? n) n 4)))
+
+(defn pool
+  "Creates a thread pool of n workers (default: available-parallelism).
+
+   Returns an executor that must eventually be shut down -- its workers are live threads
+   and the process will not exit while they are running."
+  ([]
+   (pool (available-parallelism)))
+  ([n]
+   (impl/ensure-warm!)
+   (let [p (impl/make-pool)
+         ;; One definition, used for both the warm-up call and the real workers.
+         make-worker (fn [ctx] (fn [] (impl/run-loop! ctx)))]
+     ;; Compile the worker on THIS thread before any other thread can call it. jank
+     ;; compiles a function on first call, and several threads entering that compilation
+     ;; at once corrupts the JIT (interleaved Clang errors, then a segfault). Running the
+     ;; worker against an already-stopped context returns immediately and leaves the code
+     ;; compiled, so the real workers only ever execute it. yakusoku.impl warms its own
+     ;; functions the same way when it loads.
+     (let [warm (impl/make-pool)]
+       (impl/stop! warm)
+       ((make-worker warm)))
+     {::kind :pool
+      ::pool p
+      ::workers (doall (map (fn [_] (future-call (make-worker p))) (range n)))})))
+
+(def ^:private default-pool-delay
+  (delay (pool)))
+
+(defn default-pool
+  "A process-wide pool, created on first use so that merely requiring Yakusoku never
+   starts threads. Also backs scheduling."
+  []
+  (deref default-pool-delay))
+
+(defn exec!
+  "Submits a zero-arity function for execution. Returns nil."
+  [executor f]
+  (case (::kind executor)
+    :inline (do (f) nil)
+    :thread (do (impl/ensure-warm!) (future (f)) nil)
+    :pool (impl/post! (::pool executor) f)
+    (throw (ex-info "Not an executor" {:executor executor}))))
+
+(defn schedule!
+  "Runs a zero-arity function after ms milliseconds, on a pool. Timing comes from Asio's
+   steady_timer, so there is no polling and no timer thread of our own.
+
+   Scheduled work is never cancelled at the timer; Yakusoku cancels at the promise
+   instead, and the callback finds it already settled and does nothing."
+  ([ms f]
+   (schedule! (default-pool) ms f))
+  ([executor ms f]
+   (let [p (if (= :pool (::kind executor))
+             (::pool executor)
+             (::pool (default-pool)))]
+     (impl/schedule! p ms f))))
+
+(defn shutdown!
+  "Drains a pool: workers finish queued work and pending timers, then stop. Blocks until
+   every worker has exited. A no-op for the inline and thread executors."
+  [executor]
+  (when (= :pool (::kind executor))
+    (impl/drain! (::pool executor))
+    (doseq [w (::workers executor)]
+      (deref w)))
+  nil)
+
+(defn shutdown-now!
+  "Stops a pool immediately, abandoning queued work. Blocks until workers exit."
+  [executor]
+  (when (= :pool (::kind executor))
+    (impl/stop! (::pool executor))
+    (doseq [w (::workers executor)]
+      (deref w)))
+  nil)

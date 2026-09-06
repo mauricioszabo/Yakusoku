@@ -1,0 +1,203 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+(ns yakusoku.impl
+  "The bridge to Yakusoku's native core. Everything that touches C++ lives here, so
+   yakusoku.core and yakusoku.exec read as ordinary Clojure.
+
+   A promise handle is a map holding an opaque box around a `yakusoku::cell`. The map
+   wrapper exists so `promise?` can answer honestly: an opaque box carries no tag jank
+   can read back, so a bare box could not be told apart from any other boxed pointer.")
+
+(cpp/raw "#include <yakusoku.hpp>")
+
+;; Status codes, kept in sync with native/yakusoku.hpp.
+(def pending 0)
+(def resolved 1)
+(def rejected 2)
+(def cancelled 3)
+
+(def ^:private status->keyword
+  {0 :pending
+   1 :resolved
+   2 :rejected
+   3 :cancelled})
+
+;; ---------------------------------------------------------------- promises ----
+
+(defn promise?
+  "True if x is a Yakusoku promise handle."
+  [x]
+  (and (map? x) (contains? x ::cell)))
+
+(defn make-promise
+  "Creates a pending promise."
+  []
+  {::cell (cpp/box (cpp/yakusoku.cell_create))})
+
+;; A jank function cannot return a native pointer, so every one of these unboxes into a
+;; local and uses it there. That is the shape the interop guide recommends anyway.
+
+(defn status
+  "One of :pending, :resolved, :rejected, :cancelled."
+  [p]
+  (let [c (cpp/unbox (:* yakusoku.cell) (::cell p))]
+    (get status->keyword (cpp/yakusoku.cell_status c))))
+
+(defn value
+  "The settled value, or the error for a rejected promise. Meaningless while pending."
+  [p]
+  (let [c (cpp/unbox (:* yakusoku.cell) (::cell p))]
+    (cpp/yakusoku.cell_value c)))
+
+(defn attach!
+  "Registers a zero-arity callback. Returns true if the promise was ALREADY settled, in
+   which case nothing was registered and the caller must run the callback itself."
+  [p callback]
+  (let [c (cpp/unbox (:* yakusoku.cell) (::cell p))]
+    (cpp/yakusoku.cell_attach c callback)))
+
+(defn settle!
+  "Moves the promise out of :pending and runs its callbacks. Returns false if it was
+   already settled, so exactly one caller ever wins."
+  [p status-code v]
+  (let [c (cpp/unbox (:* yakusoku.cell) (::cell p))]
+    (cpp/yakusoku.cell_settle c (cpp/cast cpp/int status-code) v)))
+
+(defn await!
+  "Blocks the calling thread until the promise settles."
+  [p]
+  (let [c (cpp/unbox (:* yakusoku.cell) (::cell p))]
+    (cpp/yakusoku.cell_await c)))
+
+(defn await-for!
+  "Blocks until the promise settles or ms elapses. Returns true if it settled."
+  [p ms]
+  (let [c (cpp/unbox (:* yakusoku.cell) (::cell p))]
+    (cpp/yakusoku.cell_await_for c (cpp/cast cpp/long ms))))
+
+;; ------------------------------------------------------------------- pools ----
+
+(defn pool?
+  "True if x is a Yakusoku pool handle."
+  [x]
+  (and (map? x) (contains? x ::pool)))
+
+(defn make-pool
+  "Creates an Asio io_context with a work guard. It has no threads of its own until
+   run! is called on threads supplied by the caller."
+  []
+  {::pool (cpp/box (cpp/yakusoku.pool_create))})
+
+(defn post!
+  "Queues a zero-arity function to run on a pool worker."
+  [p f]
+  (let [ctx (cpp/unbox (:* yakusoku.pool) (::pool p))]
+    (cpp/yakusoku.pool_post ctx f)))
+
+(defn schedule!
+  "Queues a zero-arity function to run after ms milliseconds."
+  [p ms f]
+  (let [ctx (cpp/unbox (:* yakusoku.pool) (::pool p))]
+    (cpp/yakusoku.pool_schedule ctx (cpp/cast cpp/long ms) f)))
+
+(defn run-loop!
+  "Runs the pool's event loop on the calling thread. Returns when the pool is drained
+   or stopped."
+  [p]
+  (let [ctx (cpp/unbox (:* yakusoku.pool) (::pool p))]
+    (cpp/yakusoku.pool_run ctx)))
+
+(defn drain!
+  "Releases the work guard: workers return once queued work and pending timers finish."
+  [p]
+  (let [ctx (cpp/unbox (:* yakusoku.pool) (::pool p))]
+    (cpp/yakusoku.pool_drain ctx)))
+
+(defn stop!
+  "Stops immediately, abandoning queued work."
+  [p]
+  (let [ctx (cpp/unbox (:* yakusoku.pool) (::pool p))]
+    (cpp/yakusoku.pool_stop ctx)))
+
+;; ------------------------------------------------------- jank's own objects ----
+
+(defn native-promise?
+  "True for a promise made by clojure.core/promise. jank has no working `instance?`,
+   so this asks the runtime for the object's type the way core.jank's own `delay?` does."
+  [x]
+  (cpp/== cpp/jank.runtime.object_type.promise (.get_type x)))
+
+(defn native-future?
+  "True for a future made by clojure.core/future."
+  [x]
+  (cpp/== cpp/jank.runtime.object_type.future (.get_type x)))
+
+;; ------------------------------------------------------------------ errors ----
+
+(defmacro attempt
+  "Evaluates body, yielding [:ok value] or [:err thrown]. jank catches
+   cpp/jank.runtime.object_ref rather than a class, and this is the only place that
+   detail needs to appear.
+
+   The body runs inside a thunk deliberately. jank miscompiles a literal `(throw ...)`
+   in value position -- `(try [:ok (throw x)] ...)` and `(try (identity (throw x)) ...)`
+   both segfault, while a throw raised inside a *called* function unwinds correctly.
+   Calling a thunk turns the first shape into the second, so `(attempt (throw x))` is
+   safe to write."
+  [& body]
+  `(try
+     (let [v# ((fn [] ~@body))]
+       [:ok v#])
+     (catch cpp/jank.runtime.object_ref e#
+       [:err e#])))
+
+;; ------------------------------------------------------------------- warm-up ----
+
+(defn warm-up!
+  "Calls every function in this namespace once, so that all of them are compiled before
+   any Yakusoku thread exists.
+
+   jank compiles a function on its first call. Compiling a function whose body contains
+   C++ interop while running on a pool or timer worker corrupts the heap -- a promise
+   callback that schedules another promise reliably produced `double free or corruption`
+   until this ran. Compiling everything up front, on whichever thread requires this
+   namespace (the main thread, in practice), means workers only ever execute code that is
+   already compiled.
+
+   Everything here is thrown away; the pool never runs a worker and is stopped at once."
+  []
+  (let [p (make-promise)
+        pool (make-pool)]
+    (promise? p)
+    (status p)
+    (attach! p (fn [] nil))
+    (settle! p resolved nil)
+    (value p)
+    (await! p)
+    (await-for! p 0)
+    (native-promise? p)
+    (native-future? p)
+    (pool? pool)
+    (post! pool (fn [] nil))
+    (schedule! pool 0 (fn [] nil))
+    (drain! pool)
+    (stop! pool)
+    ;; The context is already stopped, so this returns immediately -- but it leaves the
+    ;; worker loop compiled, which is what pool workers will call.
+    (run-loop! pool)
+    nil))
+
+(def ^:private warmed
+  (delay (warm-up!)))
+
+(defn ensure-warm!
+  "Runs warm-up! once per process, the first time anything is about to start a thread.
+
+   Deliberately not run at namespace load: calling these functions while this very module
+   is still being loaded re-enters jank's compiler and segfaults. jank's delay is
+   mutex-guarded, so this is safe to call from anywhere."
+  []
+  (deref warmed)
+  nil)

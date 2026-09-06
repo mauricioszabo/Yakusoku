@@ -1,0 +1,391 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+(ns yakusoku.core-test
+  (:require [clojure.test :refer [deftest testing is]]
+            [yakusoku.core :as p]
+            [yakusoku.exec :as exec]))
+
+;; Every blocking wait in this suite is bounded, so a bug that stalls a promise fails the
+;; test instead of hanging the run.
+(def ^:private timeout-ms 2000)
+
+(defn- settled
+  "Waits for p, returning [:ok value], [:err reason], [:cancelled] or [:timeout].
+
+   Deliberately built on wait! rather than await!, so that a rejection is reported rather
+   than rethrown and a promise resolved with nil is not mistaken for a timeout."
+  [p]
+  (let [src (p/promise p)]
+    (if (p/wait! src timeout-ms)
+      (case (p/state src)
+        :resolved [:ok (p/extract src)]
+        :rejected [:err (p/error src)]
+        :cancelled [:cancelled]
+        [:pending])
+      [:timeout])))
+
+;; ------------------------------------------------------------------- state ----
+
+(deftest promise-lifecycle
+  (testing "a fresh promise is pending"
+    (let [p (p/deferred)]
+      (is (p/promise? p))
+      (is (p/pending? p))
+      (is (not (p/done? p)))
+      (is (= :pending (p/state p)))))
+
+  (testing "resolving settles exactly once"
+    (let [p (p/deferred)]
+      (is (true? (p/resolve! p 1)))
+      (is (false? (p/resolve! p 2)) "a second settle must not win")
+      (is (p/resolved? p))
+      (is (p/done? p))
+      (is (= 1 (p/extract p)))))
+
+  (testing "rejecting records the reason"
+    (let [p (p/deferred)
+          boom (ex-info "boom" {})]
+      (p/reject! p boom)
+      (is (p/rejected? p))
+      (is (= boom (p/error p)))
+      (is (nil? (p/extract p)))
+      (is (= ::none (p/extract p ::none)))))
+
+  (testing "cancelling is its own state"
+    (let [p (p/deferred)]
+      (p/cancel! p)
+      (is (p/cancelled? p))
+      (is (p/done? p))
+      (is (not (p/rejected? p)))))
+
+  (testing "resolved and rejected constructors"
+    (is (= 42 (p/extract (p/resolved 42))))
+    (is (p/rejected? (p/rejected (ex-info "x" {}))))))
+
+(deftest promise-coercion
+  (testing "a plain value becomes a resolved promise"
+    (is (= [:ok 7] (settled (p/promise 7)))))
+  (testing "a promise passes through unchanged"
+    (let [p (p/resolved 1)]
+      (is (identical? p (p/promise p)))))
+  (testing "a jank-native promise is wrapped"
+    (let [np (promise)]
+      (future (deliver np :from-native))
+      (is (= [:ok :from-native] (settled (p/promise np))))))
+  (testing "a jank-native future is wrapped"
+    (is (= [:ok 3] (settled (p/promise (future (+ 1 2))))))))
+
+;; ---------------------------------------------------------------- chaining ----
+
+(deftest then-chaining
+  (testing "then applies to the resolved value"
+    (is (= [:ok 2] (settled (p/then (p/resolved 1) inc)))))
+
+  (testing "then flattens a returned promise"
+    (is (= [:ok 10] (settled (p/then (p/resolved 1) (fn [_] (p/resolved 10)))))))
+
+  (testing "then flattens through several levels"
+    (is (= [:ok :deep]
+           (settled (p/then (p/resolved 1)
+                            (fn [_] (p/resolved (p/resolved :deep))))))))
+
+  (testing "then' does not flatten"
+    (let [inner (p/resolved 10)]
+      (is (= [:ok inner] (settled (p/then' (p/resolved 1) (fn [_] inner)))))))
+
+  (testing "callbacks attached after settling still run"
+    (let [p (p/resolved 1)]
+      (is (= [:ok 2] (settled (p/then p inc))))))
+
+  (testing "callbacks attached before settling run on settle"
+    (let [d (p/deferred)
+          out (p/then d inc)]
+      (is (p/pending? out))
+      (p/resolve! d 1)
+      (is (= [:ok 2] (settled out)))))
+
+  (testing "chain threads through several functions"
+    (is (= [:ok 4] (settled (p/chain (p/resolved 1) inc inc inc)))))
+
+  (testing "map and fmap"
+    (is (= [:ok 2] (settled (p/map inc (p/resolved 1)))))
+    (is (= [:ok 2] (settled (p/fmap (p/resolved 1) inc)))))
+
+  (testing "bind flattens"
+    (is (= [:ok 5] (settled (p/bind (p/resolved 4) (fn [v] (p/resolved (inc v)))))))))
+
+(deftest error-propagation
+  (testing "a rejection skips then and reaches catch"
+    (let [boom (ex-info "boom" {})]
+      (is (= [:ok :recovered]
+             (settled (-> (p/rejected boom)
+                          (p/then (fn [_] :never))
+                          (p/catch (fn [_] :recovered))))))))
+
+  (testing "a throw inside then rejects the chain"
+    (let [r (settled (p/then (p/resolved 1) (fn [_] (throw (ex-info "inside" {})))))]
+      (is (= :err (nth r 0)))
+      (is (= "inside" (ex-message (nth r 1))))))
+
+  (testing "catch does not run for a resolved promise"
+    (is (= [:ok 1] (settled (p/catch (p/resolved 1) (fn [_] :nope))))))
+
+  (testing "a rejection propagates through a long chain"
+    (let [r (settled (-> (p/resolved 1)
+                         (p/then (fn [_] (throw (ex-info "early" {}))))
+                         (p/then inc)
+                         (p/then inc)))]
+      (is (= :err (nth r 0)))
+      (is (= "early" (ex-message (nth r 1))))))
+
+  (testing "catch can itself return a promise, which is flattened"
+    (is (= [:ok :async-recovery]
+           (settled (p/catch (p/rejected (ex-info "x" {}))
+                             (fn [_] (p/resolved :async-recovery)))))))
+
+  (testing "merr is catch"
+    (is (= [:ok :ok] (settled (p/merr (p/rejected (ex-info "x" {})) (fn [_] :ok)))))))
+
+(deftest cancellation
+  (testing "cancellation propagates downstream rather than resolving or rejecting"
+    (let [d (p/deferred)
+          out (-> d (p/then inc) (p/catch (fn [_] :recovered)))]
+      (p/cancel! d)
+      (is (= [:cancelled] (settled out)) "catch must not treat a cancel as an error"))))
+
+(deftest handle-and-finally
+  (testing "handle sees the value on success"
+    (is (= [:ok [1 nil]]
+           (settled (p/handle (p/resolved 1) (fn [v e] [v e]))))))
+
+  (testing "handle sees the error on failure, and recovers"
+    (let [boom (ex-info "boom" {})]
+      (is (= [:ok [nil boom]]
+             (settled (p/handle (p/rejected boom) (fn [v e] [v e])))))))
+
+  (testing "finally runs on success and passes the value through"
+    (let [ran (atom false)]
+      (is (= [:ok 1] (settled (p/finally (p/resolved 1) (fn [_ _] (reset! ran true))))))
+      (is (true? @ran))))
+
+  (testing "finally runs on failure and preserves the rejection"
+    (let [ran (atom false)
+          r (settled (p/finally (p/rejected (ex-info "x" {})) (fn [_ _] (reset! ran true))))]
+      (is (true? @ran))
+      (is (= :err (nth r 0)))))
+
+  (testing "a throw inside finally rejects the chain"
+    (let [r (settled (p/finally (p/resolved 1) (fn [_ _] (throw (ex-info "in-finally" {})))))]
+      (is (= :err (nth r 0)))
+      (is (= "in-finally" (ex-message (nth r 1)))))))
+
+;; ------------------------------------------------------------ combinators ----
+
+(deftest all-combinator
+  (testing "resolves with values in order, not completion order"
+    (let [slow (p/delay 120 :slow)
+          fast (p/resolved :fast)]
+      (is (= [:ok [:slow :fast]] (settled (p/all [slow fast]))))))
+
+  (testing "mixes plain values in"
+    (is (= [:ok [1 2 3]] (settled (p/all [1 (p/resolved 2) 3])))))
+
+  (testing "an empty collection resolves immediately with an empty vector"
+    (is (= [:ok []] (settled (p/all [])))))
+
+  (testing "rejects as soon as any promise rejects"
+    (let [r (settled (p/all [(p/resolved 1)
+                             (p/rejected (ex-info "nope" {}))
+                             (p/delay 5000 :never)]))]
+      (is (= :err (nth r 0)))
+      (is (= "nope" (ex-message (nth r 1)))))))
+
+(deftest race-combinator
+  (testing "the first to settle wins"
+    (is (= [:ok :fast] (settled (p/race [(p/delay 500 :slow) (p/delay 10 :fast)])))))
+  (testing "a rejection can win the race"
+    (is (= :err (nth (settled (p/race [(p/delay 500 :slow)
+                                       (p/rejected (ex-info "quick-fail" {}))]))
+                     0)))))
+
+(deftest any-combinator
+  (testing "resolves with the first success, ignoring earlier failures"
+    (is (= [:ok :good]
+           (settled (p/any [(p/rejected (ex-info "a" {}))
+                            (p/delay 20 :good)])))))
+  (testing "rejects with every reason when all fail"
+    (let [r (settled (p/any [(p/rejected (ex-info "a" {}))
+                             (p/rejected (ex-info "b" {}))]))]
+      (is (= :err (nth r 0)))
+      (is (= 2 (count (nth r 1)))))))
+
+(deftest wait-all-combinator
+  (testing "waits for every promise regardless of outcome"
+    (let [r (settled (p/wait-all [(p/resolved 1)
+                                  (p/rejected (ex-info "x" {}))
+                                  (p/delay 30 :late)]))]
+      (is (= [:ok nil] r)))))
+
+;; ---------------------------------------------------------------- blocking ----
+
+(defn- await-message [p]
+  (try
+    (p/await! p)
+    :no-throw
+    (catch cpp/jank.runtime.object_ref e
+      (ex-message e))))
+
+(deftest blocking-waits
+  (testing "await! returns the value"
+    (is (= 1 (p/await! (p/resolved 1)))))
+
+  (testing "await! blocks until another thread settles the promise"
+    (let [d (p/deferred)]
+      (future (cpp/clojure.core_native.sleep 100) (p/resolve! d :late))
+      (is (= :late (p/await! d)))))
+
+  (testing "await! rethrows a rejection"
+    (let [r (await-message (p/rejected (ex-info "thrown" {})))]
+      (is (= "thrown" r))))
+
+  (testing "await-for! gives up and returns the timeout value"
+    (is (= ::gave-up (p/await-for! (p/deferred) 50 ::gave-up))))
+
+  (testing "await-for! returns the value when it arrives in time"
+    (is (= :in-time (p/await-for! (p/delay 20 :in-time) 1000 ::gave-up)))))
+
+;; ---------------------------------------------------------------- timing ----
+
+(deftest timing
+  (testing "delay resolves after the interval"
+    (is (= [:ok :done] (settled (p/delay 30 :done)))))
+
+  (testing "timeout lets a fast promise through"
+    (is (= [:ok :quick] (settled (p/timeout (p/delay 10 :quick) 1000)))))
+
+  (testing "timeout rejects a slow promise"
+    (let [r (settled (p/timeout (p/delay 5000 :never) 50))]
+      (is (= :err (nth r 0)))))
+
+  (testing "timeout can reject with a supplied value"
+    (let [r (settled (p/timeout (p/deferred) 30 :too-slow))]
+      (is (= [:err :too-slow] r)))))
+
+;; ----------------------------------------------------------------- macros ----
+
+(deftest macros
+  (testing "p/let awaits each binding in turn"
+    (is (= [:ok 6] (settled (p/let [a (p/delay 20 1)
+                                    b (p/resolved 2)
+                                    c 3]
+                              (+ a b c))))))
+
+  (testing "p/let bindings can depend on earlier ones"
+    (is (= [:ok 4] (settled (p/let [a (p/resolved 2)
+                                    b (p/resolved (* a 2))]
+                              b)))))
+
+  (testing "p/let short-circuits on rejection"
+    (let [ran (atom false)
+          r (settled (p/let [a (p/rejected (ex-info "stop" {}))
+                             b (do (reset! ran true) 2)]
+                       [a b]))]
+      (is (= :err (nth r 0)))
+      (is (false? @ran) "later bindings must not be evaluated")))
+
+  (testing "p/plet evaluates bindings in parallel"
+    (is (= [:ok 3] (settled (p/plet [a (p/delay 40 1)
+                                     b (p/delay 40 2)]
+                              (+ a b))))))
+
+  (testing "p/do sequences forms and yields the last"
+    (let [order (atom [])]
+      (is (= [:ok :third]
+             (settled (p/do
+                        (swap! order conj :first)
+                        (p/delay 20 (swap! order conj :second))
+                        (do (swap! order conj :third) :third)))))
+      (is (= [:first :second :third] @order))))
+
+  (testing "p/-> threads the resolved value"
+    (is (= [:ok 4] (settled (p/-> (p/resolved 1) inc inc inc)))))
+
+  (testing "p/->> threads as the last argument"
+    (is (= [:ok [2 3]] (settled (p/->> (p/resolved [1 2])
+                                       (clojure.core/map inc)
+                                       vec)))))
+
+  (testing "p/future runs on another thread"
+    (is (= [:ok 3] (settled (p/future (+ 1 2))))))
+
+  (testing "p/future captures a throw as a rejection"
+    (is (= :err (nth (settled (p/future (throw (ex-info "in-future" {})))) 0))))
+
+  (testing "p/via runs on a given executor"
+    (let [pool (exec/pool 2)]
+      (try
+        (is (= [:ok 9] (settled (p/via pool (* 3 3)))))
+        (finally
+          (exec/shutdown! pool))))))
+
+;; ------------------------------------------------------------------ create ----
+
+(deftest create-promise
+  (testing "resolve callback"
+    (is (= [:ok :made] (settled (p/create (fn [resolve _] (resolve :made)))))))
+
+  (testing "reject callback"
+    (is (= :err (nth (settled (p/create (fn [_ reject] (reject (ex-info "no" {}))))) 0))))
+
+  (testing "a throw in the body rejects"
+    (is (= :err (nth (settled (p/create (fn [_ _] (throw (ex-info "boom" {}))))) 0))))
+
+  (testing "resolving asynchronously"
+    (is (= [:ok :later]
+           (settled (p/create (fn [resolve _]
+                                (future (cpp/clojure.core_native.sleep 50)
+                                        (resolve :later)))))))))
+
+(deftest loop-and-doseq
+  (testing "p/loop iterates, awaiting a promise each time"
+    (is (= [:ok 5]
+           (settled (p/loop [n 0]
+                      (if (< n 5)
+                        (p/then (p/delay 5 (inc n)) p/recur)
+                        n))))))
+
+  (testing "p/loop can finish without ever recurring"
+    (is (= [:ok :immediate] (settled (p/loop [] :immediate)))))
+
+  (testing "p/loop carries several bindings"
+    (is (= [:ok 10]
+           (settled (p/loop [i 0 acc 0]
+                      (if (< i 5)
+                        (p/recur (inc i) (+ acc i))
+                        acc))))))
+
+  (testing "p/loop does not grow the stack over many iterations"
+    (is (= [:ok 2000]
+           (settled (p/loop [n 0]
+                      (if (< n 2000)
+                        (p/recur (inc n))
+                        n))))))
+
+  (testing "a rejection inside p/loop propagates out"
+    (is (= :err (nth (settled (p/loop [n 0]
+                                (if (< n 2)
+                                  (p/then (p/resolved (inc n)) p/recur)
+                                  (p/rejected (ex-info "loop failed" {})))))
+                     0))))
+
+  (testing "p/doseq runs the body once per item, in order"
+    (let [seen (atom [])]
+      (is (= [:ok nil]
+             (settled (p/doseq [x [1 2 3]]
+                        (p/then (p/delay 5 x) (fn [v] (swap! seen conj v)))))))
+      (is (= [1 2 3] @seen))))
+
+  (testing "p/doseq over an empty collection"
+    (is (= [:ok nil] (settled (p/doseq [x []] (throw (ex-info "never" {}))))))))

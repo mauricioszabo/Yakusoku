@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Prints the flags jank needs to compile and link Yakusoku. Sourced by bin/test and
+# usable directly: jank run $(bin/jank-flags) --module-path src my_program.jank
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [ -f "${root}/third-party/asio/asio/include/asio.hpp" ]; then
+  asio_include="${root}/third-party/asio/asio/include"
+elif [ -f /usr/local/include/asio.hpp ]; then
+  asio_include="/usr/local/include"
+else
+  asio_include="/usr/include"
+fi
+
+echo -n "-DASIO_STANDALONE -DASIO_NO_DEPRECATED -DASIO_SEPARATE_COMPILATION "
+echo -n "-I ${asio_include} -I ${root}/native "
+echo -n "-L ${root}/target/native -l yakusoku-asio"

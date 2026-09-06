@@ -1,0 +1,639 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+(ns yakusoku.core
+  "A promise library for jank, shaped after promesa.
+
+   Require it as:
+
+     (require '[yakusoku.core :as p])
+
+   Callbacks run on the thread that settles the promise unless an executor is passed as
+   the last argument, so a chain costs nothing extra by default.
+
+   Note that `@promise` does not work: jank has no `deftype`, and its object-type enum is
+   not extensible from user code, so no value we can construct carries deref behaviour.
+   Use `p/await!`, `p/deref` or `p/deref-for` instead."
+  (:refer-clojure :exclude [map mapcat deref delay future let loop promise recur
+                            doseq -> ->>])
+  (:require [yakusoku.impl :as impl]
+            [yakusoku.exec :as exec]))
+
+(declare promise then deliver-value! ensure-warm!)
+
+
+
+;; ------------------------------------------------------------- construction ----
+
+(defn deferred
+  "Creates a pending promise, to be settled with resolve!, reject! or cancel!."
+  []
+  ;; Every promise in the library is born here, which makes this the one place that can
+  ;; guarantee the whole namespace is compiled before any worker thread touches it.
+  (ensure-warm!)
+  (impl/make-promise))
+
+(defn promise?
+  "True if x is a Yakusoku promise."
+  [x]
+  (impl/promise? x))
+
+(defn resolve!
+  "Resolves a pending promise. Returns true if this call settled it."
+  [p v]
+  (impl/settle! p impl/resolved v))
+
+(defn reject!
+  "Rejects a pending promise. Returns true if this call settled it."
+  [p e]
+  (impl/settle! p impl/rejected e))
+
+(defn cancel!
+  "Cancels a pending promise. Returns true if this call settled it. Callbacks downstream
+   of a cancelled promise are cancelled too, rather than resolved or rejected."
+  [p]
+  (impl/settle! p impl/cancelled nil))
+
+(defn resolved
+  "A promise already resolved with v."
+  [v]
+  (doto (deferred) (resolve! v)))
+
+(defn rejected
+  "A promise already rejected with e."
+  [e]
+  (doto (deferred) (reject! e)))
+
+;; ------------------------------------------------------------------- state ----
+
+(defn state
+  "One of :pending, :resolved, :rejected, :cancelled."
+  [p]
+  (impl/status p))
+
+(defn pending?   [p] (= :pending (impl/status p)))
+(defn resolved?  [p] (= :resolved (impl/status p)))
+(defn rejected?  [p] (= :rejected (impl/status p)))
+(defn cancelled? [p] (= :cancelled (impl/status p)))
+
+(defn done?
+  "True once the promise has settled, however it settled."
+  [p]
+  (not= :pending (impl/status p)))
+
+(defn extract
+  "The resolved value, or default (nil) if the promise is not resolved."
+  ([p] (extract p nil))
+  ([p default]
+   (if (resolved? p) (impl/value p) default)))
+
+(defn error
+  "The rejection reason, or nil if the promise is not rejected."
+  [p]
+  (when (rejected? p) (impl/value p)))
+
+;; -------------------------------------------------------------- internals ----
+
+(defn- on-settle
+  "Runs the zero-arity thunk f once p settles. With no executor, f runs on whichever
+   thread settles p -- or immediately, on this thread, if p is already settled."
+  [p executor f]
+  (clojure.core/let [callback (if executor
+                                (fn [] (exec/exec! executor f))
+                                f)]
+    ;; attach! returns true when the promise was already settled, in which case nothing
+    ;; was registered and we run the callback ourselves. That return value is decided
+    ;; under the same lock settling takes, which is what makes this race-free.
+    (when (impl/attach! p callback)
+      (callback)))
+  nil)
+
+(defn- copy-settlement!
+  "Settles out the same way src settled."
+  [src out]
+  (case (impl/status src)
+    :resolved (deliver-value! out (impl/value src))
+    :rejected (reject! out (impl/value src))
+    :cancelled (cancel! out)
+    nil))
+
+(defn- deliver-value!
+  "Resolves out with v, flattening if v is itself a promise."
+  [out v]
+  (if (impl/promise? v)
+    (on-settle v nil (fn [] (copy-settlement! v out)))
+    (resolve! out v)))
+
+(defn- from-blocking
+  "Wraps a jank-native promise or future. Costs one thread: jank's own promises expose no
+   completion callback, only a blocking deref."
+  [x]
+  (clojure.core/let [out (deferred)]
+    (exec/exec! (exec/thread-executor)
+                (fn []
+                  (clojure.core/let [r (impl/attempt (clojure.core/deref x))]
+                    (if (= :ok (nth r 0))
+                      (deliver-value! out (nth r 1))
+                      (reject! out (nth r 1))))))
+    out))
+
+;; ----------------------------------------------------------- coercion ----
+
+(defn promise
+  "Coerces x to a promise: a promise passes through, a jank-native promise or future is
+   wrapped (at the cost of a thread), and anything else becomes a resolved promise."
+  [x]
+  (cond
+    (impl/promise? x) x
+    (impl/native-promise? x) (from-blocking x)
+    (impl/native-future? x) (from-blocking x)
+    :else (resolved x)))
+
+(defn create
+  "Creates a promise from a function of two arguments, resolve and reject.
+
+     (p/create (fn [resolve reject] (resolve 42)))
+
+   With an executor, the function runs there rather than on the calling thread."
+  ([f] (create f nil))
+  ([f executor]
+   (clojure.core/let [out (deferred)
+                      run (fn []
+                            (clojure.core/let
+                              [r (impl/attempt
+                                   (f (fn [v] (deliver-value! out v))
+                                      (fn [e] (reject! out e))))]
+                              (when (= :err (nth r 0))
+                                (reject! out (nth r 1)))))]
+     (if executor
+       (exec/exec! executor run)
+       (run))
+     out)))
+
+;; ---------------------------------------------------------------- chaining ----
+
+(defn then
+  "Applies f to the resolved value of p and resolves with the result, flattening it if it
+   is itself a promise. A rejection passes through untouched; so does a cancellation."
+  ([p f] (then p f nil))
+  ([p f executor]
+   (clojure.core/let [src (promise p)
+                      out (deferred)]
+     (on-settle src executor
+                (fn []
+                  (case (impl/status src)
+                    :resolved (clojure.core/let [r (impl/attempt (f (impl/value src)))]
+                                (if (= :ok (nth r 0))
+                                  (deliver-value! out (nth r 1))
+                                  (reject! out (nth r 1))))
+                    :rejected (reject! out (impl/value src))
+                    :cancelled (cancel! out)
+                    nil)))
+     out)))
+
+(defn then'
+  "Like then, but does not flatten: a promise returned by f becomes the resolved value."
+  ([p f] (then' p f nil))
+  ([p f executor]
+   (clojure.core/let [src (promise p)
+                      out (deferred)]
+     (on-settle src executor
+                (fn []
+                  (case (impl/status src)
+                    :resolved (clojure.core/let [r (impl/attempt (f (impl/value src)))]
+                                (if (= :ok (nth r 0))
+                                  (resolve! out (nth r 1))
+                                  (reject! out (nth r 1))))
+                    :rejected (reject! out (impl/value src))
+                    :cancelled (cancel! out)
+                    nil)))
+     out)))
+
+(defn map
+  "Applies f to the resolved value, without flattening. Argument order matches
+   clojure.core/map, so it threads well with ->>."
+  ([f p] (then' p f))
+  ([f p executor] (then' p f executor)))
+
+(defn fmap
+  "Alias of map, in promise-first argument order."
+  ([p f] (then' p f))
+  ([p f executor] (then' p f executor)))
+
+(defn bind
+  "Applies f to the resolved value; f must return a promise, which is flattened."
+  ([p f] (then p f))
+  ([p f executor] (then p f executor)))
+
+(defn mapcat
+  "bind with clojure.core/mapcat's argument order."
+  ([f p] (then p f))
+  ([f p executor] (then p f executor)))
+
+(defn chain
+  "Threads a promise through a series of then calls."
+  [p & fs]
+  (clojure.core/reduce (fn [acc f] (then acc f)) (promise p) fs))
+
+(defn catch
+  "Applies f to the rejection reason and resolves with the result, recovering the chain.
+   A resolved promise passes through untouched."
+  ([p f] (catch p f nil))
+  ([p f executor]
+   (clojure.core/let [src (promise p)
+                      out (deferred)]
+     (on-settle src executor
+                (fn []
+                  (case (impl/status src)
+                    :resolved (resolve! out (impl/value src))
+                    :rejected (clojure.core/let [r (impl/attempt (f (impl/value src)))]
+                                (if (= :ok (nth r 0))
+                                  (deliver-value! out (nth r 1))
+                                  (reject! out (nth r 1))))
+                    :cancelled (cancel! out)
+                    nil)))
+     out)))
+
+(defn merr
+  "Alias of catch, for symmetry with promesa's naming."
+  ([p f] (catch p f))
+  ([p f executor] (catch p f executor)))
+
+(defn handle
+  "Applies f to both outcomes as (f value error) -- exactly one of which is non-nil --
+   and resolves with the result, flattening it."
+  ([p f] (handle p f nil))
+  ([p f executor]
+   (clojure.core/let [src (promise p)
+                      out (deferred)]
+     (on-settle src executor
+                (fn []
+                  (case (impl/status src)
+                    :cancelled (cancel! out)
+                    (clojure.core/let
+                      [rejected? (= :rejected (impl/status src))
+                       r (impl/attempt (if rejected?
+                                         (f nil (impl/value src))
+                                         (f (impl/value src) nil)))]
+                      (if (= :ok (nth r 0))
+                        (deliver-value! out (nth r 1))
+                        (reject! out (nth r 1)))))))
+     out)))
+
+(defn finally
+  "Runs f for its side effects once p settles, as (f value error), and passes p's own
+   outcome through unchanged. f's return value is ignored; if f throws, the chain is
+   rejected with what it threw."
+  ([p f] (finally p f nil))
+  ([p f executor]
+   (clojure.core/let [src (promise p)
+                      out (deferred)]
+     (on-settle src executor
+                (fn []
+                  (clojure.core/let
+                    [st (impl/status src)
+                     r (impl/attempt (if (= :rejected st)
+                                       (f nil (impl/value src))
+                                       (f (impl/value src) nil)))]
+                    (if (= :err (nth r 0))
+                      (reject! out (nth r 1))
+                      (copy-settlement! src out)))))
+     out)))
+
+(defn fnly
+  "Alias of finally."
+  ([p f] (finally p f))
+  ([p f executor] (finally p f executor)))
+
+;; ------------------------------------------------------------ combinators ----
+
+(defn all
+  "Waits for every promise in coll and resolves with a vector of their values, in order.
+   Rejects as soon as any of them rejects."
+  ([coll] (all coll nil))
+  ([coll executor]
+   (clojure.core/let [ps (clojure.core/mapv promise coll)
+                      n (count ps)
+                      out (deferred)]
+     (if (zero? n)
+       (resolve! out [])
+       (clojure.core/let [results (atom (vec (repeat n nil)))
+                          remaining (atom n)]
+         (dotimes [i n]
+           (clojure.core/let [p (nth ps i)]
+             (on-settle p executor
+                        (fn []
+                          (case (impl/status p)
+                            :resolved (do
+                                        (swap! results assoc i (impl/value p))
+                                        (when (zero? (swap! remaining dec))
+                                          (resolve! out (clojure.core/deref results))))
+                            :rejected (reject! out (impl/value p))
+                            :cancelled (cancel! out)
+                            nil)))))))
+     out)))
+
+(defn race
+  "Settles the same way as whichever promise in coll settles first."
+  ([coll] (race coll nil))
+  ([coll executor]
+   (clojure.core/let [ps (clojure.core/mapv promise coll)
+                      out (deferred)]
+     (clojure.core/doseq [p ps]
+       (on-settle p executor (fn [] (copy-settlement! p out))))
+     out)))
+
+(defn any
+  "Resolves with the value of the first promise to resolve. If every promise rejects,
+   rejects with a vector of all the reasons."
+  ([coll] (any coll nil))
+  ([coll executor]
+   (clojure.core/let [ps (clojure.core/mapv promise coll)
+                      n (count ps)
+                      out (deferred)]
+     (if (zero? n)
+       (reject! out (ex-info "No promises to wait on" {:coll coll}))
+       (clojure.core/let [errors (atom (vec (repeat n nil)))
+                          remaining (atom n)]
+         (dotimes [i n]
+           (clojure.core/let [p (nth ps i)]
+             (on-settle p executor
+                        (fn []
+                          (case (impl/status p)
+                            :resolved (resolve! out (impl/value p))
+                            (do
+                              (swap! errors assoc i (impl/value p))
+                              (when (zero? (swap! remaining dec))
+                                (reject! out (clojure.core/deref errors)))))))))))
+     out)))
+
+(defn wait-all
+  "Waits for every promise in coll to settle, however each settles, and resolves with nil."
+  ([coll] (wait-all coll nil))
+  ([coll executor]
+   (clojure.core/let [ps (clojure.core/mapv promise coll)
+                      n (count ps)
+                      out (deferred)]
+     (if (zero? n)
+       (resolve! out nil)
+       (clojure.core/let [remaining (atom n)]
+         (clojure.core/doseq [p ps]
+           (on-settle p executor
+                      (fn []
+                        (when (zero? (swap! remaining dec))
+                          (resolve! out nil)))))))
+     out)))
+
+;; ---------------------------------------------------------------- blocking ----
+
+(defn await!
+  "Blocks the calling thread until p settles, then returns its value. Rethrows the
+   rejection reason; returns nil for a cancelled promise.
+
+   This is what `@promise` would be if jank let us define deref on our own types."
+  [p]
+  (clojure.core/let [src (promise p)]
+    (impl/await! src)
+    (case (impl/status src)
+      :resolved (impl/value src)
+      :rejected (throw (impl/value src))
+      nil)))
+
+(defn deref
+  "Alias of await!."
+  [p]
+  (await! p))
+
+(defn wait!
+  "Blocks until p settles, or at most ms if given. Returns true if it settled.
+
+   Unlike await!, this reports settlement without looking at the outcome and without
+   rethrowing a rejection -- useful when you want to inspect `state` yourself."
+  ([p]
+   (impl/await! (promise p))
+   true)
+  ([p ms]
+   (impl/await-for! (promise p) ms)))
+
+(defn await-for!
+  "Blocks for at most ms. Returns the value if the promise settled in time, otherwise
+   timeout-val (nil by default). Rethrows a rejection.
+
+   jank's own (deref ref ms val) is an unimplemented stub, so this is the only way to
+   wait with a timeout."
+  ([p ms] (await-for! p ms nil))
+  ([p ms timeout-val]
+   (clojure.core/let [src (promise p)]
+     (if (impl/await-for! src ms)
+       (case (impl/status src)
+         :resolved (impl/value src)
+         :rejected (throw (impl/value src))
+         nil)
+       timeout-val))))
+
+;; ---------------------------------------------------------------- timing ----
+
+(defn delay
+  "A promise that resolves with v (nil by default) after ms milliseconds. Timing comes
+   from Asio's steady_timer."
+  ([ms] (delay ms nil))
+  ([ms v]
+   (clojure.core/let [out (deferred)]
+     (exec/schedule! ms (fn [] (resolve! out v)))
+     out)))
+
+(defn timeout
+  "Settles as p does, unless ms elapses first -- in which case it rejects with
+   timeout-val, or an ex-info if none is given.
+
+   Nothing is cancelled at the timer: whichever of the two finishes first settles the
+   promise, and the loser finds it settled and does nothing."
+  ([p ms] (timeout p ms nil))
+  ([p ms timeout-val]
+   (clojure.core/let [src (promise p)
+                      out (deferred)]
+     (on-settle src nil (fn [] (copy-settlement! src out)))
+     (exec/schedule! ms
+                     (fn []
+                       (reject! out (or timeout-val
+                                        (ex-info "Operation timed out" {:timeout ms})))))
+     out)))
+
+;; ----------------------------------------------------------------- macros ----
+
+(defmacro let
+  "Like clojure.core/let, but every binding is awaited before the next is evaluated.
+   Returns a promise of the body's value. A rejection anywhere short-circuits the rest."
+  [bindings & body]
+  (if (empty? bindings)
+    `(do ~@body)
+    `(then (promise ~(second bindings))
+           (fn [~(first bindings)]
+             (let ~(vec (drop 2 bindings)) ~@body)))))
+
+(defmacro plet
+  "Like let, but the bindings do not wait on each other -- they are evaluated together
+   and awaited in parallel. Bindings must therefore not refer to one another."
+  [bindings & body]
+  (clojure.core/let [names (vec (take-nth 2 bindings))
+                     exprs (vec (take-nth 2 (rest bindings)))]
+    `(then (all [~@exprs])
+           (fn [values#]
+             (clojure.core/let [~names values#]
+               ~@body)))))
+
+(defmacro future
+  "Runs body on its own thread and returns a promise of its value. One OS thread per
+   call, since that is what jank's future costs; prefer `via` with a pool for volume."
+  [& body]
+  `(create (fn [resolve# reject#]
+             (clojure.core/let [r# (impl/attempt (clojure.core/let [v# ((fn [] ~@body))] v#))]
+               (if (= :ok (nth r# 0))
+                 (resolve# (nth r# 1))
+                 (reject# (nth r# 1)))))
+           (exec/thread-executor)))
+
+(defmacro via
+  "Runs body on the given executor and returns a promise of its value."
+  [executor & body]
+  `(create (fn [resolve# reject#]
+             (clojure.core/let [r# (impl/attempt (clojure.core/let [v# ((fn [] ~@body))] v#))]
+               (if (= :ok (nth r# 0))
+                 (resolve# (nth r# 1))
+                 (reject# (nth r# 1)))))
+           ~executor))
+
+(defmacro ->
+  "Like clojure.core/->, threading through then: each step receives the resolved value
+   of the previous one."
+  [x & forms]
+  (clojure.core/reduce (fn [acc form]
+                         (clojure.core/let [[f & args] (if (seq? form) form (list form))]
+                           `(then ~acc (fn [v#] (~f v# ~@args)))))
+                       `(promise ~x)
+                       forms))
+
+(defmacro ->>
+  "Like clojure.core/->>, threading through then: each step receives the resolved value
+   of the previous one as its last argument."
+  [x & forms]
+  (clojure.core/reduce (fn [acc form]
+                         (clojure.core/let [[f & args] (if (seq? form) form (list form))]
+                           `(then ~acc (fn [v#] (~f ~@args v#)))))
+                       `(promise ~x)
+                       forms))
+
+(defn recur?
+  "True for the marker p/recur returns."
+  [x]
+  (and (map? x) (contains? x ::recur)))
+
+(defn recur
+  "Inside a p/loop body, asks for another iteration with these bindings. Returning
+   anything else ends the loop with that value."
+  [& args]
+  {::recur (vec args)})
+
+(defn- run-loop
+  "Drives one p/loop: calls f with args, and if the result asks to recur, goes round again
+   with the new bindings. Chained rather than nested, so iterations do not grow the stack.
+
+   This is a top-level function on purpose. Expressing it as a self-referential fn nested
+   inside the macro expansion crashes jank's compiler in ir::hoist_scoped_values."
+  [f args]
+  (then (apply f args)
+        (fn [result]
+          (if (recur? result)
+            (run-loop f (::recur result))
+            result))))
+
+(defmacro loop
+  "Like clojure.core/loop, but each iteration may yield a promise, which is awaited before
+   the next begins. Call p/recur to iterate; return anything else to finish. Yields a
+   promise of the final value.
+
+     (p/loop [n 0]
+       (if (< n 3)
+         (p/then (p/delay 10 (inc n)) p/recur)
+         n))"
+  [bindings & body]
+  (clojure.core/let [names (vec (take-nth 2 bindings))
+                     inits (vec (take-nth 2 (rest bindings)))]
+    `(then (all [~@inits])
+           (fn [values#]
+             (run-loop (fn [~@names] (do ~@body)) values#)))))
+
+(defmacro doseq
+  "Like clojure.core/doseq over a single binding, but sequential in promise terms: each
+   iteration is awaited before the next starts. Yields a promise of nil."
+  [bindings & body]
+  (clojure.core/let [binding-name (first bindings)
+                     coll-expr (second bindings)]
+    `(then (promise ~coll-expr)
+           (fn [items#]
+             (then (clojure.core/reduce
+                     (fn [acc# item#]
+                       (then acc# (fn [_#] (clojure.core/let [~binding-name item#]
+                                             (do ~@body)))))
+                     (resolved nil)
+                     items#)
+                   (fn [_#] nil))))))
+
+;; ------------------------------------------------------------------ warm-up ----
+
+(def ^:private warmed (atom false))
+
+(defn- warm-up!
+  "Runs one promise through every function in this namespace, on the calling thread.
+
+   jank compiles a function the first time it is called, and first-compiling on a pool or
+   timer worker corrupts the heap -- `(p/then (p/delay 5 1) (fn [v] (p/delay 5 (inc v))))`
+   reliably produced `double free or corruption` before this existed, because the timer
+   callback compiled the settle path on a worker thread. Doing it here means workers only
+   execute code that is already compiled.
+
+   Guarded by a compare-and-set rather than a delay: this runs from `deferred`, which
+   warm-up! itself calls, and jank's delay is not re-entrant."
+  []
+  (impl/ensure-warm!)
+  (clojure.core/let [d (impl/make-promise)
+                     other (impl/make-promise)]
+    (on-settle d nil (fn [] nil))
+    (resolve! d :warm)
+    (deliver-value! other :warm)
+    (copy-settlement! d (impl/make-promise))
+    (await! d)
+    (await-for! d 0)
+    (then d (fn [v] v))
+    (then' d (fn [v] v))
+    (handle d (fn [_ _] nil))
+    (finally d (fn [_ _] nil))
+    (catch (rejected (ex-info "warm" {})) (fn [_] nil))
+    (all [d])
+    (race [d])
+    (wait-all [d]))
+  nil)
+
+(defn- ensure-warm!
+  "Warms this namespace once per process."
+  []
+  (when (compare-and-set! warmed false true)
+    (warm-up!))
+  nil)
+
+;; ---------------------------------------------------------------------- do ----
+;;
+;; Defined last, deliberately. jank resolves a macro named `do` ahead of the special form,
+;; so from this point on any `when`, multi-form `defn` body or anything else that expands
+;; to a bare `do` inside this namespace would expand into a promise chain instead. Nothing
+;; follows it, so nothing is affected; call sites reference it qualified, as `p/do`.
+
+(defmacro do
+  "Evaluates each form in order, waiting for any promise a form yields before moving to
+   the next, and resolves with the last one's value."
+  [& body]
+  (clojure.core/reduce (fn [acc form]
+                         `(then ~acc (fn [_#] ~form)))
+                       `(resolved nil)
+                       body))

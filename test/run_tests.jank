@@ -1,0 +1,17 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+(ns run-tests
+  "Entry point for the test suite: jank run --module-path src:test test/run_tests.jank"
+  (:require [clojure.test :as t]
+            [yakusoku.core-test]
+            [yakusoku.exec-test]))
+
+(let [summary (t/run-tests 'yakusoku.core-test 'yakusoku.exec-test)]
+  (println)
+  (if (t/successful? summary)
+    (println "All tests passed.")
+    (do
+      (println "FAILURES:" (:fail summary 0) "ERRORS:" (:error summary 0))
+      (cpp/exit (cpp/cast cpp/int 1)))))
