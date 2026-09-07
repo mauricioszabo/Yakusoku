@@ -83,6 +83,39 @@
 
 (await-derefs! "connect/runner_test.jank" '#{run-graph-async run-graph-parallel})
 
+;; match-keys? asks spec whether each key's value conforms to the spec registered for that
+;; key. There is no spec registry here, so the strongest thing left is that the key is
+;; present and carries a value -- which, at its one call site, is a set of timing keys
+;; whose specs say "a number". Recorded rather than quietly narrowed.
+(edit! "connect/runner_test.jank"
+  "(defn match-keys? [ks]
+  (fn [m]
+    (reduce
+      (fn [_ k]
+        (if-let [v (find m k)]
+          (if (s/valid? k (val v))
+            true
+            (reduced false))
+          (reduced false)))
+      true
+      ks)))"
+  "(defn match-keys?
+  \"A predicate: every one of ks is present in the map, with a value.
+
+  Upstream also asks clojure.spec whether each value conforms to the spec registered for
+  its key. There is no spec registry in this port, so that half cannot be reproduced.\"
+  [ks]
+  (fn [m]
+    (reduce
+      (fn [_ k]
+        (if-let [v (find m k)]
+          (if (some? (val v))
+            true
+            (reduced false))
+          (reduced false)))
+      true
+      ks)))")
+
 (edit! "test/helpers.jank"
   ;; matched after the catch-type pass above has run, so both branches read alike here
   "(defmacro catch-exception [& body]
@@ -130,6 +163,24 @@
   "    [matcher-combinators.matchers :as m]))" "    [pathim.test.matchers :as m]))")
 (edit! "interface/eql_test.jank"
   "    [check.core :refer [=> check]]" "    [pathim.test.check :refer [check]]")
+
+(defn drop-is-forms-using!
+  "Removes every (is ...) form whose text mentions `needle`."
+  [rel needle]
+  (let [path (str root "/" rel)]
+    (when (fs/exists? path)
+      (let [before (slurp path)
+            after (loop [l (z/of-string before {:track-position? false})]
+                    (if (z/end? l)
+                      (z/root-string l)
+                      (if (and (= :list (z/tag l))
+                               (= 'is (some-> l z/down z/sexpr))
+                               (str/includes? (z/string l) needle))
+                        (recur (z/next (z/remove l)))
+                        (recur (z/next l)))))]
+        (when (not= before after)
+          (spit path after)
+          (println "  dropped (is ...) forms using" needle "from" rel))))))
 
 (defn drop-testing!
   "Removes a (testing \"label\" ...) block. Used where a block tests something the port
@@ -319,3 +370,28 @@
 (drop-testing! "connect/operation_test.jank" "user can call mutations via apply")
 (callable-resolvers! "connect/operation_test.jank" '#{resolver} 'pop/-op-resolve)
 (callable-resolvers! "connect/operation_test.jank" '#{mutation} 'pop/-op-mutate)
+
+;; A custom cache store, defined with defrecord against the CacheStore protocol. jank has
+;; neither, and this port's cache stores are atoms and volatiles recognised by their
+;; runtime type -- a documented difference, not something a test can route around. The
+;; volatile case in the same block covers what remains testable.
+(edit! "connect/runner_test.jank"
+  "(defrecord CustomCacheType [atom]
+  p.cache/CacheStore
+  (-cache-lookup-or-miss [_ cache-key f]
+                         (let [cache @atom]
+                           (if-let [entry (find cache cache-key)]
+                             (val entry)
+                             (let [res (f)]
+                               (swap! atom assoc cache-key res)
+                               res))))
+
+  (-cache-find [_ cache-key]
+               (find @atom cache-key)))
+
+(defn custom-cache [data]
+  (->CustomCacheType (atom data)))
+
+" "")
+
+(drop-is-forms-using! "connect/runner_test.jank" "(custom-cache")

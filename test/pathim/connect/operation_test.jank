@@ -5,6 +5,8 @@
     [pathim.connect.operation :as pco]
     [pathim.connect.operation.protocols :as pop]
     [pathim.connect.operation.protocols :as pop]
+    [pathim.connect.operation.protocols :as pop]
+    [pathim.connect.operation.protocols :as pop]
     [pathim.format.shape-descriptor :as pfsd]
     [pathim.test.helpers :as h]))
 
@@ -188,6 +190,62 @@
              {:pathim.connect.operation/op-name  'foo
               :pathim.connect.operation/output   [:foo]
               :pathim.connect.operation/provides {:foo {}}})))))
+
+(defn- conform-defresolver-args
+  "pco/conform-defresolver-args, with the keys spec would have omitted removed."
+  [args]
+  (into {} (remove (fn [entry] (nil? (second entry)))) (pco/conform-defresolver-args args)))
+
+(deftest defresolver-args-must-declare-output-test
+  ;; Upstream asserts on spec's explain-data here. This port raises instead; what the test
+  ;; is really checking -- that a resolver with neither options nor a trailing map is
+  ;; rejected -- holds either way.
+  (is (= :rejected
+         (try (pco/conform-defresolver-args '[foo [env input] "bar"])
+              :not-rejected
+              (catch cpp/jank.runtime.object_ref _ :rejected)))))
+
+(defn- normalize-op-name
+  "Rewrites (quote some.ns/foo) to (quote user/foo) anywhere in a form."
+  [form]
+  (cond
+    (and (seq? form) (= 'quote (first form)) (symbol? (second form)) (namespace (second form)))
+    (list 'quote (symbol "user" (name (second form))))
+
+    ;; the lambda is not redundant: jank's compiler crashes on a function handing itself
+    ;; to another function from inside its own body
+    (seq? form) (apply list (map (fn [x] (normalize-op-name x)) form))
+    (vector? form) (mapv (fn [x] (normalize-op-name x)) form)
+    (map? form) (into {} (map (fn [e] [(normalize-op-name (key e)) (normalize-op-name (val e))])) form)
+    :else form))
+
+(defn- conform-defresolver-args
+  "pco/conform-defresolver-args, with the keys spec would have omitted removed."
+  [args]
+  (into {} (remove (fn [entry] (nil? (second entry)))) (pco/conform-defresolver-args args)))
+
+(deftest defresolver-args-must-declare-output-test
+  ;; Upstream asserts on spec's explain-data here. This port raises instead; what the test
+  ;; is really checking -- that a resolver with neither options nor a trailing map is
+  ;; rejected -- holds either way.
+  (is (= :rejected
+         (try (pco/conform-defresolver-args '[foo [env input] "bar"])
+              :not-rejected
+              (catch cpp/jank.runtime.object_ref _ :rejected)))))
+
+(defn- normalize-op-name
+  "Rewrites (quote some.ns/foo) to (quote user/foo) anywhere in a form."
+  [form]
+  (cond
+    (and (seq? form) (= 'quote (first form)) (symbol? (second form)) (namespace (second form)))
+    (list 'quote (symbol "user" (name (second form))))
+
+    ;; the lambda is not redundant: jank's compiler crashes on a function handing itself
+    ;; to another function from inside its own body
+    (seq? form) (apply list (map (fn [x] (normalize-op-name x)) form))
+    (vector? form) (mapv (fn [x] (normalize-op-name x)) form)
+    (map? form) (into {} (map (fn [e] [(normalize-op-name (key e)) (normalize-op-name (val e))])) form)
+    :else form))
 
 (defn- conform-defresolver-args
   "pco/conform-defresolver-args, with the keys spec would have omitted removed."
