@@ -39,7 +39,8 @@
       (keep
         (fn [{::keys [id]}]
           (get-in index-plugins [id k])))
-      (rseq plugin-order))))
+      ;; reverse, not rseq: jank's rseq is an unimplemented stub.
+      (reverse plugin-order))))
 
 (defn add-plugin-at-order
   [{::keys [plugin-order] :as env} {::keys [id add-before add-after]}]

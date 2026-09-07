@@ -14,4 +14,5 @@
 (defn find-closest-non-placeholder-parent-join-key
   "Find the closest parent key that's not a placeholder key."
   [{::p.path/keys [path] :as env}]
-  (->> (or path []) rseq (drop 1) (remove #(placeholder-key? env %)) first))
+  ;; reverse, not rseq: jank's rseq is an unimplemented stub.
+  (->> (or path []) reverse (drop 1) (remove #(placeholder-key? env %)) first))
