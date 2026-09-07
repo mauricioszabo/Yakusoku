@@ -158,7 +158,26 @@ the two implementations. This is what catches a planner that quietly plans diffe
 Requires `bb` on the path.
 
 **The ported suite** is Pathom's own tests: the planner, operation, indexes, format and
-interface suites, adapted only where jank genuinely differs.
+interface suites, adapted only where jank genuinely differs. Where a test cannot hold as
+written, the adaptation is in `tools/test-fixups.clj` with a comment saying why; nothing is
+weakened to pass. Three kinds recur:
+
+* Operations are called as functions upstream, since `Resolver` implements `IFn`. Those
+  calls are rewritten to `pop/-op-resolve` / `pop/-op-mutate`, which says the same thing.
+  The two blocks that test `IFn`-ness itself, through `apply`, are dropped.
+* `clojure.spec` conforming. The port's hand-written parser produces the same shapes, so
+  those assertions stand; the blocks that test spec's own machinery (`explain-data`,
+  conforming a single destructuring argument) are replaced by an assertion that the same
+  input is rejected.
+* Environment assumptions, chiefly the `user/foo` in the `defresolver` expansion tests --
+  whatever `*ns*` happens to be. That symbol is normalised rather than the assertion
+  changed.
+
+**Known failures**: three, all in the planner, all the same thing. `optimize-OR-equal-branches`
+(twice) and `denormalize-node-test` produce the same graph as upstream with the node ids
+swapped between two branches. Node ids are assigned in the order the planner walks an
+unordered collection, and jank's iteration order is not Clojure's. The plans are equivalent;
+the assertions name specific ids, so they fail.
 
 There is no oracle for the async and parallel runners: promesa does not load under babashka
 (`defrecord ... found: Supplier`), which is why Pathom itself carries a `:bb` branch. Two

@@ -12,7 +12,7 @@
     [pathim.error :as p.error]
     [pathim.interface.eql :as p.eql]
     [pathim.eql :as eql]
-    ))
+    [pathim.test.matchers :as m]))
 
 (defn register-index [ops]
   (let [ops' (into []

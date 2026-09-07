@@ -9,17 +9,42 @@
    vectors, sets, scalars -- is compared exactly, so the ported tests stay as strict as
    upstream's wherever they can be."
   (:require
-    [clojure.test :as t]))
+    [clojure.test :as t]
+    [pathim.test.matchers :as m]))
 
 (defn matches?
   "True if actual matches the expected pattern: maps match on the keys expected names
    (recursively), everything else must be equal."
   [expected actual]
   (cond
+    ;; A matcher from pathim.test.matchers -- `m/absent` and friends. Upstream's tests mix
+    ;; matcher-combinators into check patterns, so this delegates rather than duplicating.
+    (m/matcher? expected)
+    (m/match? expected actual)
+
+    ;; A function in the pattern is a predicate applied to the value -- check's own
+    ;; semantics, and what lets a test say `number?` where the value is a generated id.
+    ;; Keywords and maps are callable too but are patterns, not predicates, so this asks
+    ;; for a function specifically.
+    (fn? expected)
+    (boolean (expected actual))
+
     (and (map? expected) (map? actual))
-    (every? (fn [k] (and (contains? actual k)
-                         (matches? (get expected k) (get actual k))))
+    (every? (fn [k]
+              (let [e (get expected k)]
+                ;; `m/absent` as a value asserts that the key is not there at all
+                (if (and (m/matcher? e) (= :absent (:pathim.test.matchers/kind e)))
+                  (not (contains? actual k))
+                  (and (contains? actual k) (matches? e (get actual k))))))
             (keys expected))
+
+    ;; Sets match elementwise, partially, like maps: the planner tests describe a run-and
+    ;; branch by naming the fields of each child they care about, and the real children
+    ;; carry node ids and parent links besides. Sizes must still agree, so an expected set
+    ;; cannot quietly ignore an extra branch.
+    (and (set? expected) (set? actual))
+    (and (= (count expected) (count actual))
+         (every? (fn [e] (some (fn [a] (matches? e a)) actual)) expected))
 
     (and (vector? expected) (vector? actual))
     (and (= (count expected) (count actual))
@@ -32,7 +57,7 @@
 (defn explain
   "A short description of why a match failed, for the test report."
   [expected actual]
-  (if (and (map? expected) (map? actual))
+  (if (and (map? expected) (map? actual) (not (fn? expected)) (not (m/matcher? expected)))
     (let [missing (remove #(contains? actual %) (keys expected))
           differing (remove (fn [k] (or (not (contains? actual k))
                                         (matches? (get expected k) (get actual k))))

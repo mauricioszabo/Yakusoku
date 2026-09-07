@@ -125,7 +125,9 @@
   "(thrown-msg? #\"Tried to register duplicated")
 (edit! "connect/planner_test.jank"
   "    [check.core :refer [=> check]]" "    [pathim.test.check :refer [check]]"
-  "    [matcher-combinators.matchers :as m]))" "    ))")
+  ;; matcher-combinators becomes the small subset in pathim.test.matchers; check's
+  ;; matches? knows about it, so `m/absent` inside a check pattern keeps working.
+  "    [matcher-combinators.matchers :as m]))" "    [pathim.test.matchers :as m]))")
 (edit! "interface/eql_test.jank"
   "    [check.core :refer [=> check]]" "    [pathim.test.check :refer [check]]")
 
