@@ -15,9 +15,16 @@
   (:refer-clojure :exclude [pool])
   (:require [yakusoku.impl :as impl]))
 
-;; No #include here on purpose. jank's C++ environment is global -- yakusoku.impl, which
-;; this namespace requires, has already brought the header in, and including it a second
-;; time leaves jank's incremental parser mid-expression and miscompiles the next form.
+(cpp/raw "#include <yakusoku.hpp>")
+
+;; This namespace calls into the native core directly (hardware_threads), so it includes the
+;; header itself rather than relying on yakusoku.impl having done it.
+;;
+;; Relying on that worked when everything was JIT-compiled into one process, where jank's
+;; C++ environment is global. It does not survive ahead-of-time compilation: `jank
+;; compile-module` builds each namespace on its own, so a consumer running `lein compile`
+;; got "no type named 'hardware_threads' in namespace 'yakusoku'". Every namespace that
+;; names a C++ symbol has to bring in its own declarations.
 
 (defn executor?
   "True if x is a Yakusoku executor."

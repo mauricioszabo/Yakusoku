@@ -339,7 +339,7 @@
   "Timed passes per benchmark. A warm-up pass runs first and is discarded: jank compiles a
    function on its first call, so the first pass of anything is a compile, not a
    measurement."
-  3)
+  7)
 
 (defn- median [xs]
   (let [sorted (vec (sort xs))]

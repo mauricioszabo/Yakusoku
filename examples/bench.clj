@@ -326,7 +326,7 @@
 (def iterations
   "Timed passes per benchmark. A warm-up pass runs first and is discarded, so the JIT is
    warm before anything is measured."
-  3)
+  7)
 
 (defn- median [xs]
   (let [sorted (vec (sort xs))]
