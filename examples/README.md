@@ -55,7 +55,7 @@ copied deliberately:
 | `chain-fallback` | the same for an odd, unknown id — both better branches miss first |
 | `many` | 24 tasks through one nested join, so one plan covers all of them |
 
-Each runs once to warm up (discarded) and then three times; the table shows the median.
+Each runs once to warm up (discarded) and then seven times; the table shows the median.
 
 ## Results
 
