@@ -8,11 +8,11 @@
     ))
 
 (deftest alias-resolver-test
-  (is (= ((pbir/alias-resolver :foo :bar) {} {:foo 3})
+  (is (= (pop/-op-resolve (pbir/alias-resolver :foo :bar) {} {:foo 3})
          {:bar 3})))
 
 (deftest constantly-resolver-test
-  (is (= ((pbir/constantly-resolver :foo "bar"))
+  (is (= (pop/-op-resolve (pbir/constantly-resolver :foo "bar") {} {})
          {:foo "bar"}))
 
   (testing "output inference"
@@ -26,26 +26,24 @@
            [{:foo [:bar :other]}]))))
 
 (deftest constantly-fn-resolver-test
-  (is (= ((pbir/constantly-fn-resolver :foo (fn [_] "bar")))
+  (is (= (pop/-op-resolve (pbir/constantly-fn-resolver :foo (fn [_] "bar")) {} {})
          {:foo "bar"})))
 
 (deftest single-attr-resolver-test
-  (is (= ((pbir/single-attr-resolver :n :x inc) {:n 10})
+  (is (= (pop/-op-resolve (pbir/single-attr-resolver :n :x inc) {} {:n 10})
          {:x 11})))
 
 (deftest single-attr-with-env-resolver-test
-  (is (= ((pbir/single-attr-with-env-resolver :n :x #(+ (:add %1) %2))
-          {:add 5}
-          {:n 10})
+  (is (= (pop/-op-resolve (pbir/single-attr-with-env-resolver :n :x #(+ (:add %1) %2)) {:add 5} {:n 10})
          {:x 15})))
 
 (deftest map-table-resolver-test
   (let [resolver (pbir/static-table-resolver :pathim.connect.built-in.resolvers-test/id {1 {:pathim.connect.built-in.resolvers-test/color "Gray"}
                                                    2 {:pathim.connect.built-in.resolvers-test/color "Purple"}})
         config   (pco/operation-config resolver)]
-    (is (= (resolver {:pathim.connect.built-in.resolvers-test/id 2})
+    (is (= (pop/-op-resolve resolver {} {:pathim.connect.built-in.resolvers-test/id 2})
            {:pathim.connect.built-in.resolvers-test/color "Purple"}))
-    (is (= (resolver {:pathim.connect.built-in.resolvers-test/id 3}) nil))
+    (is (= (pop/-op-resolve resolver {} {:pathim.connect.built-in.resolvers-test/id 3}) nil))
     (is (= (:pathim.connect.operation/input config)
            [:pathim.connect.built-in.resolvers-test/id]))
     (is (= (:pathim.connect.operation/output config)
@@ -56,9 +54,9 @@
                    {1 "Gray"
                     2 "Purple"})
         config   (pco/operation-config resolver)]
-    (is (= (resolver {:pathim.connect.built-in.resolvers-test/id 2})
+    (is (= (pop/-op-resolve resolver {} {:pathim.connect.built-in.resolvers-test/id 2})
            {:pathim.connect.built-in.resolvers-test/color "Purple"}))
-    (is (= (resolver {:pathim.connect.built-in.resolvers-test/id 3}) nil))
+    (is (= (pop/-op-resolve resolver {} {:pathim.connect.built-in.resolvers-test/id 3}) nil))
     (is (= (:pathim.connect.operation/input config)
            [:pathim.connect.built-in.resolvers-test/id]))
     (is (= (:pathim.connect.operation/output config)
@@ -67,7 +65,7 @@
 (deftest attribute-table-resolver-test
   (let [resolver (pbir/attribute-table-resolver :pathim.connect.built-in.resolvers-test/colors :pathim.connect.built-in.resolvers-test/id [:pathim.connect.built-in.resolvers-test/color])
         config   (pco/operation-config resolver)]
-    (is (= (resolver {:pathim.connect.built-in.resolvers-test/colors {1 {:pathim.connect.built-in.resolvers-test/color "Gray"}
+    (is (= (pop/-op-resolve resolver {} {:pathim.connect.built-in.resolvers-test/colors {1 {:pathim.connect.built-in.resolvers-test/color "Gray"}
                                 2 {:pathim.connect.built-in.resolvers-test/color "Purple"}}
                       :pathim.connect.built-in.resolvers-test/id     2})
            {:pathim.connect.built-in.resolvers-test/color "Purple"}))
@@ -79,10 +77,8 @@
 (deftest env-table-resolver-test
   (let [resolver (pbir/env-table-resolver :pathim.connect.built-in.resolvers-test/colors :pathim.connect.built-in.resolvers-test/id [:pathim.connect.built-in.resolvers-test/color])
         config   (pco/operation-config resolver)]
-    (is (= (resolver
-             {:pathim.connect.built-in.resolvers-test/colors {1 {:pathim.connect.built-in.resolvers-test/color "Gray"}
-                        2 {:pathim.connect.built-in.resolvers-test/color "Purple"}}}
-             {:pathim.connect.built-in.resolvers-test/id 2})
+    (is (= (pop/-op-resolve resolver {:pathim.connect.built-in.resolvers-test/colors {1 {:pathim.connect.built-in.resolvers-test/color "Gray"}
+                        2 {:pathim.connect.built-in.resolvers-test/color "Purple"}}} {:pathim.connect.built-in.resolvers-test/id 2})
            {:pathim.connect.built-in.resolvers-test/color "Purple"}))
     (is (= (:pathim.connect.operation/input config)
            [:pathim.connect.built-in.resolvers-test/id]))

@@ -120,16 +120,61 @@
 (edit! "interface/eql_test.jank"
   "    [check.core :refer [=> check]]" "    [pathim.test.check :refer [check]]")
 
+(defn callable-resolvers!
+  "Rewrites calls that treat a resolver as a function into pop/-op-resolve calls.
+
+   Upstream's Resolver is a record implementing IFn, with arities [], [input] and
+   [env input]. jank has no records and no way to make a map callable, so the port's
+   resolvers are plain maps -- and calling one silently does the wrong thing: a map called
+   with two arguments is a lookup with a default, and with none it throws. This is the one
+   upstream shape that cannot survive the port, so the tests are rewritten to say the same
+   thing the supported way rather than weakened.
+
+   Two call shapes are rewritten: ((expr ...) ...), where the head is itself a call
+   producing a resolver, and (sym ...) for the locals named in `locals`."
+  [rel locals]
+  (let [path (str root "/" rel)]
+    (when (fs/exists? path)
+      (let [before (slurp path)
+            resolver-call? (fn [l]
+                             (and (= :list (z/tag l))
+                                  (let [head (z/down l)]
+                                    (or (= :list (z/tag head))
+                                        (contains? locals (and (= :token (z/tag head))
+                                                               (z/sexpr head)))))))
+            after (loop [l (z/of-string before {:track-position? false})]
+                    (if (z/end? l)
+                      (z/root-string l)
+                      (if (resolver-call? l)
+                        (let [kids (remove #(contains? #{:whitespace :newline :comment} (n/tag %))
+                                           (n/children (z/node l)))
+                              [target & args] kids
+                              ;; [] -> {} {}, [input] -> {} input, [env input] -> as is
+                              args' (case (count args)
+                                      0 [(n/map-node []) (n/map-node [])]
+                                      1 [(n/map-node []) (first args)]
+                                      (vec args))]
+                          (recur (z/next (z/replace l (n/list-node
+                                                        (into [(n/token-node 'pop/-op-resolve)
+                                                               (n/spaces 1)
+                                                               target]
+                                                              (mapcat (fn [a] [(n/spaces 1) a]) args')))))))
+                        (recur (z/next l)))))]
+        (when (not= before after)
+          (spit path after)
+          (println "  rewrote resolver calls in" rel))))))
+
 ;; SmartMaps are not part of this port, and a resolver is not directly callable here.
 (edit! "connect/built_in/resolvers_test.jank"
   "    [pathim.interface.smart-map :as psm]))" "    ))"
   ;; anchored on the smart-map line's replacement above so a re-run cannot add it twice
   "    [pathim.connect.operation :as pco]\n    ))"
   "    [pathim.connect.operation :as pco]\n    [pathim.connect.operation.protocols :as pop]\n    ))"
-  "(is (= (resolver {} {})" "(is (= (pop/-op-resolve resolver {} {})"
   "\n    (let [sm (psm/smart-map (pci/register resolvers) {:my.system/user-id 4})]
       (is (= (:my.system.user/name sm) \"Anne\")))))"
   "))\n\n;; Upstream also reads these through a SmartMap; SmartMaps are not part of this port.")
+
+(callable-resolvers! "connect/built_in/resolvers_test.jank" '#{resolver})
 
 ;; jank has no Java interop, and cpp/std.sqrt is ambiguous across its overloads.
 (edit! "test/geometry_resolvers.jank"
