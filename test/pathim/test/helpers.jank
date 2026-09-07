@@ -1,0 +1,44 @@
+(ns pathim.test.helpers
+  (:require
+    [clojure.walk :as walk]))
+
+(defn spy [{:keys [return]}]
+  (let [calls (atom [])]
+    (with-meta
+      (fn [& args]
+        (swap! calls conj args)
+        return)
+      {:calls calls})))
+
+(defn spy-fn [f]
+  (let [calls (atom [])]
+    (with-meta
+      (fn [& args]
+        (swap! calls conj args)
+        (apply f args))
+      {:calls calls})))
+
+(defn match-error [error-msg-regex]
+  (fn [value]
+    (re-find error-msg-regex (ex-message value))))
+
+(defn expose-meta [x]
+  (walk/postwalk
+    (fn [x]
+      (if (and (map? x)
+               (seq (meta x)))
+        (assoc x ::meta (meta x))
+        x))
+    x))
+
+(defn error->data [error]
+  {:ex/message (ex-message error)
+   :ex/data    (ex-data error)})
+
+(defmacro catch-exception
+  "Runs body, returning the thrown error as data rather than propagating it."
+  [& body]
+  `(try
+     ~@body
+     (catch cpp/jank.runtime.object_ref e#
+       (error->data e#))))

@@ -1,0 +1,26 @@
+;; Entry point for the ported Pathom test suite:
+;;   jank run --module-path src:test test/run_pathim_tests.jank
+
+(ns run-pathim-tests
+  (:require [clojure.test :as t]
+            [pathim.format.shape-descriptor-test]
+            [pathim.format.eql-test]
+            [pathim.connect.indexes-test]
+            [pathim.connect.operation-test]
+            [pathim.connect.planner-test]
+            [pathim.connect.built-in.resolvers-test]
+            [pathim.interface.eql-test]))
+
+(let [summary (t/run-tests 'pathim.format.shape-descriptor-test
+                           'pathim.format.eql-test
+                           'pathim.connect.indexes-test
+                           'pathim.connect.operation-test
+                           'pathim.connect.planner-test
+                           'pathim.connect.built-in.resolvers-test
+                           'pathim.interface.eql-test)]
+  (println)
+  (if (t/successful? summary)
+    (println "All pathim tests passed.")
+    (do
+      (println "FAILURES:" (:fail summary 0) "ERRORS:" (:error summary 0))
+      (cpp/exit (cpp/cast cpp/int 1)))))

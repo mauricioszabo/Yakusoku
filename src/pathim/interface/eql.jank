@@ -2,6 +2,7 @@
   (:require
     [pathim.misc :refer [raise!]]
     [pathim.misc.coll :as coll]
+    [pathim.connect.foreign :as pcf]
     [pathim.connect.indexes :as pci]
     [pathim.connect.runner :as pcr]
     [pathim.entity-tree :as p.ent]
@@ -177,10 +178,7 @@
   Env ext can be either a map to merge in the original env, or a function that transforms
   the env.
   "
-  ;; Upstream registers pcf/foreign-indexes-resolver here so a boundary interface can serve
-  ;; as a remote for another Pathom. connect/foreign is not part of this port, so the env
-  ;; is used as given.
-  [env] (let [env' env]
+  [env] (let [env' (pci/register env pcf/foreign-indexes-resolver)]
     (fn boundary-interface-internal
       ([env-extension request]
        (let [{:pathom/keys [eql entity ast include-stats?] :as request'}

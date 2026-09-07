@@ -1,0 +1,709 @@
+(ns pathim.connect.operation-test
+  (:require
+    [clojure.test :refer [deftest is are run-tests testing]]
+    [pathim.connect.built-in.resolvers :as pbir]
+    [pathim.connect.operation :as pco]
+    [pathim.format.shape-descriptor :as pfsd]
+    [pathim.test.helpers :as h]))
+
+(deftest resolver-test
+  (testing "creating resolvers"
+    (let [resolver (pco/resolver 'foo {::pco/output [:foo]} (fn [_ _] {:foo "bar"}))]
+      (is (= (resolver)
+             {:foo "bar"}))
+
+      (is (= (pco/operation-config resolver)
+             {::pco/op-name  'foo
+              ::pco/input    []
+              ::pco/provides {:foo {}}
+              ::pco/requires {}
+              ::pco/output   [:foo]})))
+
+    (let [resolver (pco/resolver 'foo {::pco/input [:required] ::pco/output [:foo]} (fn [_ _] {:foo "bar"}))]
+      (is (= (resolver)
+             {:foo "bar"}))
+
+      (is (= (pco/operation-config resolver)
+             {::pco/op-name  'foo
+              ::pco/input    [:required]
+              ::pco/provides {:foo {}}
+              ::pco/requires {:required {}}
+              ::pco/output   [:foo]}))))
+
+  (testing "creating resolver from pure maps"
+    (let [resolver (pco/resolver {::pco/op-name 'foo
+                                  ::pco/output  [:foo]
+                                  ::pco/resolve (fn [_ _] "bar")})]
+      (is (= (resolver nil nil)
+             "bar"))
+
+      (is (= (pco/operation-config resolver)
+             {::pco/op-name  'foo
+              ::pco/output   [:foo]
+              ::pco/input    []
+              ::pco/provides {:foo {}}
+              ::pco/requires {}}))))
+
+  (testing "user can call resolver via apply"
+    (let [resolver (pco/resolver 'foo {::pco/output [:foo]} (fn [env input]
+                                                              (cond-> {:foo "bar"}
+                                                                (seq env) (assoc :env env)
+                                                                (seq input) (assoc :input input))))]
+      (is (= (apply resolver [])
+             {:foo "bar"}))
+
+      (is (= (apply resolver [{:x 1}])
+             {:foo "bar"
+              :input {:x 1}}))
+
+      (is (= (apply resolver [{:z 3} {:x 1}])
+             {:foo "bar"
+              :input {:x 1}
+              :env {:z 3}}))
+
+      (try
+           (apply resolver [{:z 3} {:x 1} {:not :ok}])
+           (is false "Error expected to be thrown")
+           (catch Throwable e
+             (is (= (ex-message e) "Can't call resolver with more than 2 arguments."))
+             (is (= (ex-data e) {:args [{:z 3} {:x 1} {:not :ok}]}))))))
+
+  (testing "validates configuration map"
+    (try
+      (pco/resolver 'foo {::pco/input #{:invalid}} (fn [_ _] {:sample "bar"}))
+      (catch Throwable e
+        (is (= (ex-message e) "Invalid config on resolver foo"))
+        (is (= (-> e
+                   (ex-data)
+                   (update :explain-data dissoc :clojure.spec.alpha/spec :clojure.spec.alpha/value))
+               {:explain-data {:clojure.spec.alpha/problems [{:in   [:pathim.connect.operation/input]
+                                                                     :path [:pathim.connect.operation/input]
+                                                                     :pred 'clojure.core/vector?
+                                                                     :val  #{:invalid}
+                                                                     :via  [:pathim.connect.operation/input]}]}})))))
+
+  (testing "name config overrides syntax name"
+    (let [resolver (pco/resolver 'foo {::pco/op-name 'bar
+                                       ::pco/resolve (fn [_ _] {})}
+                     (fn [_ _] {:foo "bar"}))]
+      (is (= (pco/operation-config resolver)
+             {::pco/op-name 'bar}))))
+
+  (testing "dynamic resolver"
+    (let [resolver (pco/resolver {::pco/op-name           'foo
+                                  ::pco/dynamic-resolver? true
+                                  ::pco/resolve           (fn [_ _] "bar")})]
+
+      (is (= (pco/operation-config resolver)
+             {::pco/op-name           'foo
+              ::pco/dynamic-resolver? true}))))
+
+  (testing "transform"
+    (let [resolver (pco/resolver 'foo {::pco/output    [:foo]
+                                       ::pco/transform (fn [config]
+                                                         (assoc config ::other "bar"))}
+                     (fn [_ _] {:foo "bar"}))]
+      (is (= (pco/operation-config resolver)
+             {::pco/op-name  'foo
+              ::other        "bar"
+              ::pco/output   [:foo]
+              ::pco/input    []
+              ::pco/provides {:foo {}}
+              ::pco/requires {}}))))
+
+  (testing "defining optional inputs"
+    (let [resolver (pco/resolver 'foo
+                     {::pco/input  [:x (pco/? :y)]
+                      ::pco/output [:foo]}
+                     (fn [_ _] {:foo "bar"}))]
+      (is (= (pco/operation-config resolver)
+             {::pco/op-name   'foo
+              ::pco/output    [:foo]
+              ::pco/input     [:x (pco/? :y)]
+              ::pco/provides  {:foo {}}
+              ::pco/requires  {:x {}}
+              ::pco/optionals {:y {}}}))))
+
+  (testing "noop when called with a resolver"
+    (let [resolver (-> {::pco/op-name 'foo
+                        ::pco/output  [:foo]
+                        ::pco/resolve (fn [_ _] "bar")}
+                       (pco/resolver)
+                       (pco/resolver)
+                       (pco/resolver))]
+      (is (= (resolver nil nil)
+             "bar"))
+
+      (is (= (pco/operation-config resolver)
+             {::pco/op-name  'foo
+              ::pco/output   [:foo]
+              ::pco/input    []
+              ::pco/provides {:foo {}}
+              ::pco/requires {}})))))
+
+(deftest mutation-test
+  (testing "creating mutations"
+    (let [mutation (pco/mutation 'foo {::pco/output [:foo]} (fn [_ _] {:foo "bar"}))]
+      (is (= (mutation)
+             {:foo "bar"}))
+
+      (is (= (pco/operation-config mutation)
+             {::pco/op-name  'foo
+              ::pco/provides {:foo {}}
+              ::pco/output   [:foo]}))))
+
+  (testing "creating mutation from pure maps"
+    (let [mutation (pco/mutation {::pco/op-name 'foo
+                                  ::pco/output  [:foo]
+                                  ::pco/mutate  (fn [_ _] {:foo "bar"})})]
+      (is (= (mutation nil nil)
+             {:foo "bar"}))
+
+      (is (= (pco/operation-config mutation)
+             {::pco/op-name  'foo
+              ::pco/output   [:foo]
+              ::pco/provides {:foo {}}}))))
+
+  (testing "user can call mutations via apply"
+    (let [resolver (pco/mutation 'foo {::pco/output [:foo]} (fn [env params]
+                                                              (cond-> {:foo "bar"}
+                                                                (seq env) (assoc :env env)
+                                                                (seq params) (assoc :params params))))]
+      (is (= (apply resolver [])
+             {:foo "bar"}))
+
+      (is (= (apply resolver [{:x 1}])
+             {:foo "bar"
+              :params {:x 1}}))
+
+      (is (= (apply resolver [{:z 3} {:x 1}])
+             {:foo "bar"
+              :params {:x 1}
+              :env {:z 3}}))
+
+      (try
+           (apply resolver [{:z 3} {:x 1} {:not :ok}])
+           (is false "Error expected to be thrown")
+           (catch Throwable e
+             (is (= (ex-message e) "Can't call mutation with more than 2 arguments."))
+             (is (= (ex-data e) {:args [{:z 3} {:x 1} {:not :ok}]}))))))
+
+  (testing "validates configuration map"
+    (try
+      (pco/mutation 'foo {::pco/input #{:invalid}} (fn [_ _] {:sample "bar"}))
+      (catch Throwable e
+        (is (= (ex-message e) "Invalid config on mutation foo"))
+        (is (= (-> e
+                   (ex-data)
+                   (update :explain-data dissoc :clojure.spec.alpha/spec :clojure.spec.alpha/value))
+               {:explain-data {:clojure.spec.alpha/problems [{:in   [:pathim.connect.operation/input]
+                                                                     :path [:pathim.connect.operation/input]
+                                                                     :pred 'clojure.core/vector?
+                                                                     :val  #{:invalid}
+                                                                     :via  [:pathim.connect.operation/input]}]}})))))
+
+  (testing "name config overrides syntax name"
+    (let [mutation (pco/mutation 'foo {::pco/op-name 'bar
+                                       ::pco/mutate  (fn [_ _] {})}
+                     (fn [_ _] {:foo "bar"}))]
+      (is (= (pco/operation-config mutation)
+             {::pco/op-name 'bar}))))
+
+  (testing "transform"
+    (let [mutation (pco/mutation 'foo {::pco/output    [:foo]
+                                       ::pco/transform (fn [config]
+                                                         (assoc config ::other "bar"))}
+                     (fn [_ _] {:foo "bar"}))]
+      (is (= (pco/operation-config mutation)
+             {::pco/op-name  'foo
+              ::other        "bar"
+              ::pco/output   [:foo]
+              ::pco/provides {:foo {}}}))))
+
+  (testing "noop when called with a mutation"
+    (let [mutation (-> {::pco/op-name 'foo
+                        ::pco/output  [:foo]
+                        ::pco/mutate  (fn [_ _] {:data "bar"})}
+                       (pco/mutation)
+                       (pco/mutation)
+                       (pco/mutation))]
+      (is (= (mutation nil nil)
+             {:data "bar"}))
+
+      (is (= (pco/operation-config mutation)
+             {::pco/op-name  'foo
+              ::pco/output   [:foo]
+              ::pco/provides {:foo {}}})))))
+
+(deftest defresolver-syntax-test
+     (testing "classic form"
+       (is (= (s/conform ::pco/defresolver-args '[foo [env input]
+                                                  {::pco/output [:foo]}
+                                                  {:foo "bar"}])
+              '{:name    foo
+                :arglist [[:sym env] [:sym input]]
+                :options {::pco/output [:foo]}
+                :body    [{:foo "bar"}]})))
+
+     (testing "docstring"
+       (is (= (s/conform ::pco/defresolver-args '[foo "doc here" [env input]
+                                                  {::pco/output [:foo]}
+                                                  {:foo "bar"}])
+              '{:name      foo
+                :docstring "doc here"
+                :arglist   [[:sym env] [:sym input]]
+                :options   {::pco/output [:foo]}
+                :body      [{:foo "bar"}]})))
+
+     (testing "visible output shape"
+       (is (= (s/conform ::pco/defresolver-args '[foo [env input] {:foo "bar"}])
+              '{:name    foo
+                :arglist [[:sym env] [:sym input]]
+                :body    [{:foo "bar"}]})))
+
+     (testing "argument destructuring"
+       (is (= (s/conform ::pco/operation-argument 'foo)
+              '[:sym foo]))
+
+       (is (= (s/conform ::pco/operation-argument '{:keys [foo]})
+              '[:map {:keys [foo]}]))
+
+       (is (= (s/conform ::pco/operation-argument '{:keys [foo] :as bar})
+              '[:map {:keys [foo] :as bar}]))
+
+       (is (= (s/conform ::pco/operation-argument '{:keys [foo] :or {foo 123}})
+              '[:map {:keys [foo] :or {foo 123}}]))
+
+       (is (= (s/conform ::pco/operation-argument '{:strs [foo]})
+              :clojure.spec.alpha/invalid))
+
+       (testing "keywords on keys"
+         (is (= (s/conform ::pco/operation-argument '{:keys [:foo]})
+                '[:map {:keys [:foo]}]))
+
+         (is (= (s/conform ::pco/operation-argument '{:keys [:foo/bar]})
+                '[:map {:keys [:foo/bar]}])))
+
+       (testing "support optionals via :or"
+         (is (= (s/conform ::pco/operation-argument '{:keys [:foo]
+                                                      :or   {foo 123}})
+                '[:map {:keys [:foo]
+                        :or   {foo 123}}]))))
+
+     (testing "fails without options or visible map"
+       (is (= (s/explain-data ::pco/defresolver-args '[foo [env input] "bar"])
+              '{:clojure.spec.alpha/problems [{:path [], :pred (clojure.core/fn must-have-output-visible-map-or-options [{:keys [body options]}] (clojure.core/or (clojure.core/map? (clojure.core/last body)) options)), :val {:name foo, :arglist [[:sym env] [:sym input]], :body ["bar"]}, :via [:??_pco_??/defresolver-args], :in []}], :clojure.spec.alpha/spec :??_pco_??/defresolver-args, :clojure.spec.alpha/value [foo [env input] "bar"]}))))
+
+(deftest extract-destructure-map-keys-as-keywords-test
+  (is (= (pco/extract-destructure-map-keys-as-keywords
+           '{:keys [foo]})
+         [:foo]))
+
+  (is (= (pco/extract-destructure-map-keys-as-keywords
+           '{:keys [:foo]})
+         [:foo]))
+
+  (is (= (pco/extract-destructure-map-keys-as-keywords
+           '{:keys [:foo/bar]})
+         [:foo/bar]))
+
+  (is (= (pco/extract-destructure-map-keys-as-keywords
+           '{:keys      [foo]
+             :user/keys [id name]
+             :as        user})
+         [:foo :user/id :user/name]))
+
+  (testing "optionals"
+    (is (= (pco/extract-destructure-map-keys-as-keywords
+             '{:keys [foo]
+               :or   {foo "bar"}})
+           [`(list :foo {::pco/optional? true})]))
+
+    (testing "namespaced key"
+      (is (= (pco/extract-destructure-map-keys-as-keywords
+               '{:some/keys [foo]
+                 :or        {foo "bar"}})
+             [`(list :some/foo {::pco/optional? true})])))
+
+    (testing "namespaced symbol"
+      (is (= (pco/extract-destructure-map-keys-as-keywords
+               '{:keys [some/foo]
+                 :or   {foo "bar"}})
+             [`(list :some/foo {::pco/optional? true})])))
+
+    (testing "symbol application"
+      (is (= (pco/extract-destructure-map-keys-as-keywords
+               '{sym :some/foo
+                 :or {sym "bar"}})
+             [`(list :some/foo {::pco/optional? true})]))))
+
+  (is (= (pco/extract-destructure-map-keys-as-keywords
+           '{renamed :foo})
+         [:foo]))
+
+  (is (= (pco/extract-destructure-map-keys-as-keywords
+           '{{deep :value} :foo})
+         [:foo]))
+
+  (is (= (pco/extract-destructure-map-keys-as-keywords
+           '{{:keys [value]} :foo})
+         [:foo])))
+
+(deftest params->resolver-options-test
+  (testing "classic case"
+    (is (= (pco/params->resolver-options
+             '{:name    foo
+               :arglist [[:name env] [:name input]]
+               :options {::pco/output [:foo]}
+               :body    [{:foo "bar"}]})
+           {::pco/output [:foo]})))
+
+  (testing "inferred input"
+    (is (= (pco/params->resolver-options
+             '{:name    foo
+               :arglist [[:sym env] [:map {:keys [dep]}]]
+               :body    [{:foo "bar"}]})
+           {::pco/inferred-input [:dep]
+            ::pco/output         [:foo]}))
+
+    (testing "preserve user input when defined"
+      (is (= (pco/params->resolver-options
+               '{:name    foo
+                 :arglist [[:sym env] [:map {:keys [dep]}]]
+                 :options {::pco/input [:dep :other]}
+                 :body    [{:foo "bar"}]})
+             {::pco/inferred-input [:dep]
+              ::pco/input          [:dep :other]
+              ::pco/output         [:foo]}))))
+
+  (testing "implicit output"
+    (is (= (pco/params->resolver-options
+             '{:name    foo
+               :arglist [[:sym env] [:sym input]]
+               :body    [nil {:foo "bar"}]})
+           {::pco/output [:foo]}))
+
+    (testing "nested body"
+      (is (= (pco/params->resolver-options
+               '{:name    foo
+                 :arglist [[:sym env] [:sym input]]
+                 :body    [{:foo  "bar"
+                            :buz  "baz"
+                            :deep {:nested (call-something)}
+                            :seq  [{:with "things"} {:around "here "}]}]})
+             {::pco/output [:buz
+                            {:deep [:nested]}
+                            :foo
+                            {:seq [:with :around]}]})))
+
+    (testing "preserve user output when defined"
+      (is (= (pco/params->resolver-options
+               '{:name    foo
+                 :arglist [[:sym env] [:sym input]]
+                 :options {::pco/output [:foo :bar]}
+                 :body    [{:foo "bar"}]})
+             {::pco/output [:foo :bar]})))))
+
+(deftest params->mutation-options-test
+  (testing "classic case"
+    (is (= (pco/params->mutation-options
+             '{:name    foo
+               :arglist [[:name env] [:name input]]
+               :options {::pco/output [:foo]}
+               :body    [{:foo "bar"}]})
+           {::pco/output [:foo]})))
+
+  (testing "inferred params"
+    (is (= (pco/params->mutation-options
+             '{:name    foo
+               :arglist [[:sym env] [:map {:keys [dep]}]]
+               :body    [{:foo "bar"}]})
+           {::pco/inferred-params [:dep]
+            ::pco/output          [:foo]}))
+
+    (testing "preserve user params when defined, and merges with inferred"
+      (is (= (pco/params->mutation-options
+               '{:name    foo
+                 :arglist [[:sym env] [:map {:keys [dep more]}]]
+                 :options {::pco/params [:dep :other]}
+                 :body    [{:foo "bar"}]})
+             {::pco/params          [:dep :other]
+              ::pco/inferred-params [:dep :more]
+              ::pco/output          [:foo]}))))
+
+  (testing "implicit output"
+    (is (= (pco/params->mutation-options
+             '{:name    foo
+               :arglist [[:sym env] [:sym params]]
+               :body    [nil {:foo "bar"}]})
+           {::pco/output [:foo]}))
+
+    (testing "nested body"
+      (is (= (pco/params->mutation-options
+               '{:name    foo
+                 :arglist [[:sym env] [:sym params]]
+                 :body    [{:foo  "bar"
+                            :buz  "baz"
+                            :deep {:nested (call-something)}
+                            :seq  [{:with "things"} {:around "here "}]}]})
+             {::pco/output [:buz
+                            {:deep [:nested]}
+                            :foo
+                            {:seq [:with :around]}]})))
+
+    (testing "preserve user output when defined"
+      (is (= (pco/params->mutation-options
+               '{:name    foo
+                 :arglist [[:sym env] [:sym params]]
+                 :options {::pco/output [:foo :bar]}
+                 :body    [{:foo "bar"}]})
+             {::pco/output [:foo :bar]})))))
+
+(deftest normalize-arglist-test
+  (is (= (pco/normalize-arglist [])
+         '[[:sym _] [:sym _]]))
+
+  (is (= (pco/normalize-arglist '[[:sym input]])
+         '[[:sym _] [:sym input]]))
+
+  (is (= (pco/normalize-arglist '[[:sym env] [:sym input]])
+         '[[:sym env] [:sym input]])))
+
+(deftest defresolver-test
+     (testing "docstring"
+       (is (= (macroexpand-1
+                `(pco/defresolver ~'foo "documentation" ~'[] {:sample "bar"}))
+              '(def foo
+                 "documentation"
+                 (pathim.connect.operation/resolver
+                   'user/foo
+                   {:pathim.connect.operation/docstring "documentation", :pathim.connect.operation/output [:sample]}
+                   (clojure.core/fn foo [_ _] {:sample "bar"}))))))
+
+     (testing "validates configuration map"
+       (try
+         (macroexpand-1
+           `(pco/defresolver ~'foo ~'[] {::pco/input #{:invalid}} {:sample "bar"}))
+         (catch Throwable e
+           (is (= (-> (ex-cause e)
+                      (ex-data)
+                      (update :explain-data dissoc :clojure.spec.alpha/spec))
+                  {:explain-data {:clojure.spec.alpha/problems [{:in [:pathim.connect.operation/input], :path [:pathim.connect.operation/input], :pred (quote clojure.core/vector?), :val #{:invalid}, :via [:pathim.connect.operation/input]}], :clojure.spec.alpha/value {:pathim.connect.operation/input #{:invalid}}}})))))
+
+     (testing "implicit output resolver, no args capture"
+       (is (= (macroexpand-1
+                `(pco/defresolver ~'foo ~'[] {:sample "bar"}))
+              '(def foo
+                 (pathim.connect.operation/resolver
+                   'user/foo
+                   {:pathim.connect.operation/output [:sample]}
+                   (clojure.core/fn foo [_ _] {:sample "bar"}))))))
+
+     (testing "explicit output, no args"
+       (is (= (macroexpand-1
+                `(pco/defresolver ~'foo ~'[] {::pco/output [:foo]} {:foo "bar"}))
+              '(def foo
+                 (pathim.connect.operation/resolver
+                   'user/foo
+                   {:pathim.connect.operation/output [:foo]}
+                   (clojure.core/fn foo [_ _] {:foo "bar"}))))))
+
+     (testing "implicit output, including implicit inputs via destructuring"
+       (is (= (macroexpand-1
+                `(pco/defresolver ~'foo ~'[{:keys [dep]}] {:sample "bar"}))
+              '(def foo
+                 (pathim.connect.operation/resolver
+                   'user/foo
+                   {:pathim.connect.operation/output [:sample], :pathim.connect.operation/inferred-input [:dep]}
+                   (clojure.core/fn foo [_ {:keys [dep]}] {:sample "bar"}))))))
+
+     (testing "implicit output, including implicit inputs via destructuring with optional"
+       (is (= (macroexpand-1
+                `(pco/defresolver ~'foo ~'[{:keys [dep] :or {dep 1}}] {:sample "bar"}))
+              '(def foo
+                 (pathim.connect.operation/resolver
+                   'user/foo
+                   {:pathim.connect.operation/output [:sample],
+                    :pathim.connect.operation/inferred-input [(clojure.core/list
+                                                                             :dep
+                                                                             {:pathim.connect.operation/optional? true})],}
+                   (clojure.core/fn foo [_ {:keys [dep], :or {dep 1}}] {:sample "bar"}))))))
+
+     (testing "implicit output, including implicit inputs via destructuring"
+       (is (= (macroexpand-1
+                `(pco/defresolver ~'foo ~'[{:keys [dep]}] {::pco/output [{:sample [:thing]}]} {:sample "bar"}))
+              '(def foo
+                 (pathim.connect.operation/resolver
+                   'user/foo
+                   {:pathim.connect.operation/output [{:sample [:thing]}], :pathim.connect.operation/inferred-input [:dep]}
+                   (clojure.core/fn foo [_ {:keys [dep]}] {:sample "bar"}))))))
+
+     (testing "explicit input"
+       (is (= (macroexpand-1
+                `(pco/defresolver ~'foo ~'[input] {::pco/input [:foo]} {:bar "baz"}))
+              '(def foo
+                 (pathim.connect.operation/resolver
+                   'user/foo
+                   {:pathim.connect.operation/output [:bar], :pathim.connect.operation/input [:foo]}
+                   (clojure.core/fn foo [_ input] {:bar "baz"}))))))
+
+     (testing "explicit input merges with implicit input"
+       (is (= (macroexpand-1
+                `(pco/defresolver ~'foo ~'[{:keys [foo bar]}] {::pco/input [{:foo [:sub]}]} {:bar "baz"}))
+              '(def foo
+                 (pathim.connect.operation/resolver
+                   'user/foo
+                   {:pathim.connect.operation/input          [{:foo [:sub]}],
+                    :pathim.connect.operation/inferred-input [:foo :bar],
+                    :pathim.connect.operation/output         [:bar]}
+                   (clojure.core/fn foo [_ {:keys [foo bar]}] {:bar "baz"}))))))
+
+     (testing "recursive nested inputs"
+       (is (= (macroexpand-1
+                `(pco/defresolver ~'foo ~'[input] {::pco/input [:foo {:bar ~'...}]} {:bar "baz"}))
+              '(def foo
+                 (pathim.connect.operation/resolver
+                   'user/foo
+                   {:pathim.connect.operation/output [:bar], :pathim.connect.operation/input [:foo {:bar ...}]}
+                   (clojure.core/fn foo [_ input] {:bar "baz"}))))))
+
+     (testing "unform options to retain data"
+       (s/def ::or-thing (s/or :foo int? :bar string?))
+
+       (is (= (macroexpand-1
+                `(pco/defresolver ~'foo ~'[] {::or-thing 3} {:sample "bar"}))
+              '(def foo
+                 (pathim.connect.operation/resolver
+                   'user/foo
+                   {::pco/output [:sample]
+                    ::or-thing   3}
+                   (clojure.core/fn foo [_ _] {:sample "bar"})))))))
+
+(deftest defmutation-test
+     (testing "docstring"
+       (is (= (macroexpand-1
+                `(pco/defmutation ~'foo "documentation" ~'[] {:sample "bar"}))
+              '(def foo
+                 "documentation"
+                 (pathim.connect.operation/mutation
+                   'user/foo
+                   {:pathim.connect.operation/docstring "documentation", :pathim.connect.operation/output [:sample]}
+                   (clojure.core/fn foo [_ _] {:sample "bar"}))))))
+
+     (testing "implicit output resolver, no args capture"
+       (is (= (macroexpand-1
+                `(pco/defmutation ~'foo ~'[] {:sample "bar"}))
+              '(def foo
+                 (pathim.connect.operation/mutation
+                   'user/foo
+                   {:pathim.connect.operation/output [:sample]}
+                   (clojure.core/fn foo [_ _] {:sample "bar"}))))))
+
+     (testing "explicit output, no args"
+       (is (= (macroexpand-1
+                `(pco/defmutation ~'foo ~'[] {::pco/output [:foo]} {:foo "bar"}))
+              '(def foo
+                 (pathim.connect.operation/mutation
+                   'user/foo
+                   {:pathim.connect.operation/output [:foo]}
+                   (clojure.core/fn foo [_ _] {:foo "bar"}))))))
+
+     (testing "implicit output, including implicit params via destructuring"
+       (is (= (macroexpand-1
+                `(pco/defmutation ~'foo ~'[{:keys [dep]}] {:sample "bar"}))
+              '(def foo
+                 (pathim.connect.operation/mutation
+                   'user/foo
+                   {:pathim.connect.operation/output [:sample], :pathim.connect.operation/inferred-params [:dep]}
+                   (clojure.core/fn foo [_ {:keys [dep]}] {:sample "bar"}))))))
+
+     (testing "implicit output, including implicit params via destructuring with optional"
+       (is (= (macroexpand-1
+                `(pco/defmutation ~'foo ~'[{:keys [dep] :or {dep true}}] {:sample "bar"}))
+              '(def foo
+                 (pathim.connect.operation/mutation
+                   'user/foo
+                   {:pathim.connect.operation/output [:sample], :pathim.connect.operation/inferred-params [(clojure.core/list :dep {:??_pco_??/optional? true})]}
+                   (clojure.core/fn foo [_ {:keys [dep] :or {dep true}}] {:sample "bar"}))))))
+
+     (testing "implicit output, including implicit params via destructuring"
+       (is (= (macroexpand-1
+                `(pco/defmutation ~'foo ~'[{:keys [dep]}] {::pco/output [{:sample [:thing]}]} {:sample "bar"}))
+              '(def foo
+                 (pathim.connect.operation/mutation
+                   'user/foo
+                   {:pathim.connect.operation/output [{:sample [:thing]}], :pathim.connect.operation/inferred-params [:dep]}
+                   (clojure.core/fn foo [_ {:keys [dep]}] {:sample "bar"}))))))
+
+     (testing "unform options to retain data"
+       (s/def ::or-thing (s/or :foo int? :bar string?))
+
+       (is (= (macroexpand-1
+                `(pco/defmutation ~'foo ~'[] {::or-thing 3} {:sample "bar"}))
+              '(def foo
+                 (pathim.connect.operation/mutation
+                   'user/foo
+                   {::pco/output [:sample]
+                    ::or-thing   3}
+                   (clojure.core/fn foo [_ _] {:sample "bar"})))))))
+
+(deftest with-node-params-test
+  (is (= (pco/with-node-params {:foo "bar"})
+         {:pathim.connect.planner/node
+          {:pathim.connect.planner/params
+           {:foo "bar"}}}))
+
+  (is (= (pco/with-node-params {:env "data"} {:foo "bar"})
+         {:env
+          "data"
+          :pathim.connect.planner/node
+          {:pathim.connect.planner/params
+           {:foo "bar"}}})))
+
+(deftest params-test
+  (is (= (pco/params {})
+         {}))
+  (is (= (pco/params (pco/with-node-params {:foo "bar"}))
+         {:foo "bar"})))
+
+(deftest update-config-test
+  (is (= (-> (pbir/constantly-resolver :foo "bar")
+             (pco/update-config assoc :extra "data")
+             (pco/operation-config))
+         '{::pco/input    [],
+           ::pco/provides {:foo {}},
+           ::pco/requires {}
+           ::pco/output   [:foo],
+           ::pco/cache?   false,
+           ::pco/op-name  -unqualified/foo--const,
+           :extra         "data"})))
+
+(defn describe-input [input]
+  (h/expose-meta (pco/describe-input input)))
+
+(deftest describe-input-test
+  (is (= (describe-input [])
+         {::pco/requires {}}))
+
+  (is (= (describe-input [:foo])
+         {::pco/requires {:foo {}}}))
+
+  (is (= (describe-input [:foo (pco/? :bar)])
+         {::pco/requires  {:foo {}}
+          ::pco/optionals {:bar {::h/meta {::pfsd/params {::pco/optional? true}}}}}))
+
+  (is (= (describe-input [:foo {:baz [:x (pco/? :y)]}])
+         {::pco/requires  {:foo {}
+                           :baz {:x {}}}
+          ::pco/optionals {:baz {:y {::h/meta {::pfsd/params {::pco/optional? true}}}}}}))
+
+  (is (= (describe-input [:foo {(pco/? :baz) [:x :y]}])
+         {::pco/requires  {:foo {}}
+          ::pco/optionals {:baz {:x {} :y {}
+                                 ::h/meta {::pfsd/params {::pco/optional? true}}}}})))
+
+(deftest final-value-test
+  (is (pco/final-value?
+        (pco/final-value {})))
+
+  (is (not (pco/final-value? {}))))

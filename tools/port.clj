@@ -153,6 +153,17 @@
     (spit out-path final)
     (println (format "  %-52s -> %s" (str (fs/file-name in-path)) out-path))))
 
+(def test-files
+  ["test/helpers"
+   "test/geometry_resolvers"
+   "format/shape_descriptor_test"
+   "format/eql_test"
+   "connect/indexes_test"
+   "connect/operation_test"
+   "connect/planner_test"
+   "connect/built_in/resolvers_test"
+   "interface/eql_test"])
+
 (let [[pathom eql misc out] *command-line-args*]
   (when-not out
     (println "usage: bb tools/port.clj <pathom> <eql> <cljc-misc> <out-dir>")
@@ -161,12 +172,15 @@
   (doseq [[in rel] (concat
                      (for [f ["attribute" "path" "error" "placeholder" "cache" "entity_tree"
                               "plugin" "format/eql" "format/shape_descriptor"
-                              "connect/operation" "connect/indexes" "connect/planner"
+                              "connect/operation" "connect/indexes" "connect/planner" "connect/foreign"
                               "connect/runner" "connect/runner/stats" "interface/eql"
                               "connect/built_in/resolvers" "connect/built_in/plugins"]]
                        [(str pathom "/src/main/com/wsscode/pathom3/" f ".cljc") (str f ".jank")])
                      [[(str eql "/src/edn_query_language/core.cljc") "eql.jank"]]
                      (for [f ["coll" "refs" "time"]]
-                       [(str misc "/src/main/com/wsscode/misc/" f ".cljc") (str "misc/" f ".jank")]))]
+                       [(str misc "/src/main/com/wsscode/misc/" f ".cljc") (str "misc/" f ".jank")])
+                     (for [f test-files]
+                       [(str pathom "/test/com/wsscode/pathom3/" f ".cljc")
+                        (str "TESTS/" f ".jank")]))]
     (when (fs/exists? in)
       (port-file in (str out "/" rel)))))
