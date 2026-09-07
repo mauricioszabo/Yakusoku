@@ -198,6 +198,12 @@ and flattening, error propagation and recovery, cancellation, every combinator, 
 blocking waits, the macros, pool execution and draining, timer ordering, and a GC stress
 test that forces collections while jank values sit in Asio's queue.
 
+## Pathim
+
+The repository also carries [pathim](#pathim), a port of
+[Pathom 3](https://github.com/wilkerlucio/pathom3) built on Yakusoku. See
+[PATHIM.md](PATHIM.md).
+
 ## License
 
 MPL-2.0, matching both jank and promesa.
