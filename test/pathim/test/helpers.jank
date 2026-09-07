@@ -35,13 +35,10 @@
   {:ex/message (ex-message error)
    :ex/data    (ex-data error)})
 
-(defmacro catch-exception [& body]
-     (if (:ns &env)
-       `(try
-          ~@body
-          (catch :default e#
-            (error->data e#)))
-       `(try
-          ~@body
-          (catch Throwable e#
-            (error->data e#)))))
+(defmacro catch-exception
+  "Runs body, returning the thrown error as data rather than propagating it."
+  [& body]
+  `(try
+     ~@body
+     (catch cpp/jank.runtime.object_ref e#
+       (error->data e#))))

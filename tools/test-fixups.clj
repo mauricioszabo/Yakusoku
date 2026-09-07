@@ -25,6 +25,14 @@
         after (-> before
                   (str/replace "(catch #?(:clj Throwable :cljs :default) "
                                "(catch cpp/jank.runtime.object_ref ")
+                  ;; Any catch type jank does not know sends its compiler into a loop
+                  ;; rather than an error -- `(catch Throwable e ...)` alone never finishes
+                  ;; compiling. Every one of these has to go, not just the ones inside a
+                  ;; reader conditional: helpers/catch-exception writes the two branches out
+                  ;; by hand, and that single occurrence was enough to stall two suites
+                  ;; indefinitely.
+                  (str/replace #"\(catch\s+(?:Throwable|Exception|ExceptionInfo|AssertionError|js/Error|:default)\s+"
+                               "(catch cpp/jank.runtime.object_ref ")
                   (str/replace #"\(thrown-with-msg\?\s+(?:AssertionError|Throwable|Exception|ExceptionInfo|js/Error)\s+"
                                "(thrown-with-msg? ")
                   (str/replace #"\(thrown\?\s+(?:AssertionError|Throwable|Exception|ExceptionInfo|js/Error)\s+"
@@ -76,11 +84,12 @@
 (await-derefs! "connect/runner_test.jank" '#{run-graph-async run-graph-parallel})
 
 (edit! "test/helpers.jank"
+  ;; matched after the catch-type pass above has run, so both branches read alike here
   "(defmacro catch-exception [& body]
      (if (:ns &env)
        `(try
           ~@body
-          (catch :default e#
+          (catch cpp/jank.runtime.object_ref e#
             (error->data e#)))
        `(try
           ~@body
@@ -120,6 +129,48 @@
 (edit! "interface/eql_test.jank"
   "    [check.core :refer [=> check]]" "    [pathim.test.check :refer [check]]")
 
+(defn drop-testing!
+  "Removes a (testing \"label\" ...) block. Used where a block tests something the port
+   deliberately does not carry, rather than something it gets wrong."
+  [rel label]
+  (let [path (str root "/" rel)]
+    (when (fs/exists? path)
+      (let [before (slurp path)
+            after (loop [l (z/of-string before {:track-position? false})]
+                    (if (z/end? l)
+                      (z/root-string l)
+                      (if (and (= :list (z/tag l))
+                               (= 'testing (some-> l z/down z/sexpr))
+                               (= label (some-> l z/down z/right z/sexpr)))
+                        (z/root-string (z/remove l))
+                        (recur (z/next l)))))]
+        (when (not= before after)
+          (spit path after)
+          (println "  dropped (testing" (pr-str label) ") from" rel))))))
+
+(defn wrap-calls!
+  "Wraps every call to one of `fns` in a call to `wrapper`: (f ...) becomes (wrapper (f ...))."
+  [rel fns wrapper]
+  (let [path (str root "/" rel)]
+    (when (fs/exists? path)
+      (let [before (slurp path)
+            after (loop [l (z/of-string before {:track-position? false})]
+                    (if (z/end? l)
+                      (z/root-string l)
+                      (if (and (= :list (z/tag l))
+                               (contains? fns (some-> l z/down z/sexpr))
+                               ;; not already wrapped -- otherwise walking into the node
+                               ;; just created matches it again, forever
+                               (not= wrapper (some-> l z/up z/down z/sexpr)))
+                        (let [inner (z/node l)]
+                          (recur (z/next (z/replace l (n/list-node [(n/token-node wrapper)
+                                                                    (n/spaces 1)
+                                                                    inner])))))
+                        (recur (z/next l)))))]
+        (when (not= before after)
+          (spit path after)
+          (println "  wrapped" (pr-str fns) "in" (pr-str wrapper) "in" rel))))))
+
 (defn callable-resolvers!
   "Rewrites calls that treat a resolver as a function into pop/-op-resolve calls.
 
@@ -132,7 +183,8 @@
 
    Two call shapes are rewritten: ((expr ...) ...), where the head is itself a call
    producing a resolver, and (sym ...) for the locals named in `locals`."
-  [rel locals]
+  ([rel locals] (callable-resolvers! rel locals 'pop/-op-resolve))
+  ([rel locals op-fn]
   (let [path (str root "/" rel)]
     (when (fs/exists? path)
       (let [before (slurp path)
@@ -155,14 +207,14 @@
                                       1 [(n/map-node []) (first args)]
                                       (vec args))]
                           (recur (z/next (z/replace l (n/list-node
-                                                        (into [(n/token-node 'pop/-op-resolve)
+                                                        (into [(n/token-node op-fn)
                                                                (n/spaces 1)
                                                                target]
                                                               (mapcat (fn [a] [(n/spaces 1) a]) args')))))))
                         (recur (z/next l)))))]
         (when (not= before after)
           (spit path after)
-          (println "  rewrote resolver calls in" rel))))))
+          (println "  rewrote resolver calls in" rel)))))))
 
 ;; SmartMaps are not part of this port, and a resolver is not directly callable here.
 (edit! "connect/built_in/resolvers_test.jank"
@@ -188,3 +240,80 @@
                   "$1\n(cpp/raw \"double pathim_sqrt(double n) { return std::sqrt(n); }\")\n"))))))
 
 (println "test fixups applied")
+
+;; operation_test conforms defresolver's arguments with clojure.spec, which this port does
+;; not carry: the parsing is hand-written in pathim.connect.operation and produces exactly
+;; the same shape, down to the [:sym env] tagging. The only difference is that it always
+;; carries :docstring and :options, nil when absent, where spec omits the key -- so the
+;; nils are dropped rather than the assertions changed.
+;;
+;; Two blocks in that suite test spec itself rather than the port: conforming a single
+;; destructuring argument (there is no such function here, only the whole-arglist parser)
+;; and spec's explain-data. The first is dropped; the second is replaced by an assertion
+;; that the same input is rejected, which is the behaviour it was really checking.
+(edit! "connect/operation_test.jank"
+  "(s/conform :pathim.connect.operation/defresolver-args" "(conform-defresolver-args"
+  "(deftest defresolver-syntax-test"
+  "(defn- conform-defresolver-args
+  \"pco/conform-defresolver-args, with the keys spec would have omitted removed.\"
+  [args]
+  (into {} (remove (fn [entry] (nil? (second entry)))) (pco/conform-defresolver-args args)))
+
+(deftest defresolver-args-must-declare-output-test
+  ;; Upstream asserts on spec's explain-data here. This port raises instead; what the test
+  ;; is really checking -- that a resolver with neither options nor a trailing map is
+  ;; rejected -- holds either way.
+  (is (= :rejected
+         (try (pco/conform-defresolver-args '[foo [env input] \"bar\"])
+              :not-rejected
+              (catch cpp/jank.runtime.object_ref _ :rejected)))))
+
+(deftest defresolver-syntax-test")
+
+(edit! "connect/operation_test.jank"
+  ;; Registering a spec so that spec's conform/unform round-trip preserves an unknown
+  ;; option. There is no spec here and nothing to round-trip through, but what the block
+  ;; goes on to assert -- that defresolver's expansion keeps the option value intact --
+  ;; still holds and is still worth checking, so only the registration goes.
+  "       (s/def :pathim.connect.operation-test/or-thing (s/or :foo int? :bar string?))\n\n" "")
+
+(drop-testing! "connect/operation_test.jank" "argument destructuring")
+(drop-testing! "connect/operation_test.jank" "fails without options or visible map")
+
+;; The defresolver/defmutation expansion tests compare against a literal that names the
+;; operation `user/foo`. That namespace is not part of what they are checking -- it is
+;; whatever *ns* happens to be, and Clojure's test runner leaves it as `user` while jank's
+;; is its own namespace. Normalising the one quoted symbol on the actual side keeps the
+;; assertion about the expansion's shape, which is the whole point of it.
+(edit! "connect/operation_test.jank"
+  "(deftest defresolver-syntax-test"
+  "(defn- normalize-op-name
+  \"Rewrites (quote some.ns/foo) to (quote user/foo) anywhere in a form.\"
+  [form]
+  (cond
+    (and (seq? form) (= 'quote (first form)) (symbol? (second form)) (namespace (second form)))
+    (list 'quote (symbol \"user\" (name (second form))))
+
+    ;; the lambda is not redundant: jank's compiler crashes on a function handing itself
+    ;; to another function from inside its own body
+    (seq? form) (apply list (map (fn [x] (normalize-op-name x)) form))
+    (vector? form) (mapv (fn [x] (normalize-op-name x)) form)
+    (map? form) (into {} (map (fn [e] [(normalize-op-name (key e)) (normalize-op-name (val e))])) form)
+    :else form))
+
+(deftest defresolver-syntax-test")
+
+(wrap-calls! "connect/operation_test.jank" '#{macroexpand-1} 'normalize-op-name)
+
+;; operation_test does the same thing resolvers_test does, on both operation kinds, and
+;; one block of it tests IFn-ness directly (calling a resolver through `apply`, including
+;; its arity error). That block is about a capability jank cannot give a map at all, so it
+;; goes; the ordinary calls are rewritten to the supported form.
+(edit! "connect/operation_test.jank"
+  "    [pathim.connect.operation :as pco]"
+  "    [pathim.connect.operation :as pco]\n    [pathim.connect.operation.protocols :as pop]")
+
+(drop-testing! "connect/operation_test.jank" "user can call resolver via apply")
+(drop-testing! "connect/operation_test.jank" "user can call mutations via apply")
+(callable-resolvers! "connect/operation_test.jank" '#{resolver} 'pop/-op-resolve)
+(callable-resolvers! "connect/operation_test.jank" '#{mutation} 'pop/-op-mutate)

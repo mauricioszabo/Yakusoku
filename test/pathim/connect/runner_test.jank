@@ -197,7 +197,7 @@
           (check (~'=> ~expected
                        (let [res# (ctry
                                     (runner# ~env ~entity ~tx)
-                                    (catch Throwable e#
+                                    (catch cpp/jank.runtime.object_ref e#
                                       {:ex/message (ex-message e#)
                                        :ex/data    (ex-data e#)}))]
                          (if (p/promise? res#)
@@ -3315,7 +3315,7 @@
                (fn [env params]
                  (try
                    (mutate env params)
-                   (catch Throwable err
+                   (catch cpp/jank.runtime.object_ref err
                      {:pathim.connect.runner/mutation-error (ex-message err)}))))}))
       {}
       '[(foo {})
@@ -3572,7 +3572,7 @@
                                     (fn [env ast]
                                       (try
                                         (mutation env ast)
-                                        (catch Throwable e
+                                        (catch cpp/jank.runtime.object_ref e
                                           (reset! err* e)
                                           nil))))}))
             {}

@@ -38,7 +38,7 @@
   (try
     (f)
     (raise! (ex-info "Expected error wasn't thrown" {}))
-    (catch Throwable e
+    (catch cpp/jank.runtime.object_ref e
       {:ex/message (ex-message e)
        :ex/data    (ex-data e)})))
 

@@ -135,7 +135,7 @@
                               (raise! (ex-info "hello" {:world 42})))))
         ex  (try
               @(p.a.eql/process env [:a])
-              (catch Throwable ex
+              (catch cpp/jank.runtime.object_ref ex
                 ex))
         msg (ex-message ex)]
     (testing
