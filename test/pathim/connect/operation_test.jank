@@ -8,44 +8,44 @@
 
 (deftest resolver-test
   (testing "creating resolvers"
-    (let [resolver (pco/resolver 'foo {::pco/output [:foo]} (fn [_ _] {:foo "bar"}))]
+    (let [resolver (pco/resolver 'foo {:pathim.connect.operation/output [:foo]} (fn [_ _] {:foo "bar"}))]
       (is (= (resolver)
              {:foo "bar"}))
 
       (is (= (pco/operation-config resolver)
-             {::pco/op-name  'foo
-              ::pco/input    []
-              ::pco/provides {:foo {}}
-              ::pco/requires {}
-              ::pco/output   [:foo]})))
+             {:pathim.connect.operation/op-name  'foo
+              :pathim.connect.operation/input    []
+              :pathim.connect.operation/provides {:foo {}}
+              :pathim.connect.operation/requires {}
+              :pathim.connect.operation/output   [:foo]})))
 
-    (let [resolver (pco/resolver 'foo {::pco/input [:required] ::pco/output [:foo]} (fn [_ _] {:foo "bar"}))]
+    (let [resolver (pco/resolver 'foo {:pathim.connect.operation/input [:required] :pathim.connect.operation/output [:foo]} (fn [_ _] {:foo "bar"}))]
       (is (= (resolver)
              {:foo "bar"}))
 
       (is (= (pco/operation-config resolver)
-             {::pco/op-name  'foo
-              ::pco/input    [:required]
-              ::pco/provides {:foo {}}
-              ::pco/requires {:required {}}
-              ::pco/output   [:foo]}))))
+             {:pathim.connect.operation/op-name  'foo
+              :pathim.connect.operation/input    [:required]
+              :pathim.connect.operation/provides {:foo {}}
+              :pathim.connect.operation/requires {:required {}}
+              :pathim.connect.operation/output   [:foo]}))))
 
   (testing "creating resolver from pure maps"
-    (let [resolver (pco/resolver {::pco/op-name 'foo
-                                  ::pco/output  [:foo]
-                                  ::pco/resolve (fn [_ _] "bar")})]
+    (let [resolver (pco/resolver {:pathim.connect.operation/op-name 'foo
+                                  :pathim.connect.operation/output  [:foo]
+                                  :pathim.connect.operation/resolve (fn [_ _] "bar")})]
       (is (= (resolver nil nil)
              "bar"))
 
       (is (= (pco/operation-config resolver)
-             {::pco/op-name  'foo
-              ::pco/output   [:foo]
-              ::pco/input    []
-              ::pco/provides {:foo {}}
-              ::pco/requires {}}))))
+             {:pathim.connect.operation/op-name  'foo
+              :pathim.connect.operation/output   [:foo]
+              :pathim.connect.operation/input    []
+              :pathim.connect.operation/provides {:foo {}}
+              :pathim.connect.operation/requires {}}))))
 
   (testing "user can call resolver via apply"
-    (let [resolver (pco/resolver 'foo {::pco/output [:foo]} (fn [env input]
+    (let [resolver (pco/resolver 'foo {:pathim.connect.operation/output [:foo]} (fn [env input]
                                                               (cond-> {:foo "bar"}
                                                                 (seq env) (assoc :env env)
                                                                 (seq input) (assoc :input input))))]
@@ -70,7 +70,7 @@
 
   (testing "validates configuration map"
     (try
-      (pco/resolver 'foo {::pco/input #{:invalid}} (fn [_ _] {:sample "bar"}))
+      (pco/resolver 'foo {:pathim.connect.operation/input #{:invalid}} (fn [_ _] {:sample "bar"}))
       (catch Throwable e
         (is (= (ex-message e) "Invalid config on resolver foo"))
         (is (= (-> e
@@ -83,51 +83,51 @@
                                                                      :via  [:pathim.connect.operation/input]}]}})))))
 
   (testing "name config overrides syntax name"
-    (let [resolver (pco/resolver 'foo {::pco/op-name 'bar
-                                       ::pco/resolve (fn [_ _] {})}
+    (let [resolver (pco/resolver 'foo {:pathim.connect.operation/op-name 'bar
+                                       :pathim.connect.operation/resolve (fn [_ _] {})}
                      (fn [_ _] {:foo "bar"}))]
       (is (= (pco/operation-config resolver)
-             {::pco/op-name 'bar}))))
+             {:pathim.connect.operation/op-name 'bar}))))
 
   (testing "dynamic resolver"
-    (let [resolver (pco/resolver {::pco/op-name           'foo
-                                  ::pco/dynamic-resolver? true
-                                  ::pco/resolve           (fn [_ _] "bar")})]
+    (let [resolver (pco/resolver {:pathim.connect.operation/op-name           'foo
+                                  :pathim.connect.operation/dynamic-resolver? true
+                                  :pathim.connect.operation/resolve           (fn [_ _] "bar")})]
 
       (is (= (pco/operation-config resolver)
-             {::pco/op-name           'foo
-              ::pco/dynamic-resolver? true}))))
+             {:pathim.connect.operation/op-name           'foo
+              :pathim.connect.operation/dynamic-resolver? true}))))
 
   (testing "transform"
-    (let [resolver (pco/resolver 'foo {::pco/output    [:foo]
-                                       ::pco/transform (fn [config]
-                                                         (assoc config ::other "bar"))}
+    (let [resolver (pco/resolver 'foo {:pathim.connect.operation/output    [:foo]
+                                       :pathim.connect.operation/transform (fn [config]
+                                                         (assoc config :pathim.connect.operation-test/other "bar"))}
                      (fn [_ _] {:foo "bar"}))]
       (is (= (pco/operation-config resolver)
-             {::pco/op-name  'foo
-              ::other        "bar"
-              ::pco/output   [:foo]
-              ::pco/input    []
-              ::pco/provides {:foo {}}
-              ::pco/requires {}}))))
+             {:pathim.connect.operation/op-name  'foo
+              :pathim.connect.operation-test/other        "bar"
+              :pathim.connect.operation/output   [:foo]
+              :pathim.connect.operation/input    []
+              :pathim.connect.operation/provides {:foo {}}
+              :pathim.connect.operation/requires {}}))))
 
   (testing "defining optional inputs"
     (let [resolver (pco/resolver 'foo
-                     {::pco/input  [:x (pco/? :y)]
-                      ::pco/output [:foo]}
+                     {:pathim.connect.operation/input  [:x (pco/? :y)]
+                      :pathim.connect.operation/output [:foo]}
                      (fn [_ _] {:foo "bar"}))]
       (is (= (pco/operation-config resolver)
-             {::pco/op-name   'foo
-              ::pco/output    [:foo]
-              ::pco/input     [:x (pco/? :y)]
-              ::pco/provides  {:foo {}}
-              ::pco/requires  {:x {}}
-              ::pco/optionals {:y {}}}))))
+             {:pathim.connect.operation/op-name   'foo
+              :pathim.connect.operation/output    [:foo]
+              :pathim.connect.operation/input     [:x (pco/? :y)]
+              :pathim.connect.operation/provides  {:foo {}}
+              :pathim.connect.operation/requires  {:x {}}
+              :pathim.connect.operation/optionals {:y {}}}))))
 
   (testing "noop when called with a resolver"
-    (let [resolver (-> {::pco/op-name 'foo
-                        ::pco/output  [:foo]
-                        ::pco/resolve (fn [_ _] "bar")}
+    (let [resolver (-> {:pathim.connect.operation/op-name 'foo
+                        :pathim.connect.operation/output  [:foo]
+                        :pathim.connect.operation/resolve (fn [_ _] "bar")}
                        (pco/resolver)
                        (pco/resolver)
                        (pco/resolver))]
@@ -135,37 +135,37 @@
              "bar"))
 
       (is (= (pco/operation-config resolver)
-             {::pco/op-name  'foo
-              ::pco/output   [:foo]
-              ::pco/input    []
-              ::pco/provides {:foo {}}
-              ::pco/requires {}})))))
+             {:pathim.connect.operation/op-name  'foo
+              :pathim.connect.operation/output   [:foo]
+              :pathim.connect.operation/input    []
+              :pathim.connect.operation/provides {:foo {}}
+              :pathim.connect.operation/requires {}})))))
 
 (deftest mutation-test
   (testing "creating mutations"
-    (let [mutation (pco/mutation 'foo {::pco/output [:foo]} (fn [_ _] {:foo "bar"}))]
+    (let [mutation (pco/mutation 'foo {:pathim.connect.operation/output [:foo]} (fn [_ _] {:foo "bar"}))]
       (is (= (mutation)
              {:foo "bar"}))
 
       (is (= (pco/operation-config mutation)
-             {::pco/op-name  'foo
-              ::pco/provides {:foo {}}
-              ::pco/output   [:foo]}))))
+             {:pathim.connect.operation/op-name  'foo
+              :pathim.connect.operation/provides {:foo {}}
+              :pathim.connect.operation/output   [:foo]}))))
 
   (testing "creating mutation from pure maps"
-    (let [mutation (pco/mutation {::pco/op-name 'foo
-                                  ::pco/output  [:foo]
-                                  ::pco/mutate  (fn [_ _] {:foo "bar"})})]
+    (let [mutation (pco/mutation {:pathim.connect.operation/op-name 'foo
+                                  :pathim.connect.operation/output  [:foo]
+                                  :pathim.connect.operation/mutate  (fn [_ _] {:foo "bar"})})]
       (is (= (mutation nil nil)
              {:foo "bar"}))
 
       (is (= (pco/operation-config mutation)
-             {::pco/op-name  'foo
-              ::pco/output   [:foo]
-              ::pco/provides {:foo {}}}))))
+             {:pathim.connect.operation/op-name  'foo
+              :pathim.connect.operation/output   [:foo]
+              :pathim.connect.operation/provides {:foo {}}}))))
 
   (testing "user can call mutations via apply"
-    (let [resolver (pco/mutation 'foo {::pco/output [:foo]} (fn [env params]
+    (let [resolver (pco/mutation 'foo {:pathim.connect.operation/output [:foo]} (fn [env params]
                                                               (cond-> {:foo "bar"}
                                                                 (seq env) (assoc :env env)
                                                                 (seq params) (assoc :params params))))]
@@ -190,7 +190,7 @@
 
   (testing "validates configuration map"
     (try
-      (pco/mutation 'foo {::pco/input #{:invalid}} (fn [_ _] {:sample "bar"}))
+      (pco/mutation 'foo {:pathim.connect.operation/input #{:invalid}} (fn [_ _] {:sample "bar"}))
       (catch Throwable e
         (is (= (ex-message e) "Invalid config on mutation foo"))
         (is (= (-> e
@@ -203,27 +203,27 @@
                                                                      :via  [:pathim.connect.operation/input]}]}})))))
 
   (testing "name config overrides syntax name"
-    (let [mutation (pco/mutation 'foo {::pco/op-name 'bar
-                                       ::pco/mutate  (fn [_ _] {})}
+    (let [mutation (pco/mutation 'foo {:pathim.connect.operation/op-name 'bar
+                                       :pathim.connect.operation/mutate  (fn [_ _] {})}
                      (fn [_ _] {:foo "bar"}))]
       (is (= (pco/operation-config mutation)
-             {::pco/op-name 'bar}))))
+             {:pathim.connect.operation/op-name 'bar}))))
 
   (testing "transform"
-    (let [mutation (pco/mutation 'foo {::pco/output    [:foo]
-                                       ::pco/transform (fn [config]
-                                                         (assoc config ::other "bar"))}
+    (let [mutation (pco/mutation 'foo {:pathim.connect.operation/output    [:foo]
+                                       :pathim.connect.operation/transform (fn [config]
+                                                         (assoc config :pathim.connect.operation-test/other "bar"))}
                      (fn [_ _] {:foo "bar"}))]
       (is (= (pco/operation-config mutation)
-             {::pco/op-name  'foo
-              ::other        "bar"
-              ::pco/output   [:foo]
-              ::pco/provides {:foo {}}}))))
+             {:pathim.connect.operation/op-name  'foo
+              :pathim.connect.operation-test/other        "bar"
+              :pathim.connect.operation/output   [:foo]
+              :pathim.connect.operation/provides {:foo {}}}))))
 
   (testing "noop when called with a mutation"
-    (let [mutation (-> {::pco/op-name 'foo
-                        ::pco/output  [:foo]
-                        ::pco/mutate  (fn [_ _] {:data "bar"})}
+    (let [mutation (-> {:pathim.connect.operation/op-name 'foo
+                        :pathim.connect.operation/output  [:foo]
+                        :pathim.connect.operation/mutate  (fn [_ _] {:data "bar"})}
                        (pco/mutation)
                        (pco/mutation)
                        (pco/mutation))]
@@ -231,68 +231,68 @@
              {:data "bar"}))
 
       (is (= (pco/operation-config mutation)
-             {::pco/op-name  'foo
-              ::pco/output   [:foo]
-              ::pco/provides {:foo {}}})))))
+             {:pathim.connect.operation/op-name  'foo
+              :pathim.connect.operation/output   [:foo]
+              :pathim.connect.operation/provides {:foo {}}})))))
 
 (deftest defresolver-syntax-test
      (testing "classic form"
-       (is (= (s/conform ::pco/defresolver-args '[foo [env input]
-                                                  {::pco/output [:foo]}
+       (is (= (s/conform :pathim.connect.operation/defresolver-args '[foo [env input]
+                                                  {:pathim.connect.operation/output [:foo]}
                                                   {:foo "bar"}])
               '{:name    foo
                 :arglist [[:sym env] [:sym input]]
-                :options {::pco/output [:foo]}
+                :options {:pathim.connect.operation/output [:foo]}
                 :body    [{:foo "bar"}]})))
 
      (testing "docstring"
-       (is (= (s/conform ::pco/defresolver-args '[foo "doc here" [env input]
-                                                  {::pco/output [:foo]}
+       (is (= (s/conform :pathim.connect.operation/defresolver-args '[foo "doc here" [env input]
+                                                  {:pathim.connect.operation/output [:foo]}
                                                   {:foo "bar"}])
               '{:name      foo
                 :docstring "doc here"
                 :arglist   [[:sym env] [:sym input]]
-                :options   {::pco/output [:foo]}
+                :options   {:pathim.connect.operation/output [:foo]}
                 :body      [{:foo "bar"}]})))
 
      (testing "visible output shape"
-       (is (= (s/conform ::pco/defresolver-args '[foo [env input] {:foo "bar"}])
+       (is (= (s/conform :pathim.connect.operation/defresolver-args '[foo [env input] {:foo "bar"}])
               '{:name    foo
                 :arglist [[:sym env] [:sym input]]
                 :body    [{:foo "bar"}]})))
 
      (testing "argument destructuring"
-       (is (= (s/conform ::pco/operation-argument 'foo)
+       (is (= (s/conform :pathim.connect.operation/operation-argument 'foo)
               '[:sym foo]))
 
-       (is (= (s/conform ::pco/operation-argument '{:keys [foo]})
+       (is (= (s/conform :pathim.connect.operation/operation-argument '{:keys [foo]})
               '[:map {:keys [foo]}]))
 
-       (is (= (s/conform ::pco/operation-argument '{:keys [foo] :as bar})
+       (is (= (s/conform :pathim.connect.operation/operation-argument '{:keys [foo] :as bar})
               '[:map {:keys [foo] :as bar}]))
 
-       (is (= (s/conform ::pco/operation-argument '{:keys [foo] :or {foo 123}})
+       (is (= (s/conform :pathim.connect.operation/operation-argument '{:keys [foo] :or {foo 123}})
               '[:map {:keys [foo] :or {foo 123}}]))
 
-       (is (= (s/conform ::pco/operation-argument '{:strs [foo]})
+       (is (= (s/conform :pathim.connect.operation/operation-argument '{:strs [foo]})
               :clojure.spec.alpha/invalid))
 
        (testing "keywords on keys"
-         (is (= (s/conform ::pco/operation-argument '{:keys [:foo]})
+         (is (= (s/conform :pathim.connect.operation/operation-argument '{:keys [:foo]})
                 '[:map {:keys [:foo]}]))
 
-         (is (= (s/conform ::pco/operation-argument '{:keys [:foo/bar]})
+         (is (= (s/conform :pathim.connect.operation/operation-argument '{:keys [:foo/bar]})
                 '[:map {:keys [:foo/bar]}])))
 
        (testing "support optionals via :or"
-         (is (= (s/conform ::pco/operation-argument '{:keys [:foo]
+         (is (= (s/conform :pathim.connect.operation/operation-argument '{:keys [:foo]
                                                       :or   {foo 123}})
                 '[:map {:keys [:foo]
                         :or   {foo 123}}]))))
 
      (testing "fails without options or visible map"
-       (is (= (s/explain-data ::pco/defresolver-args '[foo [env input] "bar"])
-              '{:clojure.spec.alpha/problems [{:path [], :pred (clojure.core/fn must-have-output-visible-map-or-options [{:keys [body options]}] (clojure.core/or (clojure.core/map? (clojure.core/last body)) options)), :val {:name foo, :arglist [[:sym env] [:sym input]], :body ["bar"]}, :via [:??_pco_??/defresolver-args], :in []}], :clojure.spec.alpha/spec :??_pco_??/defresolver-args, :clojure.spec.alpha/value [foo [env input] "bar"]}))))
+       (is (= (s/explain-data :pathim.connect.operation/defresolver-args '[foo [env input] "bar"])
+              '{:clojure.spec.alpha/problems [{:path [], :pred (clojure.core/fn must-have-output-visible-map-or-options [{:keys [body options]}] (clojure.core/or (clojure.core/map? (clojure.core/last body)) options)), :val {:name foo, :arglist [[:sym env] [:sym input]], :body ["bar"]}, :via [:pathim.connect.operation/defresolver-args], :in []}], :clojure.spec.alpha/spec :pathim.connect.operation/defresolver-args, :clojure.spec.alpha/value [foo [env input] "bar"]}))))
 
 (deftest extract-destructure-map-keys-as-keywords-test
   (is (= (pco/extract-destructure-map-keys-as-keywords
@@ -317,25 +317,25 @@
     (is (= (pco/extract-destructure-map-keys-as-keywords
              '{:keys [foo]
                :or   {foo "bar"}})
-           [`(list :foo {::pco/optional? true})]))
+           [`(list :foo {:pathim.connect.operation/optional? true})]))
 
     (testing "namespaced key"
       (is (= (pco/extract-destructure-map-keys-as-keywords
                '{:some/keys [foo]
                  :or        {foo "bar"}})
-             [`(list :some/foo {::pco/optional? true})])))
+             [`(list :some/foo {:pathim.connect.operation/optional? true})])))
 
     (testing "namespaced symbol"
       (is (= (pco/extract-destructure-map-keys-as-keywords
                '{:keys [some/foo]
                  :or   {foo "bar"}})
-             [`(list :some/foo {::pco/optional? true})])))
+             [`(list :some/foo {:pathim.connect.operation/optional? true})])))
 
     (testing "symbol application"
       (is (= (pco/extract-destructure-map-keys-as-keywords
                '{sym :some/foo
                  :or {sym "bar"}})
-             [`(list :some/foo {::pco/optional? true})]))))
+             [`(list :some/foo {:pathim.connect.operation/optional? true})]))))
 
   (is (= (pco/extract-destructure-map-keys-as-keywords
            '{renamed :foo})
@@ -354,34 +354,34 @@
     (is (= (pco/params->resolver-options
              '{:name    foo
                :arglist [[:name env] [:name input]]
-               :options {::pco/output [:foo]}
+               :options {:pathim.connect.operation/output [:foo]}
                :body    [{:foo "bar"}]})
-           {::pco/output [:foo]})))
+           {:pathim.connect.operation/output [:foo]})))
 
   (testing "inferred input"
     (is (= (pco/params->resolver-options
              '{:name    foo
                :arglist [[:sym env] [:map {:keys [dep]}]]
                :body    [{:foo "bar"}]})
-           {::pco/inferred-input [:dep]
-            ::pco/output         [:foo]}))
+           {:pathim.connect.operation/inferred-input [:dep]
+            :pathim.connect.operation/output         [:foo]}))
 
     (testing "preserve user input when defined"
       (is (= (pco/params->resolver-options
                '{:name    foo
                  :arglist [[:sym env] [:map {:keys [dep]}]]
-                 :options {::pco/input [:dep :other]}
+                 :options {:pathim.connect.operation/input [:dep :other]}
                  :body    [{:foo "bar"}]})
-             {::pco/inferred-input [:dep]
-              ::pco/input          [:dep :other]
-              ::pco/output         [:foo]}))))
+             {:pathim.connect.operation/inferred-input [:dep]
+              :pathim.connect.operation/input          [:dep :other]
+              :pathim.connect.operation/output         [:foo]}))))
 
   (testing "implicit output"
     (is (= (pco/params->resolver-options
              '{:name    foo
                :arglist [[:sym env] [:sym input]]
                :body    [nil {:foo "bar"}]})
-           {::pco/output [:foo]}))
+           {:pathim.connect.operation/output [:foo]}))
 
     (testing "nested body"
       (is (= (pco/params->resolver-options
@@ -391,7 +391,7 @@
                             :buz  "baz"
                             :deep {:nested (call-something)}
                             :seq  [{:with "things"} {:around "here "}]}]})
-             {::pco/output [:buz
+             {:pathim.connect.operation/output [:buz
                             {:deep [:nested]}
                             :foo
                             {:seq [:with :around]}]})))
@@ -400,43 +400,43 @@
       (is (= (pco/params->resolver-options
                '{:name    foo
                  :arglist [[:sym env] [:sym input]]
-                 :options {::pco/output [:foo :bar]}
+                 :options {:pathim.connect.operation/output [:foo :bar]}
                  :body    [{:foo "bar"}]})
-             {::pco/output [:foo :bar]})))))
+             {:pathim.connect.operation/output [:foo :bar]})))))
 
 (deftest params->mutation-options-test
   (testing "classic case"
     (is (= (pco/params->mutation-options
              '{:name    foo
                :arglist [[:name env] [:name input]]
-               :options {::pco/output [:foo]}
+               :options {:pathim.connect.operation/output [:foo]}
                :body    [{:foo "bar"}]})
-           {::pco/output [:foo]})))
+           {:pathim.connect.operation/output [:foo]})))
 
   (testing "inferred params"
     (is (= (pco/params->mutation-options
              '{:name    foo
                :arglist [[:sym env] [:map {:keys [dep]}]]
                :body    [{:foo "bar"}]})
-           {::pco/inferred-params [:dep]
-            ::pco/output          [:foo]}))
+           {:pathim.connect.operation/inferred-params [:dep]
+            :pathim.connect.operation/output          [:foo]}))
 
     (testing "preserve user params when defined, and merges with inferred"
       (is (= (pco/params->mutation-options
                '{:name    foo
                  :arglist [[:sym env] [:map {:keys [dep more]}]]
-                 :options {::pco/params [:dep :other]}
+                 :options {:pathim.connect.operation/params [:dep :other]}
                  :body    [{:foo "bar"}]})
-             {::pco/params          [:dep :other]
-              ::pco/inferred-params [:dep :more]
-              ::pco/output          [:foo]}))))
+             {:pathim.connect.operation/params          [:dep :other]
+              :pathim.connect.operation/inferred-params [:dep :more]
+              :pathim.connect.operation/output          [:foo]}))))
 
   (testing "implicit output"
     (is (= (pco/params->mutation-options
              '{:name    foo
                :arglist [[:sym env] [:sym params]]
                :body    [nil {:foo "bar"}]})
-           {::pco/output [:foo]}))
+           {:pathim.connect.operation/output [:foo]}))
 
     (testing "nested body"
       (is (= (pco/params->mutation-options
@@ -446,7 +446,7 @@
                             :buz  "baz"
                             :deep {:nested (call-something)}
                             :seq  [{:with "things"} {:around "here "}]}]})
-             {::pco/output [:buz
+             {:pathim.connect.operation/output [:buz
                             {:deep [:nested]}
                             :foo
                             {:seq [:with :around]}]})))
@@ -455,9 +455,9 @@
       (is (= (pco/params->mutation-options
                '{:name    foo
                  :arglist [[:sym env] [:sym params]]
-                 :options {::pco/output [:foo :bar]}
+                 :options {:pathim.connect.operation/output [:foo :bar]}
                  :body    [{:foo "bar"}]})
-             {::pco/output [:foo :bar]})))))
+             {:pathim.connect.operation/output [:foo :bar]})))))
 
 (deftest normalize-arglist-test
   (is (= (pco/normalize-arglist [])
@@ -483,7 +483,7 @@
      (testing "validates configuration map"
        (try
          (macroexpand-1
-           `(pco/defresolver ~'foo ~'[] {::pco/input #{:invalid}} {:sample "bar"}))
+           `(pco/defresolver ~'foo ~'[] {:pathim.connect.operation/input #{:invalid}} {:sample "bar"}))
          (catch Throwable e
            (is (= (-> (ex-cause e)
                       (ex-data)
@@ -501,7 +501,7 @@
 
      (testing "explicit output, no args"
        (is (= (macroexpand-1
-                `(pco/defresolver ~'foo ~'[] {::pco/output [:foo]} {:foo "bar"}))
+                `(pco/defresolver ~'foo ~'[] {:pathim.connect.operation/output [:foo]} {:foo "bar"}))
               '(def foo
                  (pathim.connect.operation/resolver
                    'user/foo
@@ -531,7 +531,7 @@
 
      (testing "implicit output, including implicit inputs via destructuring"
        (is (= (macroexpand-1
-                `(pco/defresolver ~'foo ~'[{:keys [dep]}] {::pco/output [{:sample [:thing]}]} {:sample "bar"}))
+                `(pco/defresolver ~'foo ~'[{:keys [dep]}] {:pathim.connect.operation/output [{:sample [:thing]}]} {:sample "bar"}))
               '(def foo
                  (pathim.connect.operation/resolver
                    'user/foo
@@ -540,7 +540,7 @@
 
      (testing "explicit input"
        (is (= (macroexpand-1
-                `(pco/defresolver ~'foo ~'[input] {::pco/input [:foo]} {:bar "baz"}))
+                `(pco/defresolver ~'foo ~'[input] {:pathim.connect.operation/input [:foo]} {:bar "baz"}))
               '(def foo
                  (pathim.connect.operation/resolver
                    'user/foo
@@ -549,7 +549,7 @@
 
      (testing "explicit input merges with implicit input"
        (is (= (macroexpand-1
-                `(pco/defresolver ~'foo ~'[{:keys [foo bar]}] {::pco/input [{:foo [:sub]}]} {:bar "baz"}))
+                `(pco/defresolver ~'foo ~'[{:keys [foo bar]}] {:pathim.connect.operation/input [{:foo [:sub]}]} {:bar "baz"}))
               '(def foo
                  (pathim.connect.operation/resolver
                    'user/foo
@@ -560,7 +560,7 @@
 
      (testing "recursive nested inputs"
        (is (= (macroexpand-1
-                `(pco/defresolver ~'foo ~'[input] {::pco/input [:foo {:bar ~'...}]} {:bar "baz"}))
+                `(pco/defresolver ~'foo ~'[input] {:pathim.connect.operation/input [:foo {:bar ~'...}]} {:bar "baz"}))
               '(def foo
                  (pathim.connect.operation/resolver
                    'user/foo
@@ -568,15 +568,15 @@
                    (clojure.core/fn foo [_ input] {:bar "baz"}))))))
 
      (testing "unform options to retain data"
-       (s/def ::or-thing (s/or :foo int? :bar string?))
+       (s/def :pathim.connect.operation-test/or-thing (s/or :foo int? :bar string?))
 
        (is (= (macroexpand-1
-                `(pco/defresolver ~'foo ~'[] {::or-thing 3} {:sample "bar"}))
+                `(pco/defresolver ~'foo ~'[] {:pathim.connect.operation-test/or-thing 3} {:sample "bar"}))
               '(def foo
                  (pathim.connect.operation/resolver
                    'user/foo
-                   {::pco/output [:sample]
-                    ::or-thing   3}
+                   {:pathim.connect.operation/output [:sample]
+                    :pathim.connect.operation-test/or-thing   3}
                    (clojure.core/fn foo [_ _] {:sample "bar"})))))))
 
 (deftest defmutation-test
@@ -601,7 +601,7 @@
 
      (testing "explicit output, no args"
        (is (= (macroexpand-1
-                `(pco/defmutation ~'foo ~'[] {::pco/output [:foo]} {:foo "bar"}))
+                `(pco/defmutation ~'foo ~'[] {:pathim.connect.operation/output [:foo]} {:foo "bar"}))
               '(def foo
                  (pathim.connect.operation/mutation
                    'user/foo
@@ -623,12 +623,12 @@
               '(def foo
                  (pathim.connect.operation/mutation
                    'user/foo
-                   {:pathim.connect.operation/output [:sample], :pathim.connect.operation/inferred-params [(clojure.core/list :dep {:??_pco_??/optional? true})]}
+                   {:pathim.connect.operation/output [:sample], :pathim.connect.operation/inferred-params [(clojure.core/list :dep {:pathim.connect.operation/optional? true})]}
                    (clojure.core/fn foo [_ {:keys [dep] :or {dep true}}] {:sample "bar"}))))))
 
      (testing "implicit output, including implicit params via destructuring"
        (is (= (macroexpand-1
-                `(pco/defmutation ~'foo ~'[{:keys [dep]}] {::pco/output [{:sample [:thing]}]} {:sample "bar"}))
+                `(pco/defmutation ~'foo ~'[{:keys [dep]}] {:pathim.connect.operation/output [{:sample [:thing]}]} {:sample "bar"}))
               '(def foo
                  (pathim.connect.operation/mutation
                    'user/foo
@@ -636,15 +636,15 @@
                    (clojure.core/fn foo [_ {:keys [dep]}] {:sample "bar"}))))))
 
      (testing "unform options to retain data"
-       (s/def ::or-thing (s/or :foo int? :bar string?))
+       (s/def :pathim.connect.operation-test/or-thing (s/or :foo int? :bar string?))
 
        (is (= (macroexpand-1
-                `(pco/defmutation ~'foo ~'[] {::or-thing 3} {:sample "bar"}))
+                `(pco/defmutation ~'foo ~'[] {:pathim.connect.operation-test/or-thing 3} {:sample "bar"}))
               '(def foo
                  (pathim.connect.operation/mutation
                    'user/foo
-                   {::pco/output [:sample]
-                    ::or-thing   3}
+                   {:pathim.connect.operation/output [:sample]
+                    :pathim.connect.operation-test/or-thing   3}
                    (clojure.core/fn foo [_ _] {:sample "bar"})))))))
 
 (deftest with-node-params-test
@@ -670,12 +670,12 @@
   (is (= (-> (pbir/constantly-resolver :foo "bar")
              (pco/update-config assoc :extra "data")
              (pco/operation-config))
-         '{::pco/input    [],
-           ::pco/provides {:foo {}},
-           ::pco/requires {}
-           ::pco/output   [:foo],
-           ::pco/cache?   false,
-           ::pco/op-name  -unqualified/foo--const,
+         '{:pathim.connect.operation/input    [],
+           :pathim.connect.operation/provides {:foo {}},
+           :pathim.connect.operation/requires {}
+           :pathim.connect.operation/output   [:foo],
+           :pathim.connect.operation/cache?   false,
+           :pathim.connect.operation/op-name  -unqualified/foo--const,
            :extra         "data"})))
 
 (defn describe-input [input]
@@ -683,24 +683,24 @@
 
 (deftest describe-input-test
   (is (= (describe-input [])
-         {::pco/requires {}}))
+         {:pathim.connect.operation/requires {}}))
 
   (is (= (describe-input [:foo])
-         {::pco/requires {:foo {}}}))
+         {:pathim.connect.operation/requires {:foo {}}}))
 
   (is (= (describe-input [:foo (pco/? :bar)])
-         {::pco/requires  {:foo {}}
-          ::pco/optionals {:bar {::h/meta {::pfsd/params {::pco/optional? true}}}}}))
+         {:pathim.connect.operation/requires  {:foo {}}
+          :pathim.connect.operation/optionals {:bar {:pathim.test.helpers/meta {:pathim.format.shape-descriptor/params {:pathim.connect.operation/optional? true}}}}}))
 
   (is (= (describe-input [:foo {:baz [:x (pco/? :y)]}])
-         {::pco/requires  {:foo {}
+         {:pathim.connect.operation/requires  {:foo {}
                            :baz {:x {}}}
-          ::pco/optionals {:baz {:y {::h/meta {::pfsd/params {::pco/optional? true}}}}}}))
+          :pathim.connect.operation/optionals {:baz {:y {:pathim.test.helpers/meta {:pathim.format.shape-descriptor/params {:pathim.connect.operation/optional? true}}}}}}))
 
   (is (= (describe-input [:foo {(pco/? :baz) [:x :y]}])
-         {::pco/requires  {:foo {}}
-          ::pco/optionals {:baz {:x {} :y {}
-                                 ::h/meta {::pfsd/params {::pco/optional? true}}}}})))
+         {:pathim.connect.operation/requires  {:foo {}}
+          :pathim.connect.operation/optionals {:baz {:x {} :y {}
+                                 :pathim.test.helpers/meta {:pathim.format.shape-descriptor/params {:pathim.connect.operation/optional? true}}}}})))
 
 (deftest final-value-test
   (is (pco/final-value?

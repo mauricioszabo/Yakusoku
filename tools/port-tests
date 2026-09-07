@@ -15,25 +15,26 @@ work="${TMPDIR:-/tmp}/pathim-port-tests"
 rm -rf "$work" && mkdir -p "$work"
 cd "${root}/tools"
 
-echo "1/4 transforming (guardrails, spec, namespaces, throws)"
+echo "1/6 transforming (guardrails, spec, namespaces, throws)"
 bb port.clj "$pathom" "$eql" "$misc" "$work" | grep -i test || true
 
-echo "2/4 resolving reader conditionals to their :clj branch"
+echo "2/6 resolving reader conditionals to their :clj branch"
 bb resolve-reader-conditionals.clj $(find "${work}/TESTS" -name '*.jank')
 
-echo "3/4 expanding namespaced map literals"
+echo "3/6 resolving auto-resolved keywords"
+bb resolve-auto-keywords.clj $(find "${work}/TESTS" -name '*.jank')
+
+echo "4/6 expanding namespaced map literals"
 bb expand-namespaced-maps.clj $(find "${work}/TESTS" -name '*.jank')
 
-echo "4/4 installing into test/pathim"
+echo "5/6 installing into test/pathim"
 mkdir -p "${root}/test/pathim"
 cp -r "${work}/TESTS/." "${root}/test/pathim/"
 
+echo "6/6 applying the fixups jank requires"
+bb test-fixups.clj "${root}/test/pathim"
+
 cat <<'NOTE'
 
-Done. The following still need applying by hand (see git history for the originals):
-  - test/helpers      : catch-exception takes jank's catch class
-  - format/eql_test   : the defrecord case is dropped (jank has no records)
-  - indexes_test      : check.core's (check (=> expected actual)) becomes (is (= ...))
-  - planner_test      : the unused matcher-combinators require is dropped
-  - resolvers_test    : SmartMap cases are dropped (not part of this port)
+Done.
 NOTE

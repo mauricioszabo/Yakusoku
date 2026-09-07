@@ -12,207 +12,207 @@
          '{:a {{} #{r r2}}})))
 
 (deftest resolver-config-test
-  (let [resolver (pco/resolver 'r {::pco/output [:foo]}
+  (let [resolver (pco/resolver 'r {:pathim.connect.operation/output [:foo]}
                    (fn [_ _] {:foo 42}))
         env      (pci/register resolver)]
     (is (= (pci/resolver-config env 'r)
-           '{::pco/input    []
-             ::pco/op-name  r
-             ::pco/output   [:foo]
-             ::pco/provides {:foo {}}
-             ::pco/requires {}})))
+           '{:pathim.connect.operation/input    []
+             :pathim.connect.operation/op-name  r
+             :pathim.connect.operation/output   [:foo]
+             :pathim.connect.operation/provides {:foo {}}
+             :pathim.connect.operation/requires {}})))
 
   (is (= (pci/resolver-config {} 'r) nil)))
 
 (deftest index-attributes-test
   (testing "combinations"
-    (is (= '{#{:b :a} {:??_pci_??/attr-id #{:b :a}, :??_pci_??/attr-provides {:c #{x}}, :??_pci_??/attr-input-in #{x}},
-            :b       {:??_pci_??/attr-id :b, :??_pci_??/attr-combinations #{#{:b :a}}, :??_pci_??/attr-input-in #{x}},
-            :a       {:??_pci_??/attr-id :a, :??_pci_??/attr-combinations #{#{:b :a}}, :??_pci_??/attr-input-in #{x}},
-            :c       {:??_pci_??/attr-id :c, :??_pci_??/attr-reach-via {#{:b :a} #{x}}, :??_pci_??/attr-output-in #{x}}}
+    (is (= '{#{:b :a} {:pathim.connect.indexes/attr-id #{:b :a}, :pathim.connect.indexes/attr-provides {:c #{x}}, :pathim.connect.indexes/attr-input-in #{x}},
+            :b       {:pathim.connect.indexes/attr-id :b, :pathim.connect.indexes/attr-combinations #{#{:b :a}}, :pathim.connect.indexes/attr-input-in #{x}},
+            :a       {:pathim.connect.indexes/attr-id :a, :pathim.connect.indexes/attr-combinations #{#{:b :a}}, :pathim.connect.indexes/attr-input-in #{x}},
+            :c       {:pathim.connect.indexes/attr-id :c, :pathim.connect.indexes/attr-reach-via {#{:b :a} #{x}}, :pathim.connect.indexes/attr-output-in #{x}}}
           (pci/index-attributes
             (-> (pco/resolver
-                  {::pco/op-name 'x
-                   ::pco/input   [:a :b]
-                   ::pco/output  [:c]})
+                  {:pathim.connect.operation/op-name 'x
+                   :pathim.connect.operation/input   [:a :b]
+                   :pathim.connect.operation/output  [:c]})
                 pco/operation-config))))
 
     (testing "nested"
       (testing "output"
         (is (= (pci/index-attributes
                  (-> (pco/resolver
-                       {::pco/op-name 'x
-                        ::pco/input   []
-                        ::pco/output  [{:c [:d]}]})
+                       {:pathim.connect.operation/op-name 'x
+                        :pathim.connect.operation/input   []
+                        :pathim.connect.operation/output  [{:c [:d]}]})
                      pco/operation-config))
-               '{#{} {::pci/attr-id       #{},
-                      ::pci/attr-provides {:c #{x}},
-                      ::pci/attr-input-in #{x}},
-                 :c  {::pci/attr-id        :c,
-                      ::pci/attr-reach-via {#{} #{x}},
-                      ::pci/attr-output-in #{x},
-                      ::pci/attr-branch-in #{x}},
-                 :d  {::pci/attr-id      :d,
-                      ::pci/attr-leaf-in #{x}}})))
+               '{#{} {:pathim.connect.indexes/attr-id       #{},
+                      :pathim.connect.indexes/attr-provides {:c #{x}},
+                      :pathim.connect.indexes/attr-input-in #{x}},
+                 :c  {:pathim.connect.indexes/attr-id        :c,
+                      :pathim.connect.indexes/attr-reach-via {#{} #{x}},
+                      :pathim.connect.indexes/attr-output-in #{x},
+                      :pathim.connect.indexes/attr-branch-in #{x}},
+                 :d  {:pathim.connect.indexes/attr-id      :d,
+                      :pathim.connect.indexes/attr-leaf-in #{x}}})))
 
       (testing "input"
         (is (= (pci/index-attributes
                  (-> (pco/resolver
-                       {::pco/op-name 'x
-                        ::pco/input   [{:c [:d]}]
-                        ::pco/output  [:e]})
+                       {:pathim.connect.operation/op-name 'x
+                        :pathim.connect.operation/input   [{:c [:d]}]
+                        :pathim.connect.operation/output  [:e]})
                      pco/operation-config))
-               '{:c {::pci/attr-id :c,
-                     ::pci/attr-provides {:e #{x}},
-                     ::pci/attr-input-in #{x},
-                     ::pci/attr-branch-in #{x}},
-                 :e {::pci/attr-id :e,
-                     ::pci/attr-reach-via {#{:c} #{x}},
-                     ::pci/attr-output-in #{x},
-                     ::pci/attr-leaf-in #{x}},
-                 :d {::pci/attr-id :d,
-                     ::pci/attr-leaf-in #{x}}}))))))
+               '{:c {:pathim.connect.indexes/attr-id :c,
+                     :pathim.connect.indexes/attr-provides {:e #{x}},
+                     :pathim.connect.indexes/attr-input-in #{x},
+                     :pathim.connect.indexes/attr-branch-in #{x}},
+                 :e {:pathim.connect.indexes/attr-id :e,
+                     :pathim.connect.indexes/attr-reach-via {#{:c} #{x}},
+                     :pathim.connect.indexes/attr-output-in #{x},
+                     :pathim.connect.indexes/attr-leaf-in #{x}},
+                 :d {:pathim.connect.indexes/attr-id :d,
+                     :pathim.connect.indexes/attr-leaf-in #{x}}}))))))
 
 (deftest register-test
   (testing "resolver"
-    (let [resolver (pco/resolver 'r {::pco/output [:foo]}
+    (let [resolver (pco/resolver 'r {:pathim.connect.operation/output [:foo]}
                      (fn [_ _] {:foo 42}))]
       (is (= (pci/register resolver)
-             {::pci/index-resolvers  {'r resolver}
-              ::pci/index-attributes '{#{}  {:??_pci_??/attr-id #{}, :??_pci_??/attr-input-in #{r}, :??_pci_??/attr-provides {:foo #{r}}}
-                                       :foo {:??_pci_??/attr-id :foo, :??_pci_??/attr-leaf-in #{r}, :??_pci_??/attr-output-in #{r}, :??_pci_??/attr-reach-via {#{} #{r}}}}
-              ::pci/index-io         {#{} {:foo {}}}
-              ::pci/index-oir        {:foo {{} #{'r}}}}))
+             {:pathim.connect.indexes/index-resolvers  {'r resolver}
+              :pathim.connect.indexes/index-attributes '{#{}  {:pathim.connect.indexes/attr-id #{}, :pathim.connect.indexes/attr-input-in #{r}, :pathim.connect.indexes/attr-provides {:foo #{r}}}
+                                       :foo {:pathim.connect.indexes/attr-id :foo, :pathim.connect.indexes/attr-leaf-in #{r}, :pathim.connect.indexes/attr-output-in #{r}, :pathim.connect.indexes/attr-reach-via {#{} #{r}}}}
+              :pathim.connect.indexes/index-io         {#{} {:foo {}}}
+              :pathim.connect.indexes/index-oir        {:foo {{} #{'r}}}}))
 
       (testing "throw error on duplicated name"
         (is (thrown-with-msg? #"Tried to register duplicated resolver: r"
               (pci/register [resolver resolver])))))
 
     (testing "remove outputs mentioned at input, and warns"
-      (is (= (-> (pco/resolver 'r {::pco/input  [:id]
-                                   ::pco/output [:id :bar]}
+      (is (= (-> (pco/resolver 'r {:pathim.connect.operation/input  [:id]
+                                   :pathim.connect.operation/output [:id :bar]}
                    (fn [_ _]))
                  (pci/register)
-                 ::pci/index-oir)
+                 :pathim.connect.indexes/index-oir)
              {:bar {{:id {}} #{'r}}})))
 
     (testing "nested inputs"
-      (is (= (-> (pco/resolver 'r {::pco/input  [{:users [:score]}]
-                                   ::pco/output [:total-score]}
+      (is (= (-> (pco/resolver 'r {:pathim.connect.operation/input  [{:users [:score]}]
+                                   :pathim.connect.operation/output [:total-score]}
                    (fn [_ _]))
                  (pci/register)
-                 ::pci/index-oir)
+                 :pathim.connect.indexes/index-oir)
              {:total-score {{:users {:score {}}} #{'r}}})))
 
     (testing "nested outputs"
-      (is (= (-> (pco/resolver 'r {::pco/output [{:item [:detail]}]} (fn [_ _]))
+      (is (= (-> (pco/resolver 'r {:pathim.connect.operation/output [{:item [:detail]}]} (fn [_ _]))
                  (pci/register)
-                 ::pci/index-io)
+                 :pathim.connect.indexes/index-io)
              {#{} {:item {:detail {}}}})))
 
     (testing "dynamic resolver"
-      (let [resolver (pco/resolver 'r {::pco/dynamic-resolver? true} (fn [_ _]))]
+      (let [resolver (pco/resolver 'r {:pathim.connect.operation/dynamic-resolver? true} (fn [_ _]))]
         (is (= (pci/register resolver)
-               {::pci/index-resolvers {'r resolver}})))))
+               {:pathim.connect.indexes/index-resolvers {'r resolver}})))))
 
   (testing "mutation"
-    (let [mutation (pco/mutation 'm {::pco/output [:foo]
-                                     ::pco/params [:bla]}
+    (let [mutation (pco/mutation 'm {:pathim.connect.operation/output [:foo]
+                                     :pathim.connect.operation/params [:bla]}
                      (fn [_ _] {:foo 42}))]
       (is (= (pci/register mutation)
-             {::pci/index-mutations  {'m mutation}
-              ::pci/index-attributes {:bla {::pci/attr-id                :bla
-                                            ::pci/attr-mutation-param-in #{'m}}
-                                      :foo {::pci/attr-id                 :foo
-                                            ::pci/attr-mutation-output-in #{'m}}}}))
+             {:pathim.connect.indexes/index-mutations  {'m mutation}
+              :pathim.connect.indexes/index-attributes {:bla {:pathim.connect.indexes/attr-id                :bla
+                                            :pathim.connect.indexes/attr-mutation-param-in #{'m}}
+                                      :foo {:pathim.connect.indexes/attr-id                 :foo
+                                            :pathim.connect.indexes/attr-mutation-output-in #{'m}}}}))
 
       (testing "throw error on duplicated name"
         (is (thrown-with-msg? #"Tried to register duplicated mutation: m"
               (pci/register [mutation mutation]))))))
 
   (testing "multiple globals"
-    (let [r1 (pco/resolver 'r {::pco/output [:foo]}
+    (let [r1 (pco/resolver 'r {:pathim.connect.operation/output [:foo]}
                (fn [_ _] {:foo 42}))
-          r2 (pco/resolver 'r2 {::pco/output [:foo2]}
+          r2 (pco/resolver 'r2 {:pathim.connect.operation/output [:foo2]}
                (fn [_ _] {:foo2 "val"}))]
       (is (= (pci/register [r1 r2])
-             {::pci/index-resolvers  {'r  r1
+             {:pathim.connect.indexes/index-resolvers  {'r  r1
                                       'r2 r2}
-              ::pci/index-attributes '{#{}   {::pci/attr-id       #{}
-                                              ::pci/attr-input-in #{r
+              :pathim.connect.indexes/index-attributes '{#{}   {:pathim.connect.indexes/attr-id       #{}
+                                              :pathim.connect.indexes/attr-input-in #{r
                                                                     r2}
-                                              ::pci/attr-provides {:foo  #{r}
+                                              :pathim.connect.indexes/attr-provides {:foo  #{r}
                                                                    :foo2 #{r2}}}
-                                       :foo  {::pci/attr-id        :foo
-                                              ::pci/attr-leaf-in   #{r}
-                                              ::pci/attr-output-in #{r}
-                                              ::pci/attr-reach-via {#{} #{r}}}
-                                       :foo2 {::pci/attr-id        :foo2
-                                              ::pci/attr-leaf-in   #{r2}
-                                              ::pci/attr-output-in #{r2}
-                                              ::pci/attr-reach-via {#{} #{r2}}}}
-              ::pci/index-oir        {:foo  {{} #{'r}}
+                                       :foo  {:pathim.connect.indexes/attr-id        :foo
+                                              :pathim.connect.indexes/attr-leaf-in   #{r}
+                                              :pathim.connect.indexes/attr-output-in #{r}
+                                              :pathim.connect.indexes/attr-reach-via {#{} #{r}}}
+                                       :foo2 {:pathim.connect.indexes/attr-id        :foo2
+                                              :pathim.connect.indexes/attr-leaf-in   #{r2}
+                                              :pathim.connect.indexes/attr-output-in #{r2}
+                                              :pathim.connect.indexes/attr-reach-via {#{} #{r2}}}}
+              :pathim.connect.indexes/index-oir        {:foo  {{} #{'r}}
                                       :foo2 {{} #{'r2}}}
-              ::pci/index-io         {#{} {:foo  {}
+              :pathim.connect.indexes/index-io         {#{} {:foo  {}
                                            :foo2 {}}}}))))
 
   (testing "indexes meta"
-    (let [r1 (pco/resolver 'r {::pco/output [:foo]}
+    (let [r1 (pco/resolver 'r {:pathim.connect.operation/output [:foo]}
                (fn [_ _] {:foo 42}))
-          r2 (pco/resolver 'r2 {::pco/output [:foo2]}
+          r2 (pco/resolver 'r2 {:pathim.connect.operation/output [:foo2]}
                (fn [_ _] {:foo2 "val"}))
-          mutation (pco/mutation 'm {::pco/output [:foo]
-                                     ::pco/params [:bla]}
+          mutation (pco/mutation 'm {:pathim.connect.operation/output [:foo]
+                                     :pathim.connect.operation/params [:bla]}
                      (fn [_ _] {:foo 42}))]
       (let [idx (pci/register r1)]
-        (is (= (-> idx ::pci/index-resolvers meta)
+        (is (= (-> idx :pathim.connect.indexes/index-resolvers meta)
                {:pathim.connect.runner/map-container?
                 true}))
 
-        (is (= (-> idx ::pci/index-attributes meta)
+        (is (= (-> idx :pathim.connect.indexes/index-attributes meta)
                {:pathim.connect.runner/map-container?
                 true})))
 
       (let [idx (pci/register [r1 r2 mutation])]
-        (is (= (-> idx ::pci/index-resolvers meta)
+        (is (= (-> idx :pathim.connect.indexes/index-resolvers meta)
                {:pathim.connect.runner/map-container?
                 true}))
 
-        (is (= (-> idx ::pci/index-attributes meta)
+        (is (= (-> idx :pathim.connect.indexes/index-attributes meta)
                {:pathim.connect.runner/map-container?
                 true}))
 
-        (is (= (-> idx ::pci/index-mutations meta)
+        (is (= (-> idx :pathim.connect.indexes/index-mutations meta)
                {:pathim.connect.runner/map-container?
                 true})))))
 
   (testing "adding indexes together"
-    (let [r1       (pco/resolver 'r {::pco/output [:foo]}
+    (let [r1       (pco/resolver 'r {:pathim.connect.operation/output [:foo]}
                      (fn [_ _] {:foo 42}))
-          r2       (pco/resolver 'r2 {::pco/output [:foo2]}
+          r2       (pco/resolver 'r2 {:pathim.connect.operation/output [:foo2]}
                      (fn [_ _] {:foo2 "val"}))
-          mutation (pco/mutation 'm {::pco/output [:foo]
-                                     ::pco/params [:bla]}
+          mutation (pco/mutation 'm {:pathim.connect.operation/output [:foo]
+                                     :pathim.connect.operation/params [:bla]}
                      (fn [_ _] {:foo 42}))]
       (is (= (pci/register [(pci/register r1) r2])
-             {::pci/index-resolvers  {'r  r1
+             {:pathim.connect.indexes/index-resolvers  {'r  r1
                                       'r2 r2}
-              ::pci/index-attributes '{#{}   {::pci/attr-id       #{}
-                                              ::pci/attr-input-in #{r
+              :pathim.connect.indexes/index-attributes '{#{}   {:pathim.connect.indexes/attr-id       #{}
+                                              :pathim.connect.indexes/attr-input-in #{r
                                                                     r2}
-                                              ::pci/attr-provides {:foo  #{r}
+                                              :pathim.connect.indexes/attr-provides {:foo  #{r}
                                                                    :foo2 #{r2}}}
-                                       :foo  {::pci/attr-id        :foo
-                                              ::pci/attr-leaf-in   #{r}
-                                              ::pci/attr-output-in #{r}
-                                              ::pci/attr-reach-via {#{} #{r}}}
-                                       :foo2 {::pci/attr-id        :foo2
-                                              ::pci/attr-leaf-in   #{r2}
-                                              ::pci/attr-output-in #{r2}
-                                              ::pci/attr-reach-via {#{} #{r2}}}}
-              ::pci/index-oir        {:foo  {{} #{'r}}
+                                       :foo  {:pathim.connect.indexes/attr-id        :foo
+                                              :pathim.connect.indexes/attr-leaf-in   #{r}
+                                              :pathim.connect.indexes/attr-output-in #{r}
+                                              :pathim.connect.indexes/attr-reach-via {#{} #{r}}}
+                                       :foo2 {:pathim.connect.indexes/attr-id        :foo2
+                                              :pathim.connect.indexes/attr-leaf-in   #{r2}
+                                              :pathim.connect.indexes/attr-output-in #{r2}
+                                              :pathim.connect.indexes/attr-reach-via {#{} #{r2}}}}
+              :pathim.connect.indexes/index-oir        {:foo  {{} #{'r}}
                                       :foo2 {{} #{'r2}}}
-              ::pci/index-io         {#{} {:foo  {}
+              :pathim.connect.indexes/index-io         {#{} {:foo  {}
                                            :foo2 {}}}}))
 
       (is (thrown-with-msg? #"Tried to register duplicated resolver: r"
@@ -222,7 +222,7 @@
             (pci/register [(pci/register mutation) (pci/register mutation)]))))))
 
 (deftest attribute-available?-test
-  (let [register (pci/register (pco/resolver 'r {::pco/output [:foo]} (fn [_ _] {})))]
+  (let [register (pci/register (pco/resolver 'r {:pathim.connect.operation/output [:foo]} (fn [_ _] {})))]
     (is (= (pci/attribute-available? register :foo) true))
     (is (= (pci/attribute-available? register :bar) false))))
 
@@ -232,68 +232,68 @@
            #{})))
 
   (testing "context data is always in"
-    (is (= (pci/reachable-attributes {} {::x {}})
-           #{::x})))
+    (is (= (pci/reachable-attributes {} {:pathim.connect.indexes-test/x {}})
+           #{:pathim.connect.indexes-test/x})))
 
   (testing "globals"
-    (let [register (pci/register (pbir/constantly-resolver ::x {}))]
+    (let [register (pci/register (pbir/constantly-resolver :pathim.connect.indexes-test/x {}))]
       (is (= (pci/reachable-attributes register {})
-             #{::x}))))
+             #{:pathim.connect.indexes-test/x}))))
 
   (testing "single dependency"
-    (let [register (pci/register (pbir/single-attr-resolver ::x ::y inc))]
-      (is (= (pci/reachable-attributes register {::x {}})
-             #{::x ::y}))))
+    (let [register (pci/register (pbir/single-attr-resolver :pathim.connect.indexes-test/x :pathim.connect.indexes-test/y inc))]
+      (is (= (pci/reachable-attributes register {:pathim.connect.indexes-test/x {}})
+             #{:pathim.connect.indexes-test/x :pathim.connect.indexes-test/y}))))
 
   (testing "multi dependency"
     (is (= (pci/reachable-attributes
              (pci/register (pco/resolver 'xyz
-                             {::pco/input  [::x ::y]
-                              ::pco/output [::z]}
+                             {:pathim.connect.operation/input  [:pathim.connect.indexes-test/x :pathim.connect.indexes-test/y]
+                              :pathim.connect.operation/output [:pathim.connect.indexes-test/z]}
                              (fn [_ _])))
-             {::x {}
-              ::y {}})
-           #{::x ::y ::z}))
+             {:pathim.connect.indexes-test/x {}
+              :pathim.connect.indexes-test/y {}})
+           #{:pathim.connect.indexes-test/x :pathim.connect.indexes-test/y :pathim.connect.indexes-test/z}))
 
     (testing "no go"
       (let [register (pci/register (pco/resolver 'xyz
-                                     {::pco/input  [::x ::y]
-                                      ::pco/output [::z]}
+                                     {:pathim.connect.operation/input  [:pathim.connect.indexes-test/x :pathim.connect.indexes-test/y]
+                                      :pathim.connect.operation/output [:pathim.connect.indexes-test/z]}
                                      (fn [_ _])))]
-        (is (= (pci/reachable-attributes register {::x {}})
-               #{::x}))))
+        (is (= (pci/reachable-attributes register {:pathim.connect.indexes-test/x {}})
+               #{:pathim.connect.indexes-test/x}))))
 
     (testing "extended dependency"
       (let [register (pci/register
                        [(pco/resolver 'xyz
-                          {::pco/input  [::x ::y]
-                           ::pco/output [::z]}
+                          {:pathim.connect.operation/input  [:pathim.connect.indexes-test/x :pathim.connect.indexes-test/y]
+                           :pathim.connect.operation/output [:pathim.connect.indexes-test/z]}
                           (fn [_ _]))
-                        (pbir/alias-resolver ::z ::a)])]
-        (is (= (pci/reachable-attributes register {::x {}
-                                                   ::y {}})
-               #{::x ::y ::z ::a})))
+                        (pbir/alias-resolver :pathim.connect.indexes-test/z :pathim.connect.indexes-test/a)])]
+        (is (= (pci/reachable-attributes register {:pathim.connect.indexes-test/x {}
+                                                   :pathim.connect.indexes-test/y {}})
+               #{:pathim.connect.indexes-test/x :pathim.connect.indexes-test/y :pathim.connect.indexes-test/z :pathim.connect.indexes-test/a})))
 
       (let [register (pci/register
                        [(pco/resolver 'xyz
-                          {::pco/input  [::x ::y]
-                           ::pco/output [::z]}
+                          {:pathim.connect.operation/input  [:pathim.connect.indexes-test/x :pathim.connect.indexes-test/y]
+                           :pathim.connect.operation/output [:pathim.connect.indexes-test/z]}
                           (fn [_ _]))
-                        (pbir/alias-resolver ::z ::a)
+                        (pbir/alias-resolver :pathim.connect.indexes-test/z :pathim.connect.indexes-test/a)
                         (pco/resolver 'axc
-                          {::pco/input  [::a ::x]
-                           ::pco/output [::c]}
+                          {:pathim.connect.operation/input  [:pathim.connect.indexes-test/a :pathim.connect.indexes-test/x]
+                           :pathim.connect.operation/output [:pathim.connect.indexes-test/c]}
                           (fn [_ _]))])]
-        (is (= (pci/reachable-attributes register {::x {}
-                                                   ::y {}})
-               #{::x ::y ::z ::a ::c}))))))
+        (is (= (pci/reachable-attributes register {:pathim.connect.indexes-test/x {}
+                                                   :pathim.connect.indexes-test/y {}})
+               #{:pathim.connect.indexes-test/x :pathim.connect.indexes-test/y :pathim.connect.indexes-test/z :pathim.connect.indexes-test/a :pathim.connect.indexes-test/c}))))))
 
 (comment
   (-> (pci/register
      (pco/resolver 'foo
-       {::pco/input [:a] ::pco/output [:a :b]}
+       {:pathim.connect.operation/input [:a] :pathim.connect.operation/output [:a :b]}
        (fn [_ _])))
-      ::pci/index-io
+      :pathim.connect.indexes/index-io
       (get #{:a})))
 
 (deftest reachable-paths-test
@@ -302,53 +302,53 @@
            {})))
 
   (testing "context data is always in"
-    (is (= (pci/reachable-paths {} {::x {}})
-           {::x {}})))
+    (is (= (pci/reachable-paths {} {:pathim.connect.indexes-test/x {}})
+           {:pathim.connect.indexes-test/x {}})))
 
   (testing "globals"
-    (let [register (pci/register (pbir/constantly-resolver ::x {}))]
+    (let [register (pci/register (pbir/constantly-resolver :pathim.connect.indexes-test/x {}))]
       (is (= (pci/reachable-paths register {})
-             {::x {}}))))
+             {:pathim.connect.indexes-test/x {}}))))
 
   (testing "single dependency"
-    (let [register (pci/register (pbir/single-attr-resolver ::x ::y inc))]
-      (is (= (pci/reachable-paths register {::x {}})
-             {::x {} ::y {}}))))
+    (let [register (pci/register (pbir/single-attr-resolver :pathim.connect.indexes-test/x :pathim.connect.indexes-test/y inc))]
+      (is (= (pci/reachable-paths register {:pathim.connect.indexes-test/x {}})
+             {:pathim.connect.indexes-test/x {} :pathim.connect.indexes-test/y {}}))))
 
   (testing "nested dependencies"
     (let [register (pci/register (pco/resolver 'xy
-                                   {::pco/output [{::x [::y]}]}
+                                   {:pathim.connect.operation/output [{:pathim.connect.indexes-test/x [:pathim.connect.indexes-test/y]}]}
                                    (fn [_ _])))]
       (is (= (pci/reachable-paths register {})
-             {::x {::y {}}})))
+             {:pathim.connect.indexes-test/x {:pathim.connect.indexes-test/y {}}})))
 
     (let [register (pci/register
                      [(pco/resolver 'xy
-                        {::pco/output [{::x [::y]}]}
+                        {:pathim.connect.operation/output [{:pathim.connect.indexes-test/x [:pathim.connect.indexes-test/y]}]}
                         (fn [_ _]))
                       (pco/resolver 'xz
-                        {::pco/output [{::x [::z]}]}
+                        {:pathim.connect.operation/output [{:pathim.connect.indexes-test/x [:pathim.connect.indexes-test/z]}]}
                         (fn [_ _]))])]
       (is (= (pci/reachable-paths register {})
-             {::x {::y {} ::z {}}})))
+             {:pathim.connect.indexes-test/x {:pathim.connect.indexes-test/y {} :pathim.connect.indexes-test/z {}}})))
 
     (is (= (pci/reachable-paths
              (pci/register
                [(pco/resolver 'x
-                  {::pco/output [::x]}
+                  {:pathim.connect.operation/output [:pathim.connect.indexes-test/x]}
                   (fn [_ _]))
                 (pco/resolver 'yz
-                  {::pco/input  [::x]
-                   ::pco/output [{::y [::z]}]}
+                  {:pathim.connect.operation/input  [:pathim.connect.indexes-test/x]
+                   :pathim.connect.operation/output [{:pathim.connect.indexes-test/y [:pathim.connect.indexes-test/z]}]}
                   (fn [_ _]))])
              {})
-           {::x {} ::y {::z {}}})))
+           {:pathim.connect.indexes-test/x {} :pathim.connect.indexes-test/y {:pathim.connect.indexes-test/z {}}})))
 
   (testing "self dependency"
     (is (= (pci/reachable-paths
              (pci/register
                (pco/resolver 'foo
-                 {::pco/input [:a] ::pco/output [:a :b]}
+                 {:pathim.connect.operation/input [:a] :pathim.connect.operation/output [:a :b]}
                  (fn [_ _])))
              {:a {}})
            {:a {} :b {}})))
@@ -356,65 +356,65 @@
   (testing "multi dependency"
     (is (= (pci/reachable-paths
              (pci/register (pco/resolver 'xyz
-                             {::pco/input  [::x ::y]
-                              ::pco/output [::z]}
+                             {:pathim.connect.operation/input  [:pathim.connect.indexes-test/x :pathim.connect.indexes-test/y]
+                              :pathim.connect.operation/output [:pathim.connect.indexes-test/z]}
                              (fn [_ _])))
-             {::x {}
-              ::y {}})
-           {::x {} ::y {} ::z {}}))
+             {:pathim.connect.indexes-test/x {}
+              :pathim.connect.indexes-test/y {}})
+           {:pathim.connect.indexes-test/x {} :pathim.connect.indexes-test/y {} :pathim.connect.indexes-test/z {}}))
 
     (testing "no go"
       (let [register (pci/register (pco/resolver 'xyz
-                                     {::pco/input  [::x ::y]
-                                      ::pco/output [::z]}
+                                     {:pathim.connect.operation/input  [:pathim.connect.indexes-test/x :pathim.connect.indexes-test/y]
+                                      :pathim.connect.operation/output [:pathim.connect.indexes-test/z]}
                                      (fn [_ _])))]
-        (is (= (pci/reachable-paths register {::x {}})
-               {::x {}}))))
+        (is (= (pci/reachable-paths register {:pathim.connect.indexes-test/x {}})
+               {:pathim.connect.indexes-test/x {}}))))
 
     (testing "extended dependency"
       (let [register (pci/register
                        [(pco/resolver 'xyz
-                          {::pco/input  [::x ::y]
-                           ::pco/output [::z]}
+                          {:pathim.connect.operation/input  [:pathim.connect.indexes-test/x :pathim.connect.indexes-test/y]
+                           :pathim.connect.operation/output [:pathim.connect.indexes-test/z]}
                           (fn [_ _]))
-                        (pbir/alias-resolver ::z ::a)])]
-        (is (= (pci/reachable-paths register {::x {}
-                                              ::y {}})
-               {::x {} ::y {} ::z {} ::a {}})))
+                        (pbir/alias-resolver :pathim.connect.indexes-test/z :pathim.connect.indexes-test/a)])]
+        (is (= (pci/reachable-paths register {:pathim.connect.indexes-test/x {}
+                                              :pathim.connect.indexes-test/y {}})
+               {:pathim.connect.indexes-test/x {} :pathim.connect.indexes-test/y {} :pathim.connect.indexes-test/z {} :pathim.connect.indexes-test/a {}})))
 
       (let [register (pci/register
                        [(pco/resolver 'xyz
-                          {::pco/input  [::x ::y]
-                           ::pco/output [::z]}
+                          {:pathim.connect.operation/input  [:pathim.connect.indexes-test/x :pathim.connect.indexes-test/y]
+                           :pathim.connect.operation/output [:pathim.connect.indexes-test/z]}
                           (fn [_ _]))
-                        (pbir/alias-resolver ::z ::a)
+                        (pbir/alias-resolver :pathim.connect.indexes-test/z :pathim.connect.indexes-test/a)
                         (pco/resolver 'axc
-                          {::pco/input  [::a ::x]
-                           ::pco/output [::c]}
+                          {:pathim.connect.operation/input  [:pathim.connect.indexes-test/a :pathim.connect.indexes-test/x]
+                           :pathim.connect.operation/output [:pathim.connect.indexes-test/c]}
                           (fn [_ _]))])]
-        (is (= (pci/reachable-paths register {::x {}
-                                              ::y {}})
-               {::x {} ::y {} ::z {} ::a {} ::c {}}))))))
+        (is (= (pci/reachable-paths register {:pathim.connect.indexes-test/x {}
+                                              :pathim.connect.indexes-test/y {}})
+               {:pathim.connect.indexes-test/x {} :pathim.connect.indexes-test/y {} :pathim.connect.indexes-test/z {} :pathim.connect.indexes-test/a {} :pathim.connect.indexes-test/c {}}))))))
 
 (deftest attribute-reachable?-test
   (let [register (pci/register
                    [(pco/resolver 'xyz
-                      {::pco/input  [::x ::y]
-                       ::pco/output [::z]}
+                      {:pathim.connect.operation/input  [:pathim.connect.indexes-test/x :pathim.connect.indexes-test/y]
+                       :pathim.connect.operation/output [:pathim.connect.indexes-test/z]}
                       (fn [_ _]))
-                    (pbir/alias-resolver ::z ::a)
+                    (pbir/alias-resolver :pathim.connect.indexes-test/z :pathim.connect.indexes-test/a)
                     (pco/resolver 'axc
-                      {::pco/input  [::a ::x]
-                       ::pco/output [::c]}
+                      {:pathim.connect.operation/input  [:pathim.connect.indexes-test/a :pathim.connect.indexes-test/x]
+                       :pathim.connect.operation/output [:pathim.connect.indexes-test/c]}
                       (fn [_ _]))])]
-    (is (= (pci/attribute-reachable? register {::x {}
-                                               ::y {}}
-                                     ::c)
+    (is (= (pci/attribute-reachable? register {:pathim.connect.indexes-test/x {}
+                                               :pathim.connect.indexes-test/y {}}
+                                     :pathim.connect.indexes-test/c)
            true))
 
-    (is (= (pci/attribute-reachable? register {::x {}
-                                               ::y {}}
-                                     ::d)
+    (is (= (pci/attribute-reachable? register {:pathim.connect.indexes-test/x {}
+                                               :pathim.connect.indexes-test/y {}}
+                                     :pathim.connect.indexes-test/d)
            false))))
 
 (deftest input-set-test

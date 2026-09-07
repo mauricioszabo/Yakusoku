@@ -19,12 +19,12 @@
   (is (= (-> (pfsd/merge-shapes
                {:a ^:foo {}} {:a {}})
              (h/expose-meta))
-         {:a {::h/meta {:foo true}}}))
+         {:a {:pathim.test.helpers/meta {:foo true}}}))
 
   (is (= (-> (pfsd/merge-shapes
                {:a {}} {:a ^:foo {}})
              (h/expose-meta))
-         {:a {::h/meta {:foo true}}})))
+         {:a {:pathim.test.helpers/meta {:foo true}}})))
 
 (deftest query->shape-descriptor-test
   (testing "empty query"
@@ -52,7 +52,7 @@
     (is (= (-> (pfsd/query->shape-descriptor
                  [{:a [(list :b {:p "v"})]}])
                (h/expose-meta))
-           {:a {:b {::h/meta {::pfsd/params {:p "v"}}}}}))))
+           {:a {:b {:pathim.test.helpers/meta {:pathim.format.shape-descriptor/params {:p "v"}}}}}))))
 
 (deftest shape-descriptor->ast-test
   (testing "empty query"
@@ -79,7 +79,7 @@
 
   (testing "union"
     (is (= (pfsd/shape-descriptor->ast
-             {:x ^::pfsd/union? {:a {:aa {}}
+             {:x ^:pathim.format.shape-descriptor/union? {:a {:aa {}}
                                  :b {:bb {}}}})
            {:type     :root,
             :children [{:type         :join,
@@ -126,12 +126,12 @@
 
   (testing "union"
     (is (= (pfsd/shape-descriptor->query
-             {:x ^::pfsd/union? {:a {:aa {}}
+             {:x ^:pathim.format.shape-descriptor/union? {:a {:aa {}}
                                  :b {:bb {}}}})
            [{:x {:a [:aa] :b [:bb]}}]))
 
     (is (= (pfsd/shape-descriptor->query
-             {:x ^::pfsd/union? {:a {:aa {}}
+             {:x ^:pathim.format.shape-descriptor/union? {:a {:aa {}}
                                  :b {:bb {}}
                                  :c {}}})
            [{:x {:a [:aa] :b [:bb] :c []}}])))
@@ -295,9 +295,9 @@
          {:a {}}))
 
   (testing "params"
-    (is (= (-> (pfsd/intersection {:a ^{::pfsd/params {:p "v"}} {}} {:a {}})
+    (is (= (-> (pfsd/intersection {:a ^{:pathim.format.shape-descriptor/params {:p "v"}} {}} {:a {}})
                (h/expose-meta))
-           {:a {::h/meta {::pfsd/params {:p "v"}}}})))
+           {:a {:pathim.test.helpers/meta {:pathim.format.shape-descriptor/params {:p "v"}}}})))
 
   (testing "nested"
     (is (= (pfsd/intersection {:a {:b {}}} {:a {}})

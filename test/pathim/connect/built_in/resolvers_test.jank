@@ -17,12 +17,12 @@
 
   (testing "output inference"
     (is (= (-> (pco/operation-config (pbir/constantly-resolver :foo {:bar "baz"}))
-               ::pco/output)
+               :pathim.connect.operation/output)
            [{:foo [:bar]}]))
 
     (is (= (-> (pco/operation-config (pbir/constantly-resolver :foo [{:bar "baz"}
                                                                      {:other "ble"}]))
-               ::pco/output)
+               :pathim.connect.operation/output)
            [{:foo [:bar :other]}]))))
 
 (deftest constantly-fn-resolver-test
@@ -40,65 +40,65 @@
          {:x 15})))
 
 (deftest map-table-resolver-test
-  (let [resolver (pbir/static-table-resolver ::id {1 {::color "Gray"}
-                                                   2 {::color "Purple"}})
+  (let [resolver (pbir/static-table-resolver :pathim.connect.built-in.resolvers-test/id {1 {:pathim.connect.built-in.resolvers-test/color "Gray"}
+                                                   2 {:pathim.connect.built-in.resolvers-test/color "Purple"}})
         config   (pco/operation-config resolver)]
-    (is (= (resolver {::id 2})
-           {::color "Purple"}))
-    (is (= (resolver {::id 3}) nil))
-    (is (= (::pco/input config)
-           [::id]))
-    (is (= (::pco/output config)
-           [::color]))))
+    (is (= (resolver {:pathim.connect.built-in.resolvers-test/id 2})
+           {:pathim.connect.built-in.resolvers-test/color "Purple"}))
+    (is (= (resolver {:pathim.connect.built-in.resolvers-test/id 3}) nil))
+    (is (= (:pathim.connect.operation/input config)
+           [:pathim.connect.built-in.resolvers-test/id]))
+    (is (= (:pathim.connect.operation/output config)
+           [:pathim.connect.built-in.resolvers-test/color]))))
 
 (deftest attribute-map-resolver-test
-  (let [resolver (pbir/static-attribute-map-resolver ::id ::color
+  (let [resolver (pbir/static-attribute-map-resolver :pathim.connect.built-in.resolvers-test/id :pathim.connect.built-in.resolvers-test/color
                    {1 "Gray"
                     2 "Purple"})
         config   (pco/operation-config resolver)]
-    (is (= (resolver {::id 2})
-           {::color "Purple"}))
-    (is (= (resolver {::id 3}) nil))
-    (is (= (::pco/input config)
-           [::id]))
-    (is (= (::pco/output config)
-           [::color]))))
+    (is (= (resolver {:pathim.connect.built-in.resolvers-test/id 2})
+           {:pathim.connect.built-in.resolvers-test/color "Purple"}))
+    (is (= (resolver {:pathim.connect.built-in.resolvers-test/id 3}) nil))
+    (is (= (:pathim.connect.operation/input config)
+           [:pathim.connect.built-in.resolvers-test/id]))
+    (is (= (:pathim.connect.operation/output config)
+           [:pathim.connect.built-in.resolvers-test/color]))))
 
 (deftest attribute-table-resolver-test
-  (let [resolver (pbir/attribute-table-resolver ::colors ::id [::color])
+  (let [resolver (pbir/attribute-table-resolver :pathim.connect.built-in.resolvers-test/colors :pathim.connect.built-in.resolvers-test/id [:pathim.connect.built-in.resolvers-test/color])
         config   (pco/operation-config resolver)]
-    (is (= (resolver {::colors {1 {::color "Gray"}
-                                2 {::color "Purple"}}
-                      ::id     2})
-           {::color "Purple"}))
-    (is (= (::pco/input config)
-           [::id ::colors]))
-    (is (= (::pco/output config)
-           [::color]))))
+    (is (= (resolver {:pathim.connect.built-in.resolvers-test/colors {1 {:pathim.connect.built-in.resolvers-test/color "Gray"}
+                                2 {:pathim.connect.built-in.resolvers-test/color "Purple"}}
+                      :pathim.connect.built-in.resolvers-test/id     2})
+           {:pathim.connect.built-in.resolvers-test/color "Purple"}))
+    (is (= (:pathim.connect.operation/input config)
+           [:pathim.connect.built-in.resolvers-test/id :pathim.connect.built-in.resolvers-test/colors]))
+    (is (= (:pathim.connect.operation/output config)
+           [:pathim.connect.built-in.resolvers-test/color]))))
 
 (deftest env-table-resolver-test
-  (let [resolver (pbir/env-table-resolver ::colors ::id [::color])
+  (let [resolver (pbir/env-table-resolver :pathim.connect.built-in.resolvers-test/colors :pathim.connect.built-in.resolvers-test/id [:pathim.connect.built-in.resolvers-test/color])
         config   (pco/operation-config resolver)]
     (is (= (resolver
-             {::colors {1 {::color "Gray"}
-                        2 {::color "Purple"}}}
-             {::id 2})
-           {::color "Purple"}))
-    (is (= (::pco/input config)
-           [::id]))
-    (is (= (::pco/output config)
-           [::color]))))
+             {:pathim.connect.built-in.resolvers-test/colors {1 {:pathim.connect.built-in.resolvers-test/color "Gray"}
+                        2 {:pathim.connect.built-in.resolvers-test/color "Purple"}}}
+             {:pathim.connect.built-in.resolvers-test/id 2})
+           {:pathim.connect.built-in.resolvers-test/color "Purple"}))
+    (is (= (:pathim.connect.operation/input config)
+           [:pathim.connect.built-in.resolvers-test/id]))
+    (is (= (:pathim.connect.operation/output config)
+           [:pathim.connect.built-in.resolvers-test/color]))))
 
 (deftest edn-file-resolver-test
   (let [[resolver :as resolvers] (pbir/edn-file-resolver "test/resources/sample-config.edn")]
-    (is (= (::pco/output (pco/operation-config resolver))
+    (is (= (:pathim.connect.operation/output (pco/operation-config resolver))
            [:my.system/generic-db :my.system/initial-path :my.system/port]))
 
     (is (= (pop/-op-resolve resolver {} {})
            {:my.system/initial-path "/tmp/system", :my.system/port 1234, :my.system/generic-db {4 {:my.system.user/name "Anne"}, 2 {:my.system.user/name "Fred"}}}))
 ))
 
-;; Upstream also reads these through a SmartMap here; SmartMaps are not part of this port.
+;; Upstream also reads these through a SmartMap; SmartMaps are not part of this port.
 
 (deftest global-data-resolver-test
   (let [[resolver :as resolvers] (pbir/global-data-resolver
@@ -112,11 +112,11 @@
                                     ^{:pathim/entity-table :my.system/user-id}
                                     {4 {:my.system.user/name "Anne"}
                                      2 {:my.system.user/name "Fred"}}})]
-    (is (= (::pco/output (pco/operation-config resolver))
+    (is (= (:pathim.connect.operation/output (pco/operation-config resolver))
            [:my.system/generic-db :my.system/initial-path :my.system/port]))
 
     (is (= (pop/-op-resolve resolver {} {})
            {:my.system/initial-path "/tmp/system", :my.system/port 1234, :my.system/generic-db {4 {:my.system.user/name "Anne"}, 2 {:my.system.user/name "Fred"}}}))
 ))
 
-;; Upstream also reads these through a SmartMap here; SmartMaps are not part of this port.
+;; Upstream also reads these through a SmartMap; SmartMaps are not part of this port.

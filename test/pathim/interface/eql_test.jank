@@ -12,56 +12,56 @@
     [pathim.eql :as eql]))
 
 (pco/defresolver coords []
-  {::coords
+  {:pathim.interface.eql-test/coords
    [{:x 10 :y 20}
-    {::geo/left 20 ::geo/width 5}]})
+    {:pathim.test.geometry-resolvers/left 20 :pathim.test.geometry-resolvers/width 5}]})
 
 (def registry
   [geo/full-registry
    coords
-   (pbir/constantly-fn-resolver :foo ::foo)
+   (pbir/constantly-fn-resolver :foo :pathim.interface.eql-test/foo)
    (pbir/constantly-resolver :false false)])
 
 (deftest process-test
   (testing "read"
     (is (= (p.eql/process (pci/register registry)
-                          [::coords])
-           {::coords
+                          [:pathim.interface.eql-test/coords])
+           {:pathim.interface.eql-test/coords
             [{:x 10 :y 20}
-             {::geo/left 20 ::geo/width 5}]}))
+             {:pathim.test.geometry-resolvers/left 20 :pathim.test.geometry-resolvers/width 5}]}))
 
     (is (= (p.eql/process (pci/register geo/full-registry)
                           {:left 10}
-                          [::geo/x])
-           {::geo/x 10}))
+                          [:pathim.test.geometry-resolvers/x])
+           {:pathim.test.geometry-resolvers/x 10}))
 
     (testing "when not found, key is omitted"
       (is (= (p.eql/process (-> (pci/register
                                   {:pathim.error/lenient-mode? true}
                                   geo/full-registry)
                                 (p.ent/with-entity {:left 10}))
-                            [::geo/top])
+                            [:pathim.test.geometry-resolvers/top])
              {:pathim.connect.runner/attribute-errors {:pathim.test.geometry-resolvers/top {:pathim.error/cause :pathim.error/attribute-unreachable}}}))))
 
   (testing "reading with *"
     (is (= (-> (p.eql/process (-> (pci/register geo/full-registry)
                                   (p.ent/with-entity {:left 10}))
-                              [::geo/x '*]))
-           {::geo/x    10
-            ::geo/left 10
+                              [:pathim.test.geometry-resolvers/x '*]))
+           {:pathim.test.geometry-resolvers/x    10
+            :pathim.test.geometry-resolvers/left 10
             :left      10})))
 
   (testing "nested read"
     (is (= (p.eql/process (-> (pci/register geo/full-registry)
                               (p.ent/with-entity {:left 10 :top 5}))
-                          [{::geo/turn-point [:right]}])
-           {::geo/turn-point {:right 10}}))
+                          [{:pathim.test.geometry-resolvers/turn-point [:right]}])
+           {:pathim.test.geometry-resolvers/turn-point {:right 10}}))
 
     (is (= (p.eql/process (-> (pci/register geo/full-registry)
-                              (p.ent/with-entity {:foo        {::geo/x 10}
-                                                  :bar        {::geo/y 4
+                              (p.ent/with-entity {:foo        {:pathim.test.geometry-resolvers/x 10}
+                                                  :bar        {:pathim.test.geometry-resolvers/y 4
                                                                :mess   "here"}
-                                                  ::geo/width 50
+                                                  :pathim.test.geometry-resolvers/width 50
                                                   :other      "value"}))
                           [{:foo [:x]}
                            {:bar [:top]}
@@ -73,27 +73,27 @@
   (testing "process sequence"
     (is (= (p.eql/process (-> {:pathim.error/lenient-mode? true}
                               (pci/register registry)
-                              (p.ent/with-entity {::coords (list
+                              (p.ent/with-entity {:pathim.interface.eql-test/coords (list
                                                              {:x 10 :y 20}
-                                                             {::geo/left 20 ::geo/width 5})}))
-                          [{::coords [:right]}])
-           {::coords [{:pathim.connect.runner/attribute-errors {:right {:pathim.error/cause :pathim.error/attribute-unreachable}}}
+                                                             {:pathim.test.geometry-resolvers/left 20 :pathim.test.geometry-resolvers/width 5})}))
+                          [{:pathim.interface.eql-test/coords [:right]}])
+           {:pathim.interface.eql-test/coords [{:pathim.connect.runner/attribute-errors {:right {:pathim.error/cause :pathim.error/attribute-unreachable}}}
                       {:right 25}]})))
 
   (testing "process vector"
     (let [res (p.eql/process (-> (pci/register registry)
-                                 (p.ent/with-entity {::coords [{::geo/left 20 ::geo/width 15}
-                                                               {::geo/left 20 ::geo/width 5}]}))
-                             [{::coords [:right]}])]
-      (is (= res {::coords [{:right 35} {:right 25}]}))
-      (is (vector? (::coords res)))))
+                                 (p.ent/with-entity {:pathim.interface.eql-test/coords [{:pathim.test.geometry-resolvers/left 20 :pathim.test.geometry-resolvers/width 15}
+                                                               {:pathim.test.geometry-resolvers/left 20 :pathim.test.geometry-resolvers/width 5}]}))
+                             [{:pathim.interface.eql-test/coords [:right]}])]
+      (is (= res {:pathim.interface.eql-test/coords [{:right 35} {:right 25}]}))
+      (is (vector? (:pathim.interface.eql-test/coords res)))))
 
   (testing "process set"
     (is (= (p.eql/process (-> (pci/register registry)
-                              (p.ent/with-entity {::coords #{{::geo/left 20 ::geo/width 15}
-                                                             {::geo/left 20 ::geo/width 5}}}))
-                          [{::coords [:right]}])
-           {::coords #{{:right 35} {:right 25}}}))))
+                              (p.ent/with-entity {:pathim.interface.eql-test/coords #{{:pathim.test.geometry-resolvers/left 20 :pathim.test.geometry-resolvers/width 15}
+                                                             {:pathim.test.geometry-resolvers/left 20 :pathim.test.geometry-resolvers/width 5}}}))
+                          [{:pathim.interface.eql-test/coords [:right]}])
+           {:pathim.interface.eql-test/coords #{{:right 35} {:right 25}}}))))
 
 (deftest process-error-test
   (check
@@ -101,7 +101,7 @@
       (p.eql/process
         (pci/register
           (pco/resolver 'a
-            {::pco/output [:a]}
+            {:pathim.connect.operation/output [:a]}
             (fn [_ _] {})))
         [:a]))
     => {:ex/message "Error while processing request [:a] for entity {}"
@@ -114,7 +114,7 @@
         (p.eql/process
           (pci/register
             (pco/resolver 'a
-              {::pco/output [:a]}
+              {:pathim.connect.operation/output [:a]}
               (fn [_ _] {})))
           [:having-a-query {:that-goes [:long]} :in-fact {:very [:long]}]))
       => {:ex/message "Error while processing request [:having-a-query {:that-goes [:long]}... for entity {}"
@@ -127,7 +127,7 @@
         (p.eql/process
           (pci/register
             (pco/resolver 'a
-              {::pco/output [:a]}
+              {:pathim.connect.operation/output [:a]}
               (fn [_ _] {})))
           {:some "Lorem Ipsum is simply dummy text of the printing and typesetting"}
           [:a]))
@@ -141,12 +141,12 @@
         (p.eql/process
           (pci/register
             [(pco/resolver 'b
-               {::pco/input  [:a]
-                ::pco/output [:b]}
+               {:pathim.connect.operation/input  [:a]
+                :pathim.connect.operation/output [:b]}
                (fn [_ _] {:b 2}))
              (pco/resolver 'c
-               {::pco/input  [:b]
-                ::pco/output [:c]}
+               {:pathim.connect.operation/input  [:b]
+                :pathim.connect.operation/output [:c]}
                (fn [_ _] {}))])
           {:a 1}
           [:c]))
@@ -160,7 +160,7 @@
 
   (is (= (p.eql/process-one (pci/register geo/full-registry)
                             {:left 10 :top 5}
-                            {::geo/turn-point [:right]})
+                            {:pathim.test.geometry-resolvers/turn-point [:right]})
          {:right 10}))
 
   (testing "keeps meta"
@@ -207,16 +207,16 @@
 (deftest boundary-interface-test
   (let [fi (p.eql/boundary-interface (pci/register registry))]
     (testing "call with just tx"
-      (is (= (fi [::coords])
-             {::coords
+      (is (= (fi [:pathim.interface.eql-test/coords])
+             {:pathim.interface.eql-test/coords
               [{:x 10 :y 20}
-               {::geo/left 20 ::geo/width 5}]})))
+               {:pathim.test.geometry-resolvers/left 20 :pathim.test.geometry-resolvers/width 5}]})))
 
     (testing "call with ast"
-      (is (= (fi {:pathom/ast (eql/query->ast [::coords])})
-             {::coords
+      (is (= (fi {:pathom/ast (eql/query->ast [:pathim.interface.eql-test/coords])})
+             {:pathim.interface.eql-test/coords
               [{:x 10 :y 20}
-               {::geo/left 20 ::geo/width 5}]})))
+               {:pathim.test.geometry-resolvers/left 20 :pathim.test.geometry-resolvers/width 5}]})))
 
     (testing "call with entity and eql"
       (is (= (fi {:pathom/entity {:left 10}
@@ -232,7 +232,7 @@
       (is (= (fi [:foo])
              {:foo nil}))
 
-      (is (= (fi {::foo "bar"} [:foo])
+      (is (= (fi {:pathim.interface.eql-test/foo "bar"} [:foo])
              {:foo "bar"})))
 
     (testing "modify env"
