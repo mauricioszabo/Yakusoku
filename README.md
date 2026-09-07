@@ -131,8 +131,8 @@ jank compiles a function on its first call, and its compiler is not reentrant ac
 threads: a pool worker compiling a callback while the main thread compiles something else
 is a segfault, deep inside clang or LLVM. Yakusoku compiles its own bridge up front (see
 `yakusoku.impl/warm-up!`) but it cannot do that for yours. `--eagerness eager` compiles
-everything at load time and removes the race entirely — `examples/run` uses it, and so
-should anything that runs a non-trivial amount of jank code on a pool.
+everything at load time and removes the race entirely — `examples/bench.jank` documents
+it, and so should anything that runs a non-trivial amount of jank code on a pool.
 
 **Cancellation is not preemptive.** Cancelling settles the promise and propagates `:cancelled`
 downstream — `catch` deliberately does not treat it as an error — but it does not interrupt
@@ -197,7 +197,8 @@ unfortunate, because eager mode is exactly what makes a concurrent program safe 
 "Things to know"): in lazy mode a pool worker compiling a callback can race the main thread
 compiling something else, and the crash is inside clang or LLVM. The suite gets away with
 lazy mode because Yakusoku warms its own bridge before any worker starts; a program that
-runs much of *its own* code on workers should use eager mode. `examples/run` does.
+runs much of *its own* code on workers should use eager mode; `examples/bench.jank` is
+run that way.
 
 One unexplained anomaly is on record: across roughly thirty-five suite runs, the GC stress
 test once reported 2001 completions for 2000 queued tasks. It has not recurred in 20
@@ -228,9 +229,12 @@ collections while jank values sit in Asio's queue.
 
 The repository also carries pathim, a port of
 [Pathom 3](https://github.com/wilkerlucio/pathom3) built on Yakusoku — sync, async and
-parallel runners. See [PATHIM.md](PATHIM.md), and [examples/](examples/) for a benchmark
-that runs the same resolver graph on jank, Clojure and ClojureScript so the port can be
-compared against the original.
+parallel runners. See [PATHIM.md](PATHIM.md), and [examples/](examples/) for a pair of
+benchmark programs — one on jank, one on Clojure — that run the same resolver graph so the
+port can be compared against the original.
+
+The jank rough edges this turned up are written up as filable bug reports in
+[JANK-ISSUES.md](JANK-ISSUES.md).
 
 ## License
 

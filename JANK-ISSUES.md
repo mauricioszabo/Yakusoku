@@ -16,7 +16,8 @@ Ubuntu 24.04.4 LTS, x86_64
 
 Entries are grouped by how well they reproduce **on that build, today**. That distinction
 matters: three of these were recorded earlier in the port and two of them no longer
-reproduce, so they are held back rather than filed.
+reproduce, so they are held back rather than filed. Issues 7 and 8 came out of writing the
+benchmark in `examples/`, after the rest.
 
 ---
 
@@ -207,6 +208,53 @@ run correctly on this build. A *sibling* site in the same project —
 `(merge-with merge-grow a b)` inside `merge-grow` in `src/pathim/misc/coll.jank` — used to
 crash the same way and **no longer does**, so part of this may already be fixed and what
 remains needs a narrower trigger than "function references itself".
+
+### 7. Any non-ASCII character in a string literal fails to lex
+
+**Severity:** medium — trivially hit, and the error names the wrong problem.
+
+```clojure
+(ns repro)
+(println "ellipsis:" "…")
+```
+
+**Actual:**
+
+```
+─ lex/unterminated-string ──────────────────────────────────────────────────────
+error: Unterminated string.
+  2  │ (println "ellipsis:" "…")
+```
+
+`"café"` fails the same way. The string is terminated; the lexer appears to count bytes
+where it means characters, so a multi-byte character makes it lose the closing quote.
+
+**Expected:** UTF-8 string literals lex. jank's own diagnostics print `…` happily, so this
+is the lexer alone.
+
+---
+
+### 8. `rem` and `mod` return a double for integer arguments
+
+**Severity:** low, but it corrupts output silently.
+
+```clojure
+(ns repro)
+(println (pr-str (rem 7 3)))   ; => 1.0   (Clojure: 1)
+(println (pr-str (mod 7 3)))   ; => 1.0   (Clojure: 1)
+(println (pr-str (quot 7 3)))  ; => 2     correct
+```
+
+**Expected:** `1`, as in Clojure — `rem` and `mod` on two integers give an integer.
+
+**Actual:** a double. `quot` is correct, which makes it look like an oversight in those two
+rather than a deliberate numeric-tower choice.
+
+**Where it bit:** formatting a number to one decimal place with
+`(str (quot tenths 10) "." (rem tenths 10))` printed `2245.7.0`. The workaround is to
+subtract instead: `(- tenths (* 10 (quot tenths 10)))`.
+
+---
 
 ---
 

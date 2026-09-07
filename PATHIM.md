@@ -52,7 +52,8 @@ The two runners differ in a way worth knowing before choosing: the **async** run
 the same plan the sync one does, awaiting each node, so a single query is no faster — what
 it buys is not blocking a thread, so many queries can be in flight at once. The **parallel**
 runner overlaps independent branches *within* a query, and batches through a debouncer. The
-benchmark in [examples/](examples/) measures both, on jank and on real Pathom.
+benchmark in [examples/](examples/) measures both: `bench.jank` against this port and
+`bench.clj` against real Pathom 3, as two independent programs.
 
 Upstream builds the parallel runner's batch debouncer on core.async. jank has none, and
 none is needed: `yakusoku.exec/debouncer` is that loop, built on a restartable Asio timer.
@@ -183,5 +184,5 @@ There is no oracle for the async and parallel runners: promesa does not load und
 (`defrecord ... found: Supplier`), which is why Pathom itself carries a `:bb` branch. Two
 things stand in for it — upstream's `runner_test`, which asserts that all three runners
 produce the same answer, and the benchmark in [examples/](examples/), which runs the same
-graph through all three runners on jank, Clojure and ClojureScript and checks that every
-runtime agreed before it reports a timing.
+graph through all three runners on jank and on real Pathom 3, printing each answer beside
+its timing so the two can be checked against each other.
