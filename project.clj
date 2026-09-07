@@ -1,4 +1,4 @@
-(defproject org.clojars.mauricioszabo/yakusoku "0.1.0-SNAPSHOT"
+(defproject org.clojars.mauricioszabo/yakusoku "0.1.0"
   :description "A promise and concurrency library for jank, in the spirit of promesa."
   :url "https://github.com/mauricioszabo/yakusoku"
   :license {:name "MPL 2.0"
