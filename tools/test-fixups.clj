@@ -67,9 +67,11 @@
   ;; there is nothing to construct; map-select over plain maps is covered above.\n\n")
 
 ;; check.core becomes a small compatible subset; one use is a plain equality check.
+;; check's => matches maps partially, so it must keep going through the compatibility
+;; layer rather than becoming a strict = -- upstream's expectation here names only some of
+;; the keys the index actually carries.
 (edit! "connect/indexes_test.jank"
-  "    [check.core :refer [=> check]]\n" ""
-  "    (check\n      (=> '{#{:b :a}" "    (is (= '{#{:b :a}")
+  "    [check.core :refer [=> check]]" "    [pathim.test.check :refer [check]]")
 (edit! "connect/planner_test.jank"
   "    [check.core :refer [=> check]]" "    [pathim.test.check :refer [check]]"
   "    [matcher-combinators.matchers :as m]))" "    ))")

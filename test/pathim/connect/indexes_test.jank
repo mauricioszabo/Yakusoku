@@ -1,5 +1,6 @@
 (ns pathim.connect.indexes-test
   (:require
+    [pathim.test.check :refer [check]]
     [clojure.test :refer [deftest is testing]]
     [pathim.connect.built-in.resolvers :as pbir]
     [pathim.connect.indexes :as pci]
@@ -26,7 +27,8 @@
 
 (deftest index-attributes-test
   (testing "combinations"
-    (is (= '{#{:b :a} {:pathim.connect.indexes/attr-id #{:b :a}, :pathim.connect.indexes/attr-provides {:c #{x}}, :pathim.connect.indexes/attr-input-in #{x}},
+    (check
+      (=> '{#{:b :a} {:pathim.connect.indexes/attr-id #{:b :a}, :pathim.connect.indexes/attr-provides {:c #{x}}, :pathim.connect.indexes/attr-input-in #{x}},
             :b       {:pathim.connect.indexes/attr-id :b, :pathim.connect.indexes/attr-combinations #{#{:b :a}}, :pathim.connect.indexes/attr-input-in #{x}},
             :a       {:pathim.connect.indexes/attr-id :a, :pathim.connect.indexes/attr-combinations #{#{:b :a}}, :pathim.connect.indexes/attr-input-in #{x}},
             :c       {:pathim.connect.indexes/attr-id :c, :pathim.connect.indexes/attr-reach-via {#{:b :a} #{x}}, :pathim.connect.indexes/attr-output-in #{x}}}
