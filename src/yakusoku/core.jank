@@ -539,13 +539,27 @@
   "Drives one p/loop: calls f with args, and if the result asks to recur, goes round again
    with the new bindings. Chained rather than nested, so iterations do not grow the stack.
 
+   A promise handed to p/recur is awaited before the next iteration, exactly as the loop's
+   initial bindings are. That is what makes `(p/recur (do-something-async))` mean \"go round
+   again once that has finished\" rather than \"go round again now\" -- and the difference is
+   not academic: Pathom's async runner drains its batch queue with that shape, and without
+   the await it read the queue back before the batch it had just started had run.
+
    This is a top-level function on purpose. Expressing it as a self-referential fn nested
    inside the macro expansion crashes jank's compiler in ir::hoist_scoped_values."
   [f args]
   (then (apply f args)
         (fn [result]
           (if (recur? result)
-            (run-loop f (::recur result))
+            (clojure.core/let [values (::recur result)]
+              ;; Only take the asynchronous route when there is actually something to
+              ;; wait for. A plain recur stays a direct call, which matters: an iteration
+              ;; that settles inline runs its continuation on this very stack, so an extra
+              ;; `then` per iteration is an extra frame per iteration, and a long
+              ;; synchronous loop overflows.
+              (if (some impl/promise? values)
+                (then (all values) (fn [awaited] (run-loop f awaited)))
+                (run-loop f values)))
             result))))
 
 (defmacro loop

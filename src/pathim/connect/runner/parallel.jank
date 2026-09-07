@@ -16,7 +16,6 @@
     [pathim.connect.runner :as pcr]
     [pathim.connect.runner.async :as pcra]
     [pathim.entity-tree :as p.ent]
-    [pathim.eql :as eql]
     [pathim.format.shape-descriptor :as pfsd]
     [pathim.path :as p.path]
     [pathim.plugin :as p.plugin]
@@ -557,49 +556,23 @@
     (-> (p.ent/entity env)
         (pcr/include-meta-stats env))))
 
-; --- warming the batch path ------------------------------------------------------------
+; --- warming ---------------------------------------------------------------------------
 ;
 ; The debouncer flushes a batch on a pool worker, and that flush is the first call to
-; run-async-batches! and to everything it reaches. jank compiles a function on its first
-; call, and first-compiling a function whose body contains C++ interop *on a worker thread*
-; corrupts the heap -- "double free or corruption", before any of it runs. Most of what the
-; flush reaches is interop-carrying: the batch helpers in pathim.connect.runner all catch
-; cpp/jank.runtime.object_ref, and they reach pathim.misc.time/now-ms.
-;
-; The async runner drives that same shared machinery, and it does it entirely on the
-; calling thread when no resolver returns a real promise. So one throwaway batch query
-; through pcra/run-graph!, run here on the caller's thread, leaves everything the flush
-; needs already compiled. Warming pathim.warm's own list is not enough on its own -- that
-; was measured, not assumed.
-
-(pco/defresolver warm-up-batch-resolver [items]
-  {::pco/input  [::warm-id]
-   ::pco/output [::warm-value]
-   ::pco/batch? true}
-  (mapv (fn [_] {::warm-value 1}) items))
-
-(def ^:private warmed (atom false))
-
-(defn- warm-batch-path!
-  "Runs one throwaway batched query through the async runner, on the calling thread, once
-  per process."
-  []
-  (when (compare-and-set! warmed false true)
-    (p/await!
-      (pcra/run-graph!
-        (pci/register warm-up-batch-resolver)
-        (eql/query->ast [{::warm-items [::warm-value]}])
-        (p.ent/create-entity {::warm-items [{::warm-id 1} {::warm-id 2}]}))))
-  nil)
+; run-async-batches! and to everything under it. jank compiles a function on its first
+; call, and doing that on a worker corrupts the heap -- "double free or corruption",
+; before any of it runs. The async runner drives the same shared machinery entirely on the
+; calling thread, so warming through it leaves everything the flush needs compiled. See
+; the note in pathim.connect.runner.async; this is measured, not assumed.
 
 (defn run-graph!
   "Plan and execute a request, given an environment (with indexes), the request AST
   and the entity-tree*."
   [env ast-or-graph entity-tree*]
   ;; Compile the port's interop-carrying functions before a worker can be the first to
-  ;; call one. See pathim.warm, and the note above on the batch path.
+  ;; call one. See pathim.warm, and the note above on warming.
   (warm/ensure-warm!)
-  (warm-batch-path!)
+  (pcra/warm-path!)
   (p/let [env env]
     (pcr/run-graph-with-plugins
       (assoc env :pathim.connect.runner.async/async-runner? true)

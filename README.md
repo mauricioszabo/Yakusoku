@@ -126,6 +126,14 @@ exit waits (up to two seconds) for workers to leave Asio's event loop. Without t
 a program that used nothing but `p/delay` segfaulted on exit, since workers were still
 running while Asio's statics were being destroyed.
 
+**Run jank with `--eagerness eager` if your callbacks touch code that has not run yet.**
+jank compiles a function on its first call, and its compiler is not reentrant across
+threads: a pool worker compiling a callback while the main thread compiles something else
+is a segfault, deep inside clang or LLVM. Yakusoku compiles its own bridge up front (see
+`yakusoku.impl/warm-up!`) but it cannot do that for yours. `--eagerness eager` compiles
+everything at load time and removes the race entirely — `examples/run` uses it, and so
+should anything that runs a non-trivial amount of jank code on a pool.
+
 **Cancellation is not preemptive.** Cancelling settles the promise and propagates `:cancelled`
 downstream — `catch` deliberately does not treat it as an error — but it does not interrupt
 work already running. A scheduled timer is likewise left to fire and find its promise settled.
@@ -184,7 +192,12 @@ calls `ensure-warm!`.
 
 Running the test suite under `--eagerness eager` segfaults inside jank before any test
 output appears, though every namespace loads cleanly in that mode and ordinary programs run
-fine there. The suite runs in jank's default (lazy) mode, where it is stable.
+fine there. The suite runs in jank's default (lazy) mode, where it is stable. That is
+unfortunate, because eager mode is exactly what makes a concurrent program safe (see
+"Things to know"): in lazy mode a pool worker compiling a callback can race the main thread
+compiling something else, and the crash is inside clang or LLVM. The suite gets away with
+lazy mode because Yakusoku warms its own bridge before any worker starts; a program that
+runs much of *its own* code on workers should use eager mode. `examples/run` does.
 
 One unexplained anomaly is on record: across roughly thirty-five suite runs, the GC stress
 test once reported 2001 completions for 2000 queued tasks. It has not recurred in 20
@@ -205,16 +218,19 @@ would be a natural next step.
 bin/test
 ```
 
-20 tests, 117 assertions, run against real jank — covering settling and its races, chaining
+22 tests, 134 assertions, run against real jank — covering settling and its races, chaining
 and flattening, error propagation and recovery, cancellation, every combinator, bounded
-blocking waits, the macros, pool execution and draining, timer ordering, and a GC stress
-test that forces collections while jank values sit in Asio's queue.
+blocking waits, the macros, pool execution and draining, timer ordering, the
+restartable timer and the debouncer built on it, and a GC stress test that forces
+collections while jank values sit in Asio's queue.
 
 ## Pathim
 
-The repository also carries [pathim](#pathim), a port of
-[Pathom 3](https://github.com/wilkerlucio/pathom3) built on Yakusoku. See
-[PATHIM.md](PATHIM.md).
+The repository also carries pathim, a port of
+[Pathom 3](https://github.com/wilkerlucio/pathom3) built on Yakusoku — sync, async and
+parallel runners. See [PATHIM.md](PATHIM.md), and [examples/](examples/) for a benchmark
+that runs the same resolver graph on jank, Clojure and ClojureScript so the port can be
+compared against the original.
 
 ## License
 

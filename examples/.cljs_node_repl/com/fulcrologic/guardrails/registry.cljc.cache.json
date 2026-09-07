@@ -1,0 +1,1 @@
+["^ ","~:rename-macros",["^ "],"~:renames",["^ "],"~:use-macros",["^ "],"~:excludes",["~#set",[]],"~:name","~$com.fulcrologic.guardrails.registry","~:imports",null,"~:requires",null,"~:cljs.spec/speced-vars",[],"~:uses",null,"~:defs",["^ "],"~:cljs.spec/registry-ref",[],"~:require-macros",null,"~:doc","for syntactic sugar when creating namespaced keywords","~:as-aliases",["^ "]]

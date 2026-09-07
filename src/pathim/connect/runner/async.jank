@@ -15,6 +15,7 @@
     [pathim.connect.planner :as pcp]
     [pathim.connect.runner :as pcr]
     [pathim.entity-tree :as p.ent]
+    [pathim.eql :as eql]
     [pathim.error :as p.error]
     [pathim.format.shape-descriptor :as pfsd]
     [pathim.path :as p.path]
@@ -626,12 +627,54 @@
       (catch cpp/jank.runtime.object_ref e
         (raise! e)))))
 
+; --- warming the async path ------------------------------------------------------------
+;
+; jank compiles a function on its first call, and two threads reaching that compilation at
+; once corrupt the compiler -- interleaved codegen, then a segfault or a heap that is
+; already broken by the time anything runs. Nothing about this runner is thread-confined:
+; it resolves promises on pool and timer workers, so the moment a caller starts two
+; queries at once, or one query fans out over a sequence, two workers can be first to call
+; the same continuation.
+;
+; One throwaway query, run before anything is dispatched, avoids it. Its resolvers return
+; already-resolved promises, so the whole chain runs on the calling thread, and the query
+; is shaped to reach the paths a real one does: a plain attribute, a join over a sequence
+; (which is what fans out), and a batched resolver. Without this, twenty concurrent
+; queries -- or one join over thirty items -- reliably die inside clang.
+;
+; The parallel runner warms through this too, rather than repeating it.
+
+(pco/defresolver warm-up-resolver [env input]
+  {::pco/input  [::warm-id]
+   ::pco/output [::warm-value]}
+  (p/resolved {::warm-value (inc (::warm-id input))}))
+
+(pco/defresolver warm-up-batch-resolver [env inputs]
+  {::pco/input  [::warm-id]
+   ::pco/output [::warm-batch-value]
+   ::pco/batch? true}
+  (p/resolved (mapv (fn [in] {::warm-batch-value (::warm-id in)}) inputs)))
+
+(def ^:private warmed (atom false))
+
+(defn warm-path!
+  "Runs one throwaway query through this runner, on the calling thread, once per process.
+  Public because the parallel runner needs the same paths compiled."
+  []
+  (when (compare-and-set! warmed false true)
+    (run-graph!
+      (pci/register [warm-up-resolver warm-up-batch-resolver])
+      (eql/query->ast [{::warm-items [::warm-value ::warm-batch-value]}])
+      (p.ent/create-entity {::warm-items [{::warm-id 1} {::warm-id 2}]})))
+  nil)
+
 (defn run-graph!
   "Plan and execute a request, given an environment (with indexes), the request AST
   and the entity-tree*."
   [env ast-or-graph entity-tree*]
   ;; Compile the port's interop-carrying functions before a worker can be the first to
-  ;; call one. See pathim.warm.
+  ;; call one. See pathim.warm, and the note above on the async path.
   (warm/ensure-warm!)
+  (warm-path!)
   (p/let [env env]
     (pcr/run-graph-with-plugins (assoc env ::async-runner? true) ast-or-graph entity-tree* run-graph-impl!)))

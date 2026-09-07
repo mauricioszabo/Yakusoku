@@ -142,12 +142,12 @@
 (def items-entity {:items items})
 
 (defn sync-throughput
-  "Twenty independent user queries, one after another. Blocking, so the cost is the sum."
-  []
+  "Independent user queries, one after another. Blocking, so the cost is the sum."
+  [ids]
   (let [start  (clock/now-ms)
         answer (mapv (fn [id]
                        (:user/summary (p.eql/process sync-env {:user/id id} [:user/summary])))
-                     user-ids)]
+                     ids)]
     {:ms (- (clock/now-ms) start) :answer answer}))
 
 (defn sync-single-query
@@ -157,21 +157,21 @@
         answer (:user/summary (p.eql/process sync-env {:user/id 1} [:user/summary]))]
     {:ms (- (clock/now-ms) start) :answer answer}))
 
-(defn sync-batched []
+(defn sync-batched [entity]
   (let [start  (clock/now-ms)
-        answer (mapv :item/price (:items (p.eql/process sync-env items-entity batch-query)))]
+        answer (mapv :item/price (:items (p.eql/process sync-env entity batch-query)))]
     {:ms (- (clock/now-ms) start) :answer answer}))
 
-(defn sync-one-by-one []
+(defn sync-one-by-one [entity]
   (let [start  (clock/now-ms)
-        answer (mapv :item/slow-price (:items (p.eql/process sync-env items-entity one-by-one-query)))]
+        answer (mapv :item/slow-price (:items (p.eql/process sync-env entity one-by-one-query)))]
     {:ms (- (clock/now-ms) start) :answer answer}))
 
 (defn async-throughput
-  "The same twenty queries, all started before any of them finishes."
-  [env]
+  "The same queries, all started before any of them finishes."
+  [env ids]
   (let [start (clock/now-ms)]
-    (p/then (p/all (mapv (fn [id] (p.a.eql/process env {:user/id id} [:user/summary])) user-ids))
+    (p/then (p/all (mapv (fn [id] (p.a.eql/process env {:user/id id} [:user/summary])) ids))
             (fn [results]
               {:ms (- (clock/now-ms) start) :answer (mapv :user/summary results)}))))
 
@@ -181,25 +181,28 @@
             (fn [result]
               {:ms (- (clock/now-ms) start) :answer (:user/summary result)}))))
 
-(defn async-batched [env]
+(defn async-batched [env entity]
   (let [start (clock/now-ms)]
-    (p/then (p.a.eql/process env items-entity batch-query)
+    (p/then (p.a.eql/process env entity batch-query)
             (fn [result]
               {:ms (- (clock/now-ms) start) :answer (mapv :item/price (:items result))}))))
 
-(defn async-one-by-one [env]
+(defn async-one-by-one [env entity]
   (let [start (clock/now-ms)]
-    (p/then (p.a.eql/process env items-entity one-by-one-query)
+    (p/then (p.a.eql/process env entity one-by-one-query)
             (fn [result]
               {:ms (- (clock/now-ms) start) :answer (mapv :item/slow-price (:items result))}))))
 
 ;; ------------------------------------------------------------- running them ----
 
 (def iterations
-  "One warm-up pass, discarded, then this many timed ones. jank compiles a function on its
-   first call and the JVM's JIT warms up, so the first pass of anything is not a
-   measurement."
+  "How many timed passes each benchmark gets. A warm-up pass runs first and is discarded:
+   jank compiles a function on its first call and the JVM's JIT warms up, so the first
+   pass of anything is not a measurement."
   3)
+
+(def ^:private one-user (vec (take 1 user-ids)))
+(def ^:private one-item {:items (vec (take 1 items))})
 
 (defn median [xs]
   (let [sorted (vec (sort xs))]
@@ -211,53 +214,95 @@
    :all-ms (mapv :ms runs)
    :answer (:answer (first runs))})
 
-(defn- repeat-sync [n f]
-  (mapv (fn [_] (f)) (range n)))
+;; Each benchmark carries two functions: :warm, over a one-element input, and :run, over
+;; the real one. The warm-up is deliberately not just a first run of the real thing.
+;;
+;; jank compiles a function on its first call, and the compiler does not survive two
+;; threads entering it at once -- one benchmark had the main thread inside LLVM building
+;; the next query while a pool worker was inside clang compiling a continuation for the
+;; last one, and that is a segfault. A one-user, one-item pass reaches every function the
+;; real pass does, but finishes each query before starting the next, so nothing is
+;; compiled concurrently. By the time the timed passes fan out, there is nothing left to
+;; compile.
 
 (defn- repeat-async
-  "Runs f n times in sequence, one promise chained onto the last, and collects the results.
-   Sequential on purpose: overlapping the repetitions would measure the pool, not the
-   query."
+  "Runs f n times in sequence, one promise chained onto the last, and collects the
+   results. Sequential on purpose: overlapping the repetitions would measure the pool,
+   not the query."
   [n f]
   (reduce (fn [acc _]
             (p/then acc (fn [runs] (p/then (f) (fn [run] (conj runs run))))))
           (p/resolved [])
           (range n)))
 
+(defn- sync-benches []
+  [{:label :sync/throughput   :warm #(sync-throughput one-user)  :run #(sync-throughput user-ids)}
+   {:label :sync/single-query :warm sync-single-query            :run sync-single-query}
+   {:label :sync/batched      :warm #(sync-batched one-item)     :run #(sync-batched items-entity)}
+   {:label :sync/one-by-one   :warm #(sync-one-by-one one-item)  :run #(sync-one-by-one items-entity)}])
+
+(defn- async-benches [prefix]
+  ;; single-query first, deliberately: it is the only one that runs one query at a time.
+  [{:label (keyword prefix "single-query")
+    :warm  (fn [env] (async-single-query env))
+    :run   (fn [env] (async-single-query env))}
+   {:label (keyword prefix "throughput")
+    :warm  (fn [env] (async-throughput env one-user))
+    :run   (fn [env] (async-throughput env user-ids))}
+   {:label (keyword prefix "batched")
+    :warm  (fn [env] (async-batched env one-item))
+    :run   (fn [env] (async-batched env items-entity))}
+   {:label (keyword prefix "one-by-one")
+    :warm  (fn [env] (async-one-by-one env one-item))
+    :run   (fn [env] (async-one-by-one env items-entity))}])
+
+(def ^:private suites [["async" async-env] ["parallel" parallel-env]])
+
 (defn run-sync
   "The blocking benchmarks. Not callable on ClojureScript, which has no way to block."
   []
-  (mapv (fn [[label f]]
-          (f)
-          (summarise label (repeat-sync iterations f)))
-        [[:sync/throughput sync-throughput]
-         [:sync/single-query sync-single-query]
-         [:sync/batched sync-batched]
-         [:sync/one-by-one sync-one-by-one]]))
+  (mapv (fn [{:keys [label warm run]}]
+          (warm)
+          (summarise label (mapv (fn [_] (run)) (range iterations))))
+        (sync-benches)))
+
+(defn run-async-blocking
+  "The non-blocking benchmarks, driven one at a time from the calling thread.
+
+   This is the shape jank and Clojure use. On jank it is not merely tidier: chaining the
+   whole suite into one promise means the harness's own closures first-compile on pool
+   workers, alongside the query continuations, and jank's compiler does not survive two
+   threads entering it at once."
+  []
+  (vec (mapcat (fn [[prefix env]]
+                 (mapv (fn [{:keys [label warm run]}]
+                         (clock/await! (warm env))
+                         (summarise label
+                                    (mapv (fn [_] (clock/await! (run env))) (range iterations))))
+                       (async-benches prefix)))
+               suites)))
 
 (defn- run-async-suite [prefix env]
-  (reduce (fn [acc [label f]]
+  (reduce (fn [acc {:keys [label warm run]}]
             (p/then acc
                     (fn [results]
-                      ;; warm-up pass, then the timed ones
-                      (p/then (f env)
+                      (p/then (warm env)
                               (fn [_]
-                                (p/then (repeat-async iterations (fn [] (f env)))
+                                (p/then (repeat-async iterations (fn [] (run env)))
                                         (fn [runs] (conj results (summarise label runs)))))))))
           (p/resolved [])
-          [[(keyword prefix "throughput") async-throughput]
-           [(keyword prefix "single-query") async-single-query]
-           [(keyword prefix "batched") async-batched]
-           [(keyword prefix "one-by-one") async-one-by-one]]))
+          (async-benches prefix)))
 
 (defn run-async
-  "Every non-blocking benchmark, async runner then parallel runner. Returns a promise of
-   the collected results, so ClojureScript can use it too."
+  "The same benchmarks as run-async-blocking, chained into one promise. This is the shape
+   ClojureScript needs, since it cannot block on anything."
   []
-  (p/then (run-async-suite "async" async-env)
-          (fn [async-results]
-            (p/then (run-async-suite "parallel" parallel-env)
-                    (fn [parallel-results] (into async-results parallel-results))))))
+  (reduce (fn [acc [prefix env]]
+            (p/then acc (fn [results]
+                          (p/then (run-async-suite prefix env)
+                                  (fn [suite] (into results suite))))))
+          (p/resolved [])
+          suites))
 
 (defn report!
   "Prints one EDN map per line: the format examples/run reads."

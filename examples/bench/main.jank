@@ -10,4 +10,4 @@
             [bench.graph :as graph]))
 
 (graph/report! (graph/run-sync))
-(graph/report! (clock/await! (graph/run-async)))
+(graph/report! (graph/run-async-blocking))

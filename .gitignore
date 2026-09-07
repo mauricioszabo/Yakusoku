@@ -4,3 +4,4 @@ target/
 *.so
 *.a
 pom.xml
+examples/target/

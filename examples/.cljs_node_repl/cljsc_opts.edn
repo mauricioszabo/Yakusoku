@@ -1,0 +1,1 @@
+{:output-dir ".cljs_node_repl", :target :nodejs, :output-to "target/bench.js", :main bench.main, :aot-cache true}

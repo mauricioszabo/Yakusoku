@@ -373,6 +373,24 @@
                         (p/recur (inc n))
                         n))))))
 
+  (testing "p/recur awaits a promise it is handed"
+    ;; The distinction that matters: `(p/recur (something-async))` must mean "go round
+    ;; again once that has finished", not "go round again now". Pathom's async runner
+    ;; drains its batch queue with exactly this shape, and reading the queue back before
+    ;; the batch had run silently lost every batched result.
+    (is (= [:ok [:a :b :c]]
+           (settled (p/loop [seen []]
+                      (if (< (count seen) 3)
+                        (p/recur (p/delay 5 (conj seen (nth [:a :b :c] (count seen)))))
+                        seen))))))
+
+  (testing "p/recur awaits every binding, not just the first"
+    (is (= [:ok [3 30]]
+           (settled (p/loop [i 0 acc 0]
+                      (if (< i 3)
+                        (p/recur (p/delay 5 (inc i)) (p/delay 5 (+ acc (* 10 i))))
+                        [i acc]))))))
+
   (testing "a rejection inside p/loop propagates out"
     (is (= :err (nth (settled (p/loop [n 0]
                                 (if (< n 2)

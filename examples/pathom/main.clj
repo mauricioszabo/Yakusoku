@@ -5,6 +5,6 @@
 
 (defn -main [& _]
   (graph/report! (graph/run-sync))
-  (graph/report! (clock/await! (graph/run-async)))
+  (graph/report! (graph/run-async-blocking))
   (shutdown-agents)
   (System/exit 0))
