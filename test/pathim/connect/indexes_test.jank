@@ -1,6 +1,6 @@
 (ns pathim.connect.indexes-test
   (:require
-    [pathim.test.check :refer [check]]
+    [pathim.test.check :refer [check thrown-msg?]]
     [clojure.test :refer [deftest is testing]]
     [pathim.connect.built-in.resolvers :as pbir]
     [pathim.connect.indexes :as pci]
@@ -87,7 +87,7 @@
               :pathim.connect.indexes/index-oir        {:foo {{} #{'r}}}}))
 
       (testing "throw error on duplicated name"
-        (is (thrown-with-msg? #"Tried to register duplicated resolver: r"
+        (is (thrown-msg? #"Tried to register duplicated resolver: r"
               (pci/register [resolver resolver])))))
 
     (testing "remove outputs mentioned at input, and warns"
@@ -129,7 +129,7 @@
                                             :pathim.connect.indexes/attr-mutation-output-in #{'m}}}}))
 
       (testing "throw error on duplicated name"
-        (is (thrown-with-msg? #"Tried to register duplicated mutation: m"
+        (is (thrown-msg? #"Tried to register duplicated mutation: m"
               (pci/register [mutation mutation]))))))
 
   (testing "multiple globals"
@@ -217,10 +217,10 @@
               :pathim.connect.indexes/index-io         {#{} {:foo  {}
                                            :foo2 {}}}}))
 
-      (is (thrown-with-msg? #"Tried to register duplicated resolver: r"
+      (is (thrown-msg? #"Tried to register duplicated resolver: r"
             (pci/register [(pci/register r1) (pci/register r1)])))
 
-      (is (thrown-with-msg? #"Tried to register duplicated mutation: m"
+      (is (thrown-msg? #"Tried to register duplicated mutation: m"
             (pci/register [(pci/register mutation) (pci/register mutation)]))))))
 
 (deftest attribute-available?-test

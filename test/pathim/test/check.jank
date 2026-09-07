@@ -42,6 +42,22 @@
                                                :actual   (get actual k)}])) differing)})
     {:expected expected :actual actual}))
 
+(defmacro thrown-msg?
+  "True if body throws something whose message matches re. Use inside `is`.
+
+   Looks in ex-data's :message as well as the message itself: jank's `assert` reports
+   \"assertion failed\" as the message and puts the text it was given into ex-data, where
+   Clojure's AssertionError carries that text as the message. What the test is really
+   asserting -- that the right complaint reaches the caller -- holds either way."
+  [re & body]
+  `(let [result# (try
+                   (do ~@body)
+                   ::no-throw
+                   (catch cpp/jank.runtime.object_ref e#
+                     [(ex-message e#) (:message (ex-data e#))]))]
+     (and (not= ::no-throw result#)
+          (boolean (some (fn [m#] (and m# (re-find ~re m#))) result#)))))
+
 (defmacro check
   "Asserts that a value matches a pattern. Both of the library's shapes are accepted:
 

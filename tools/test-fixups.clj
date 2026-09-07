@@ -70,8 +70,12 @@
 ;; check's => matches maps partially, so it must keep going through the compatibility
 ;; layer rather than becoming a strict = -- upstream's expectation here names only some of
 ;; the keys the index actually carries.
+;; jank's assert puts its message in ex-data rather than in the exception message, so the
+;; duplicate-registration assertions go through a matcher that looks in both places.
 (edit! "connect/indexes_test.jank"
-  "    [check.core :refer [=> check]]" "    [pathim.test.check :refer [check]]")
+  "    [check.core :refer [=> check]]" "    [pathim.test.check :refer [check thrown-msg?]]"
+  "(thrown-with-msg? #\"Tried to register duplicated"
+  "(thrown-msg? #\"Tried to register duplicated")
 (edit! "connect/planner_test.jank"
   "    [check.core :refer [=> check]]" "    [pathim.test.check :refer [check]]"
   "    [matcher-combinators.matchers :as m]))" "    ))")
