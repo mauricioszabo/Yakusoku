@@ -8,7 +8,13 @@
 
    A promise handle is a map holding an opaque box around a `yakusoku::cell`. The map
    wrapper exists so `promise?` can answer honestly: an opaque box carries no tag jank
-   can read back, so a bare box could not be told apart from any other boxed pointer.")
+   can read back, so a bare box could not be told apart from any other boxed pointer.
+
+   The boxing and unboxing happen in C++, not through jank's `cpp/box` and `cpp/unbox`.
+   jank's `cpp/box` emits a `_jank_eval_str` per call site, so it re-enters the compiler
+   every time it runs and cannot be called from two threads at once -- see the note in
+   native/yakusoku.hpp. Everything here is therefore an ordinary interop call taking the
+   handle straight through.")
 
 (cpp/raw "#include <yakusoku.hpp>")
 
@@ -34,48 +40,39 @@
 (defn make-promise
   "Creates a pending promise."
   []
-  {::cell (cpp/box (cpp/yakusoku.cell_create))})
-
-;; A jank function cannot return a native pointer, so every one of these unboxes into a
-;; local and uses it there. That is the shape the interop guide recommends anyway.
+  {::cell (cpp/yakusoku.cell_create)})
 
 (defn status
   "One of :pending, :resolved, :rejected, :cancelled."
   [p]
-  (let [c (cpp/unbox (:* yakusoku.cell) (::cell p))]
-    (get status->keyword (cpp/yakusoku.cell_status c))))
+  (get status->keyword (cpp/yakusoku.cell_status (::cell p))))
 
 (defn value
   "The settled value, or the error for a rejected promise. Meaningless while pending."
   [p]
-  (let [c (cpp/unbox (:* yakusoku.cell) (::cell p))]
-    (cpp/yakusoku.cell_value c)))
+  (cpp/yakusoku.cell_value (::cell p)))
 
 (defn attach!
   "Registers a zero-arity callback. Returns true if the promise was ALREADY settled, in
    which case nothing was registered and the caller must run the callback itself."
   [p callback]
-  (let [c (cpp/unbox (:* yakusoku.cell) (::cell p))]
-    (cpp/yakusoku.cell_attach c callback)))
+  (cpp/yakusoku.cell_attach (::cell p) callback))
 
 (defn settle!
   "Moves the promise out of :pending and runs its callbacks. Returns false if it was
    already settled, so exactly one caller ever wins."
   [p status-code v]
-  (let [c (cpp/unbox (:* yakusoku.cell) (::cell p))]
-    (cpp/yakusoku.cell_settle c (cpp/cast cpp/int status-code) v)))
+  (cpp/yakusoku.cell_settle (::cell p) (cpp/cast cpp/int status-code) v))
 
 (defn await!
   "Blocks the calling thread until the promise settles."
   [p]
-  (let [c (cpp/unbox (:* yakusoku.cell) (::cell p))]
-    (cpp/yakusoku.cell_await c)))
+  (cpp/yakusoku.cell_await (::cell p)))
 
 (defn await-for!
   "Blocks until the promise settles or ms elapses. Returns true if it settled."
   [p ms]
-  (let [c (cpp/unbox (:* yakusoku.cell) (::cell p))]
-    (cpp/yakusoku.cell_await_for c (cpp/cast cpp/long ms))))
+  (cpp/yakusoku.cell_await_for (::cell p) (cpp/cast cpp/long ms)))
 
 ;; ------------------------------------------------------------------- pools ----
 
@@ -88,38 +85,33 @@
   "Creates an Asio io_context with a work guard. It has no threads of its own until
    run! is called on threads supplied by the caller."
   []
-  {::pool (cpp/box (cpp/yakusoku.pool_create))})
+  {::pool (cpp/yakusoku.pool_create)})
 
 (defn post!
   "Queues a zero-arity function to run on a pool worker."
   [p f]
-  (let [ctx (cpp/unbox (:* yakusoku.pool) (::pool p))]
-    (cpp/yakusoku.pool_post ctx f)))
+  (cpp/yakusoku.pool_post (::pool p) f))
 
 (defn schedule!
   "Queues a zero-arity function to run after ms milliseconds."
   [p ms f]
-  (let [ctx (cpp/unbox (:* yakusoku.pool) (::pool p))]
-    (cpp/yakusoku.pool_schedule ctx (cpp/cast cpp/long ms) f)))
+  (cpp/yakusoku.pool_schedule (::pool p) (cpp/cast cpp/long ms) f))
 
 (defn run-loop!
   "Runs the pool's event loop on the calling thread. Returns when the pool is drained
    or stopped."
   [p]
-  (let [ctx (cpp/unbox (:* yakusoku.pool) (::pool p))]
-    (cpp/yakusoku.pool_run ctx)))
+  (cpp/yakusoku.pool_run (::pool p)))
 
 (defn drain!
   "Releases the work guard: workers return once queued work and pending timers finish."
   [p]
-  (let [ctx (cpp/unbox (:* yakusoku.pool) (::pool p))]
-    (cpp/yakusoku.pool_drain ctx)))
+  (cpp/yakusoku.pool_drain (::pool p)))
 
 (defn stop!
   "Stops immediately, abandoning queued work."
   [p]
-  (let [ctx (cpp/unbox (:* yakusoku.pool) (::pool p))]
-    (cpp/yakusoku.pool_stop ctx)))
+  (cpp/yakusoku.pool_stop (::pool p)))
 
 ;; ------------------------------------------------------------------ timers ----
 
@@ -133,21 +125,18 @@
    native/yakusoku.hpp -- so create one per long-lived thing that needs to debounce, not
    one per event."
   [p]
-  (let [ctx (cpp/unbox (:* yakusoku.pool) (::pool p))]
-    {::timer (cpp/box (cpp/yakusoku.timer_create ctx))}))
+  {::timer (cpp/yakusoku.timer_create (::pool p))})
 
 (defn restart-timer!
   "Arms the timer to run a zero-arity function after ms milliseconds, cancelling any
    pending wait. Restarting before the deadline is what makes this a debouncer."
   [t ms f]
-  (let [tm (cpp/unbox (:* yakusoku.timer) (::timer t))]
-    (cpp/yakusoku.timer_restart tm (cpp/cast cpp/long ms) f)))
+  (cpp/yakusoku.timer_restart (::timer t) (cpp/cast cpp/long ms) f))
 
 (defn cancel-timer!
   "Cancels a pending wait. The callback is dropped, not run."
   [t]
-  (let [tm (cpp/unbox (:* yakusoku.timer) (::timer t))]
-    (cpp/yakusoku.timer_cancel tm)))
+  (cpp/yakusoku.timer_cancel (::timer t)))
 
 ;; ------------------------------------------------------- jank's own objects ----
 

@@ -1,0 +1,266 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+(ns bench.graph
+  "A resolver graph built so that the three runners visibly differ, plus the benchmarks
+   over it.
+
+   Written once, against pathim and Yakusoku. examples/run rewrites the namespace prefixes
+   to real Pathom 3 and promesa, so the identical code runs on Clojure and ClojureScript
+   and the numbers can be compared across runtimes. Nothing here may use a reader
+   conditional: jank's reader feature is :jank, so every #?(...) would silently resolve to
+   nothing. Everything that differs per runtime lives in bench.clock instead.
+
+   What each runner actually buys is worth stating plainly, because the benchmarks are
+   shaped around it:
+
+     * The async runner does not overlap the steps of one query -- it walks the same plan,
+       awaiting each node. What it buys is not blocking a thread, so many queries can be in
+       flight at once. Benchmark 1 measures that, as throughput.
+     * The parallel runner overlaps independent branches *within* one query. Benchmark 2
+       measures that, on a query whose two expensive resolvers do not depend on each other.
+     * Batching turns N resolver calls into one. Benchmark 3 measures that against a
+       deliberately non-batched twin resolver."
+  (:require
+    [bench.clock :as clock]
+    [pathim.connect.operation :as pco]
+    [pathim.connect.indexes :as pci]
+    [pathim.interface.eql :as p.eql]
+    [pathim.interface.async.eql :as p.a.eql]
+    [yakusoku.core :as p]))
+
+;; ------------------------------------------------------------------ workload ----
+;;
+;; Simulated latency, in milliseconds. These stand in for network calls: the sync
+;; resolvers block for them, the async ones resolve a promise after them.
+
+(def slow-ms
+  "Each of the two independent user resolvers."
+  50)
+
+(def join-ms
+  "The resolver that depends on both of them."
+  10)
+
+(def batch-ms
+  "One batched call, however many items it covers."
+  60)
+
+(def item-ms
+  "One call of the non-batched twin, per item."
+  20)
+
+(def user-ids (vec (range 1 21)))
+
+(def item-ids (vec (range 1 31)))
+
+(def items (mapv (fn [id] {:item/id id}) item-ids))
+
+;; ----------------------------------------------------------- sync resolvers ----
+
+(pco/defresolver profile-sync [env input]
+  {::pco/input  [:user/id]
+   ::pco/output [:user/profile]}
+  (clock/sleep-ms slow-ms)
+  {:user/profile (str "profile-" (:user/id input))})
+
+(pco/defresolver orders-sync [env input]
+  {::pco/input  [:user/id]
+   ::pco/output [:user/orders]}
+  (clock/sleep-ms slow-ms)
+  {:user/orders (* 3 (:user/id input))})
+
+(pco/defresolver summary-sync [env input]
+  {::pco/input  [:user/profile :user/orders]
+   ::pco/output [:user/summary]}
+  (clock/sleep-ms join-ms)
+  {:user/summary (str (:user/profile input) "/" (:user/orders input))})
+
+(pco/defresolver price-batch-sync [env inputs]
+  {::pco/input  [:item/id]
+   ::pco/output [:item/price]
+   ::pco/batch? true}
+  (clock/sleep-ms batch-ms)
+  (mapv (fn [item] {:item/price (* 10 (:item/id item))}) inputs))
+
+(pco/defresolver price-one-sync [env input]
+  {::pco/input  [:item/id]
+   ::pco/output [:item/slow-price]}
+  (clock/sleep-ms item-ms)
+  {:item/slow-price (* 10 (:item/id input))})
+
+;; ---------------------------------------------------------- async resolvers ----
+;;
+;; The same graph, with every resolver returning a promise rather than blocking.
+
+(pco/defresolver profile-async [env input]
+  {::pco/input  [:user/id]
+   ::pco/output [:user/profile]}
+  (p/delay slow-ms {:user/profile (str "profile-" (:user/id input))}))
+
+(pco/defresolver orders-async [env input]
+  {::pco/input  [:user/id]
+   ::pco/output [:user/orders]}
+  (p/delay slow-ms {:user/orders (* 3 (:user/id input))}))
+
+(pco/defresolver summary-async [env input]
+  {::pco/input  [:user/profile :user/orders]
+   ::pco/output [:user/summary]}
+  (p/delay join-ms {:user/summary (str (:user/profile input) "/" (:user/orders input))}))
+
+(pco/defresolver price-batch-async [env inputs]
+  {::pco/input  [:item/id]
+   ::pco/output [:item/price]
+   ::pco/batch? true}
+  (p/delay batch-ms (mapv (fn [item] {:item/price (* 10 (:item/id item))}) inputs)))
+
+(pco/defresolver price-one-async [env input]
+  {::pco/input  [:item/id]
+   ::pco/output [:item/slow-price]}
+  (p/delay item-ms {:item/slow-price (* 10 (:item/id input))}))
+
+;; --------------------------------------------------------------------- envs ----
+
+(def sync-env
+  (pci/register [profile-sync orders-sync summary-sync price-batch-sync price-one-sync]))
+
+(def async-env
+  (pci/register [profile-async orders-async summary-async price-batch-async price-one-async]))
+
+(def parallel-env
+  (assoc async-env ::p.a.eql/parallel? true))
+
+;; --------------------------------------------------------------- benchmarks ----
+;;
+;; Every benchmark answers with a plain vector of scalars as well as a duration, so
+;; examples/run can check that all three runners in all three runtimes computed the same
+;; thing before it compares any timings.
+
+(def batch-query [{:items [:item/price]}])
+(def one-by-one-query [{:items [:item/slow-price]}])
+(def items-entity {:items items})
+
+(defn sync-throughput
+  "Twenty independent user queries, one after another. Blocking, so the cost is the sum."
+  []
+  (let [start  (clock/now-ms)
+        answer (mapv (fn [id]
+                       (:user/summary (p.eql/process sync-env {:user/id id} [:user/summary])))
+                     user-ids)]
+    {:ms (- (clock/now-ms) start) :answer answer}))
+
+(defn sync-single-query
+  "One query whose two expensive resolvers are independent. Sync pays for both."
+  []
+  (let [start  (clock/now-ms)
+        answer (:user/summary (p.eql/process sync-env {:user/id 1} [:user/summary]))]
+    {:ms (- (clock/now-ms) start) :answer answer}))
+
+(defn sync-batched []
+  (let [start  (clock/now-ms)
+        answer (mapv :item/price (:items (p.eql/process sync-env items-entity batch-query)))]
+    {:ms (- (clock/now-ms) start) :answer answer}))
+
+(defn sync-one-by-one []
+  (let [start  (clock/now-ms)
+        answer (mapv :item/slow-price (:items (p.eql/process sync-env items-entity one-by-one-query)))]
+    {:ms (- (clock/now-ms) start) :answer answer}))
+
+(defn async-throughput
+  "The same twenty queries, all started before any of them finishes."
+  [env]
+  (let [start (clock/now-ms)]
+    (p/then (p/all (mapv (fn [id] (p.a.eql/process env {:user/id id} [:user/summary])) user-ids))
+            (fn [results]
+              {:ms (- (clock/now-ms) start) :answer (mapv :user/summary results)}))))
+
+(defn async-single-query [env]
+  (let [start (clock/now-ms)]
+    (p/then (p.a.eql/process env {:user/id 1} [:user/summary])
+            (fn [result]
+              {:ms (- (clock/now-ms) start) :answer (:user/summary result)}))))
+
+(defn async-batched [env]
+  (let [start (clock/now-ms)]
+    (p/then (p.a.eql/process env items-entity batch-query)
+            (fn [result]
+              {:ms (- (clock/now-ms) start) :answer (mapv :item/price (:items result))}))))
+
+(defn async-one-by-one [env]
+  (let [start (clock/now-ms)]
+    (p/then (p.a.eql/process env items-entity one-by-one-query)
+            (fn [result]
+              {:ms (- (clock/now-ms) start) :answer (mapv :item/slow-price (:items result))}))))
+
+;; ------------------------------------------------------------- running them ----
+
+(def iterations
+  "One warm-up pass, discarded, then this many timed ones. jank compiles a function on its
+   first call and the JVM's JIT warms up, so the first pass of anything is not a
+   measurement."
+  3)
+
+(defn median [xs]
+  (let [sorted (vec (sort xs))]
+    (nth sorted (quot (count sorted) 2))))
+
+(defn- summarise [label runs]
+  {:bench  label
+   :ms     (median (mapv :ms runs))
+   :all-ms (mapv :ms runs)
+   :answer (:answer (first runs))})
+
+(defn- repeat-sync [n f]
+  (mapv (fn [_] (f)) (range n)))
+
+(defn- repeat-async
+  "Runs f n times in sequence, one promise chained onto the last, and collects the results.
+   Sequential on purpose: overlapping the repetitions would measure the pool, not the
+   query."
+  [n f]
+  (reduce (fn [acc _]
+            (p/then acc (fn [runs] (p/then (f) (fn [run] (conj runs run))))))
+          (p/resolved [])
+          (range n)))
+
+(defn run-sync
+  "The blocking benchmarks. Not callable on ClojureScript, which has no way to block."
+  []
+  (mapv (fn [[label f]]
+          (f)
+          (summarise label (repeat-sync iterations f)))
+        [[:sync/throughput sync-throughput]
+         [:sync/single-query sync-single-query]
+         [:sync/batched sync-batched]
+         [:sync/one-by-one sync-one-by-one]]))
+
+(defn- run-async-suite [prefix env]
+  (reduce (fn [acc [label f]]
+            (p/then acc
+                    (fn [results]
+                      ;; warm-up pass, then the timed ones
+                      (p/then (f env)
+                              (fn [_]
+                                (p/then (repeat-async iterations (fn [] (f env)))
+                                        (fn [runs] (conj results (summarise label runs)))))))))
+          (p/resolved [])
+          [[(keyword prefix "throughput") async-throughput]
+           [(keyword prefix "single-query") async-single-query]
+           [(keyword prefix "batched") async-batched]
+           [(keyword prefix "one-by-one") async-one-by-one]]))
+
+(defn run-async
+  "Every non-blocking benchmark, async runner then parallel runner. Returns a promise of
+   the collected results, so ClojureScript can use it too."
+  []
+  (p/then (run-async-suite "async" async-env)
+          (fn [async-results]
+            (p/then (run-async-suite "parallel" parallel-env)
+                    (fn [parallel-results] (into async-results parallel-results))))))
+
+(defn report!
+  "Prints one EDN map per line: the format examples/run reads."
+  [results]
+  (doseq [r results]
+    (prn (assoc r :runtime (clock/runtime-name)))))

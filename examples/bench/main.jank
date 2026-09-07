@@ -1,0 +1,13 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+(ns bench.main
+  "jank driver: run the blocking benchmarks, then block on the non-blocking ones.
+
+   jank run $(bin/jank-flags) --module-path src:examples examples/bench/main.jank"
+  (:require [bench.clock :as clock]
+            [bench.graph :as graph]))
+
+(graph/report! (graph/run-sync))
+(graph/report! (clock/await! (graph/run-async)))

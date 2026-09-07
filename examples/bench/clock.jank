@@ -1,0 +1,26 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+(ns bench.clock
+  "Everything in the benchmark that differs between jank, Clojure and ClojureScript.
+   There are only four things, and this is the jank one; examples/pathom/clock.clj and
+   clock.cljs are the other two."
+  (:require [yakusoku.core :as p]))
+
+(defn runtime-name [] "jank")
+
+(defn now-ms
+  "Milliseconds from a monotonic clock, as a double."
+  []
+  (/ (double (cpp/clojure.core_native.current_time)) 1000000.0))
+
+(defn sleep-ms
+  "Blocks the calling thread. Used only by the sync benchmarks."
+  [ms]
+  (cpp/clojure.core_native.sleep ms))
+
+(defn await!
+  "Blocks until a promise settles and returns its value."
+  [promise]
+  (p/await! promise))
