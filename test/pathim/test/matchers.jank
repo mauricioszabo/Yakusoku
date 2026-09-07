@@ -1,0 +1,77 @@
+;; Stands in for the `matcher-combinators` library used by Pathom's own tests.
+
+(ns pathim.test.matchers
+  "A small compatible subset of nubank/matcher-combinators -- the four things Pathom's
+   runner tests use, and nothing else.
+
+   The default semantics are matcher-combinators's: a map in the pattern matches a map that
+   *embeds* it, so a test can name the keys it cares about; sequences must have the same
+   length and match elementwise; everything else must be equal. `equals` opts out of the
+   embedding for one map, `regex` matches a string, and `absent` asserts that a key is not
+   there at all.
+
+   jank has no records, so a matcher is a map carrying ::kind, recognised structurally --
+   the same shape the port uses everywhere it would otherwise need a type."
+  (:refer-clojure :exclude [==]))
+
+(def absent
+  "As a map value: that key must not be present."
+  {::kind :absent})
+
+(defn equals
+  "Matches x exactly: a map matched with this must have precisely these keys."
+  [x]
+  {::kind :equals :value x})
+
+(defn regex
+  "Matches a string containing re."
+  [re]
+  {::kind :regex :value re})
+
+(defn matcher?
+  "True for one of the matchers above."
+  [x]
+  (and (map? x) (contains? x ::kind)))
+
+(declare match?)
+
+(defn- match-map? [expected actual embed?]
+  (and (map? actual)
+       ;; ::absent entries assert absence; every other key must be present and match
+       (every? (fn [k]
+                 (let [e (get expected k)]
+                   (if (and (matcher? e) (= :absent (::kind e)))
+                     (not (contains? actual k))
+                     (and (contains? actual k) (match? e (get actual k))))))
+               (keys expected))
+       (or embed?
+           ;; `equals` also requires that nothing else is there
+           (= (count (remove (fn [k] (let [e (get expected k)]
+                                       (and (matcher? e) (= :absent (::kind e)))))
+                             (keys expected)))
+              (count (keys actual))))))
+
+(defn- match-seq? [expected actual]
+  (and (sequential? actual)
+       (= (count expected) (count actual))
+       (every? (fn [i] (match? (nth (vec expected) i) (nth (vec actual) i)))
+               (range (count expected)))))
+
+(defn match?
+  "True if actual matches the expected pattern."
+  [expected actual]
+  (cond
+    (matcher? expected)
+    (case (::kind expected)
+      :absent (nil? actual)
+      :equals (let [v (:value expected)]
+                (if (map? v)
+                  (match-map? v actual false)
+                  (match? v actual)))
+      :regex (and (string? actual) (some? (re-find (:value expected) actual)))
+      false)
+
+    (map? expected) (match-map? expected actual true)
+    (set? expected) (= expected actual)
+    (sequential? expected) (match-seq? expected actual)
+    :else (= expected actual)))

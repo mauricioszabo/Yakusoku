@@ -1,0 +1,3646 @@
+(ns pathim.connect.runner-test
+  (:require
+    [pathim.misc :refer [raise!]]
+    [pathim.test.check :refer [check]]
+    [clojure.test :refer [deftest is are run-tests testing]]
+    [pathim.misc.coll :as coll]
+    [pathim.cache :as p.cache]
+    [pathim.connect.built-in.plugins :as pbip]
+    [pathim.connect.built-in.resolvers :as pbir]
+    [pathim.connect.indexes :as pci]
+    [pathim.connect.operation :as pco]
+    [pathim.connect.planner :as pcp]
+    [pathim.connect.runner :as pcr]
+    [pathim.connect.runner.async :as pcra]
+    [pathim.connect.runner.parallel :as pcrc]
+    [pathim.entity-tree :as p.ent]
+    [pathim.error :as p.error]
+    [pathim.format.eql :as pf.eql]
+    [pathim.format.shape-descriptor :as pfsd]
+    [pathim.interface.eql :as p.eql]
+    [pathim.path :as p.path]
+    [pathim.plugin :as p.plugin]
+    [pathim.test.geometry-resolvers :as geo]
+    [pathim.test.helpers :as h]
+    [pathim.promise-macros :refer [clet ctry]]
+    [pathim.eql :as eql]
+    [pathim.test.matchers :as m]
+    [pathim.test.matchers :as mcs]
+    [yakusoku.core :as p]))
+
+(declare thrown-with-msg?)
+
+(defonce ^:dynamic *test-only-serial* false)
+
+(comment
+  (alter-var-root #'*test-only-serial* (constantly true))
+  (alter-var-root #'*test-only-serial* (constantly false)))
+
+(defn match-keys? [ks]
+  (fn [m]
+    (reduce
+      (fn [_ k]
+        (if-let [v (find m k)]
+          (if (s/valid? k (val v))
+            true
+            (reduced false))
+          (reduced false)))
+      true
+      ks)))
+
+(deftest all-requires-ready?-test
+  (is (= (pcr/all-requires-ready? (p.ent/with-entity {} {:a 1})
+           {:pathim.connect.planner/expects {}})
+         true))
+
+  (is (= (pcr/all-requires-ready? (p.ent/with-entity {} {:a 1})
+           {:pathim.connect.planner/expects {:a {}}})
+         true))
+
+  (is (= (pcr/all-requires-ready? (p.ent/with-entity {} {:a 1})
+           {:pathim.connect.planner/expects {:b {}}})
+         false)))
+
+(deftest merge-resolver-response!-test
+  (testing "does nothing when response is not a map"
+    (is (= (-> (pcr/merge-resolver-response!
+                 (p.ent/with-entity {} {:foo "bar"})
+                 nil)
+               :pathim.entity-tree/entity-tree* deref)
+           {:foo "bar"})))
+
+  (testing "adds new data to cache tree"
+    (is (= (-> (pcr/merge-resolver-response!
+                 (p.ent/with-entity {:pathim.path/path []
+                                     :pathim.connect.planner/graph   {:pathim.connect.planner/nodes     {}
+                                                    :pathim.connect.planner/index-ast {}}} {:foo "bar"})
+                 {:buz "baz"})
+               :pathim.entity-tree/entity-tree* deref)
+           {:foo "bar"
+            :buz "baz"}))
+
+    (testing "skip unknown values"
+      (is (= (-> (pcr/merge-resolver-response!
+                   (p.ent/with-entity {:pathim.path/path []
+                                       :pathim.connect.planner/graph   {:pathim.connect.planner/nodes     {}
+                                                      :pathim.connect.planner/index-ast {}}} {:foo "bar"})
+                   {:buz :pathim.connect.operation/unknown-value})
+                 :pathim.entity-tree/entity-tree* deref)
+             {:foo "bar"})))
+
+    (testing "dont override current data"
+      (is (= (-> (pcr/merge-resolver-response!
+                   (p.ent/with-entity
+                     {:pathim.path/path []
+                      :pathim.connect.planner/graph   {:pathim.connect.planner/nodes     {}
+                                     :pathim.connect.planner/index-ast {}}}
+                     {:foo "bar"})
+                   {:foo "other"
+                    :buz "baz"})
+                 :pathim.entity-tree/entity-tree* deref)
+             {:foo "bar"
+              :buz "baz"})))))
+
+(deftest run-node!-test
+  (is (= (let [tree  {:pathim.test.geometry-resolvers/left 10 :pathim.test.geometry-resolvers/width 30}
+               env   (p.ent/with-entity (pci/register {:pathim.path/path []} geo/registry)
+                                        tree)
+               graph (pcp/compute-run-graph
+                       (-> env
+                           (assoc
+                             :pathim.connect.planner/available-data (pfsd/data->shape-descriptor tree)
+                             :edn-query-language.ast/node (eql/query->ast [:pathim.test.geometry-resolvers/right
+                                                                           :pathim.test.geometry-resolvers/center-x]))))
+               env   (assoc env :pathim.connect.planner/graph graph
+                       :pathim.connect.runner/node-run-stats* (volatile! ^:pathim.connect.runner-test/map-container? {}))]
+           (pcr/run-node! env (pcp/get-root-node graph))
+           @(:pathim.entity-tree/entity-tree* env))
+         {:pathim.test.geometry-resolvers/left       10
+          :pathim.test.geometry-resolvers/width      30
+          :pathim.test.geometry-resolvers/right      40
+          :pathim.test.geometry-resolvers/half-width 15
+          :pathim.test.geometry-resolvers/center-x   25})))
+
+(defn run-graph
+  ([{:pathim.connect.runner-test/keys [map-select?] :as env} tree query]
+   (let [ast (eql/query->ast query)
+         res (pcr/run-graph! env ast (p.ent/create-entity tree))]
+     (if map-select?
+       (pf.eql/map-select env res query)
+       res)))
+  ([env tree query _] (run-graph env tree query)))
+
+(defn run-graph-async
+  ([env tree query]
+   (let [ast (eql/query->ast query)]
+     (pcra/run-graph! env ast (p.ent/create-entity tree))))
+  ([env tree query _expected]
+   (run-graph-async env tree query)))
+
+(defn run-graph-parallel [env tree query]
+  (let [ast (eql/query->ast query)]
+    (p/timeout
+      (pcrc/run-graph! env ast (p.ent/create-entity tree))
+      3000)))
+
+(defn coords-resolver [c]
+  (pco/resolver 'coords-resolver {:pathim.connect.operation/output [:pathim.connect.runner-test/coords]}
+    (fn [_ _] {:pathim.connect.runner-test/coords c})))
+
+(def full-env (pci/register [geo/full-registry]))
+
+(defn graph-response? [env tree query expected]
+  (if (fn? expected)
+    #_{:clj-kondo/ignore [:single-logical-operand]}
+    (let [sync             (expected (run-graph env tree query))
+          async (expected (p/await! (run-graph-async env tree query)))
+          parallel (expected (p/await! (run-graph-parallel env tree query)))]
+      (and sync async parallel))
+    (= (run-graph env tree query)
+       (let [res (p/await! (run-graph-async env tree query))]
+                 ;(println res)
+                 res)
+       (let [res (p/await! (run-graph-parallel env tree query))]
+                 ;(println res)
+                 res)
+       expected)))
+
+(def all-runners [run-graph run-graph-async run-graph-parallel])
+
+(defn check-runners []
+  (if *test-only-serial*
+    [run-graph]
+    all-runners))
+
+(defmacro check-serial [env entity tx expected]
+     `(check
+        (run-graph ~env ~entity ~tx)
+        ~'=> ~expected))
+
+(defmacro check-parallel [env entity tx expected]
+     `(check
+        (p/await! (run-graph-parallel ~env ~entity ~tx))
+        ~'=> ~expected))
+
+(defmacro check-all-runners [env entity tx expected]
+     `(doseq [runner# (check-runners)]
+        (testing (str runner#)
+          (check
+            (let [res# (runner# ~env ~entity ~tx)]
+              (if (p/promise? res#)
+                @res# res#))
+            ~'=> ~expected))))
+
+(defmacro check-all-runners-ex [env entity tx expected]
+     `(doseq [runner# (check-runners)]
+        (testing (str runner#)
+          (check (~'=> ~expected
+                       (let [res# (ctry
+                                    (runner# ~env ~entity ~tx)
+                                    (catch Throwable e#
+                                      {:ex/message (ex-message e#)
+                                       :ex/data    (ex-data e#)}))]
+                         (if (p/promise? res#)
+                           @res# res#)))))))
+
+; region helpers
+
+(defn batchfy
+  "Convert a resolver in a batch version of it."
+  [resolver]
+  (-> resolver
+      (pco/update-config #(assoc % :pathim.connect.operation/batch? true))
+      (update :resolve
+        (fn [resolve]
+          (fn [env inputs]
+            (mapv #(resolve env %) inputs))))))
+
+(pco/defresolver optional-in [{:keys [foo bar]
+                               :or   {bar 1}}]
+  {:out (str foo " - " bar)})
+
+(deftest resolver-implicit-optionals
+  (check-all-runners
+    (pci/register optional-in)
+    {:foo 3}
+    [:out]
+    {:out "3 - 1"}))
+
+(pco/defresolver batch-param [env items]
+  {:pathim.connect.operation/input  [:id]
+   :pathim.connect.operation/output [:v]
+   :pathim.connect.operation/batch? true}
+  (let [m (-> (pco/params env) :multiplier (or 10))]
+    (mapv #(hash-map :v (* m (:id %))) items)))
+
+(pco/defresolver batch-fetch-error []
+  {:pathim.connect.operation/input  [:id]
+   :pathim.connect.operation/output [:v]
+   :pathim.connect.operation/batch? true}
+  (raise! (ex-info "Batch error" {})))
+
+(pco/defresolver batch-fetch-nested [items]
+  {:pathim.connect.operation/input  [:id]
+   :pathim.connect.operation/output [{:n [:pre-id]}]
+   :pathim.connect.operation/batch? true}
+  (mapv #(hash-map :n {:pre-id (* 10 (:id %))}) items))
+
+(pco/defresolver batch-pre-id [items]
+  {:pathim.connect.operation/input  [:pre-id]
+   :pathim.connect.operation/output [:id]
+   :pathim.connect.operation/batch? true}
+  (mapv #(hash-map :id (inc (:pre-id %))) items))
+
+(defrecord CustomCacheType [atom]
+  p.cache/CacheStore
+  (-cache-lookup-or-miss [_ cache-key f]
+                         (let [cache @atom]
+                           (if-let [entry (find cache cache-key)]
+                             (val entry)
+                             (let [res (f)]
+                               (swap! atom assoc cache-key res)
+                               res))))
+
+  (-cache-find [_ cache-key]
+               (find @atom cache-key)))
+
+(defn custom-cache [data]
+  (->CustomCacheType (atom data)))
+
+(def mock-todos-db
+  [{:pathim.connect.runner-test/todo-message "Write demo on params"
+    :pathim.connect.runner-test/todo-done?   true}
+   {:pathim.connect.runner-test/todo-message "Pathom in Rust"
+    :pathim.connect.runner-test/todo-done?   false}])
+
+(defn filter-params-match [env coll]
+  (let [params     (pco/params env)
+        param-keys (keys params)]
+    (if (seq params)
+      (filter
+        #(= params
+            (select-keys % param-keys))
+        coll)
+      coll)))
+
+(pco/defresolver todos-resolver [env _]
+  {:pathim.connect.operation/output
+   [{:pathim.connect.runner-test/todos
+     [:pathim.connect.runner-test/todo-message
+      :pathim.connect.runner-test/todo-done?]}]}
+  {:pathim.connect.runner-test/todos (filter-params-match env mock-todos-db)})
+
+; endregion
+
+(deftest run-graph!-test
+  (is (graph-response? (pci/register geo/registry)
+        {:pathim.test.geometry-resolvers/left 10 :pathim.test.geometry-resolvers/width 30}
+        [:pathim.test.geometry-resolvers/right :pathim.test.geometry-resolvers/center-x]
+
+        {:pathim.test.geometry-resolvers/left       10
+         :pathim.test.geometry-resolvers/width      30
+         :pathim.test.geometry-resolvers/right      40
+         :pathim.test.geometry-resolvers/half-width 15
+         :pathim.test.geometry-resolvers/center-x   25}))
+
+  (is (graph-response? full-env
+        {:data {:pathim.test.geometry-resolvers/x 10}}
+        [{:data [:left]}]
+        {:data {:pathim.test.geometry-resolvers/x    10
+                :pathim.test.geometry-resolvers/left 10
+                :left      10}}))
+
+  (testing "ident"
+    (is (graph-response? full-env
+          {}
+          [[:pathim.test.geometry-resolvers/x 10]]
+          {[:pathim.test.geometry-resolvers/x 10] {:pathim.test.geometry-resolvers/x 10}}))
+
+    (testing "persistent cache"
+      (let [cache* (atom {})
+            env    (assoc full-env :pathim.connect.planner/plan-cache* cache*)]
+        (is (graph-response? env
+              {}
+              [[:pathim.test.geometry-resolvers/x 10]]
+              {[:pathim.test.geometry-resolvers/x 10] {:pathim.test.geometry-resolvers/x 10}}))
+
+        (is (graph-response? env
+              {}
+              [[:pathim.test.geometry-resolvers/x 11]]
+              {[:pathim.test.geometry-resolvers/x 11] {:pathim.test.geometry-resolvers/x 11}}))))
+
+    (is (graph-response? full-env
+          {}
+          [{[:pathim.test.geometry-resolvers/x 10] [:pathim.test.geometry-resolvers/left]}]
+          {[:pathim.test.geometry-resolvers/x 10] {:pathim.test.geometry-resolvers/x    10
+                         :pathim.test.geometry-resolvers/left 10}}))
+
+    (is (graph-response? full-env
+          {[:pathim.test.geometry-resolvers/x 10] {:random "data"}}
+          [{[:pathim.test.geometry-resolvers/x 10] [:pathim.test.geometry-resolvers/left]}]
+          {[:pathim.test.geometry-resolvers/x 10] {:random    "data"
+                         :pathim.test.geometry-resolvers/x    10
+                         :pathim.test.geometry-resolvers/left 10}})))
+
+  (testing "path"
+    (is (graph-response? (pci/register [(pbir/constantly-resolver :pathim.connect.runner-test/hold {})
+                                        (pbir/constantly-resolver :pathim.connect.runner-test/sequence [{} {}])
+                                        (pbir/constantly-fn-resolver :pathim.path/path :pathim.path/path)])
+          {}
+          [:pathim.path/path
+           {:pathim.connect.runner-test/hold [:pathim.path/path]}
+           {:pathim.connect.runner-test/sequence [:pathim.path/path]}]
+          {:pathim.path/path [],
+           :pathim.connect.runner-test/sequence    [{:pathim.path/path [:pathim.connect.runner-test/sequence 0]}
+                          {:pathim.path/path [:pathim.connect.runner-test/sequence 1]}],
+           :pathim.connect.runner-test/hold        {:pathim.path/path [:pathim.connect.runner-test/hold]}})))
+
+  (testing "insufficient data"
+    (let [res (run-graph (pci/register
+                           {:pathim.error/lenient-mode? true}
+                           [(pco/resolver 'a {:pathim.connect.operation/input  [:b]
+                                              :pathim.connect.operation/output [:a]}
+                              (fn [_ _] {:a "a"}))
+                            (pco/resolver 'b {:pathim.connect.operation/output [:b]}
+                              (fn [_ _] {}))])
+                         {}
+                         [:a])]
+      (check
+        (=> {:pathim.connect.runner/attribute-errors
+             {:a {:pathim.error/cause              :pathim.error/node-errors,
+                  :pathim.error/node-error-details {1 {:pathim.error/cause :pathim.error/attribute-missing}}}}}
+            res))))
+
+  (testing "ending values"
+    (is (graph-response?
+          (pci/register [(pco/resolver 'a {:pathim.connect.operation/output [{:a [:n]}]}
+                           (fn [_ _] {:a '({:n 1} {:n 2})}))])
+          {}
+          [{:a [:n]}]
+          {:a '({:n 1} {:n 2})})))
+
+  (testing "processing sequence of consistent elements"
+    (is (graph-response? (pci/register [geo/full-registry
+                                        (coords-resolver
+                                          [{:pathim.test.geometry-resolvers/x 7 :pathim.test.geometry-resolvers/y 9}
+                                           {:pathim.test.geometry-resolvers/x 3 :pathim.test.geometry-resolvers/y 4}])])
+          {}
+          [{:pathim.connect.runner-test/coords [:left]}]
+          {:pathim.connect.runner-test/coords [{:pathim.test.geometry-resolvers/x 7 :pathim.test.geometry-resolvers/y 9 :pathim.test.geometry-resolvers/left 7 :left 7}
+                     {:pathim.test.geometry-resolvers/x 3 :pathim.test.geometry-resolvers/y 4 :pathim.test.geometry-resolvers/left 3 :left 3}]}))
+
+    (testing "data from join"
+      (is (graph-response? (pci/register geo/full-registry)
+            {:pathim.connect.runner-test/coords [{:pathim.test.geometry-resolvers/x 7 :pathim.test.geometry-resolvers/y 9}
+                       {:pathim.test.geometry-resolvers/x 3 :pathim.test.geometry-resolvers/y 4}]}
+            [{:pathim.connect.runner-test/coords [:left]}]
+            {:pathim.connect.runner-test/coords [{:pathim.test.geometry-resolvers/x 7 :pathim.test.geometry-resolvers/y 9 :pathim.test.geometry-resolvers/left 7 :left 7}
+                       {:pathim.test.geometry-resolvers/x 3 :pathim.test.geometry-resolvers/y 4 :pathim.test.geometry-resolvers/left 3 :left 3}]})))
+
+    (testing "set data from join"
+      (is (graph-response? (pci/register geo/full-registry)
+            {:pathim.connect.runner-test/coords #{{:pathim.test.geometry-resolvers/x 7 :pathim.test.geometry-resolvers/y 9}
+                        {:pathim.test.geometry-resolvers/x 3 :pathim.test.geometry-resolvers/y 4}}}
+            [{:pathim.connect.runner-test/coords [:left]}]
+            {:pathim.connect.runner-test/coords #{{:pathim.test.geometry-resolvers/x 7 :pathim.test.geometry-resolvers/y 9 :pathim.test.geometry-resolvers/left 7 :left 7}
+                        {:pathim.test.geometry-resolvers/x 3 :pathim.test.geometry-resolvers/y 4 :pathim.test.geometry-resolvers/left 3 :left 3}}})))
+
+    (testing "map values"
+      (is (graph-response? (pci/register geo/full-registry)
+            {:pathim.connect.runner-test/coords ^:pathim.connect.runner/map-container? {:a {:pathim.test.geometry-resolvers/x 7 :pathim.test.geometry-resolvers/y 9}
+                                             :b {:pathim.test.geometry-resolvers/x 3 :pathim.test.geometry-resolvers/y 4}}}
+            [{:pathim.connect.runner-test/coords [:left]}]
+            {:pathim.connect.runner-test/coords {:a {:pathim.test.geometry-resolvers/x 7 :pathim.test.geometry-resolvers/y 9 :pathim.test.geometry-resolvers/left 7 :left 7}
+                       :b {:pathim.test.geometry-resolvers/x 3 :pathim.test.geometry-resolvers/y 4 :pathim.test.geometry-resolvers/left 3 :left 3}}}))
+
+      (is (graph-response? (pci/register geo/full-registry)
+            {:pathim.connect.runner-test/coords {:a {:pathim.test.geometry-resolvers/x 7 :pathim.test.geometry-resolvers/y 9}
+                       :b {:pathim.test.geometry-resolvers/x 3 :pathim.test.geometry-resolvers/y 4}}}
+            '[{(:pathim.connect.runner-test/coords {:pathim.connect.runner/map-container? true}) [:left]}]
+            {:pathim.connect.runner-test/coords {:a {:pathim.test.geometry-resolvers/x 7 :pathim.test.geometry-resolvers/y 9 :pathim.test.geometry-resolvers/left 7 :left 7}
+                       :b {:pathim.test.geometry-resolvers/x 3 :pathim.test.geometry-resolvers/y 4 :pathim.test.geometry-resolvers/left 3 :left 3}}}))))
+
+  (testing "processing sequence of inconsistent maps"
+    (is (graph-response? (pci/register geo/full-registry)
+          {:pathim.connect.runner-test/coords [{:pathim.test.geometry-resolvers/x 7 :pathim.test.geometry-resolvers/y 9}
+                     {:pathim.test.geometry-resolvers/left 7 :pathim.test.geometry-resolvers/y 9}]}
+          [{:pathim.connect.runner-test/coords [:left]}]
+          {:pathim.connect.runner-test/coords
+           [{:pathim.test.geometry-resolvers/x    7
+             :pathim.test.geometry-resolvers/y    9
+             :pathim.test.geometry-resolvers/left 7
+             :left      7}
+            {:pathim.test.geometry-resolvers/left 7
+             :pathim.test.geometry-resolvers/y    9
+             :left      7}]})))
+
+  (testing "processing sequence partial items being maps"
+    (is (graph-response? (pci/register geo/full-registry)
+          {:pathim.connect.runner-test/coords [{:pathim.test.geometry-resolvers/x 7 :pathim.test.geometry-resolvers/y 9}
+                     20]}
+          [{:pathim.connect.runner-test/coords [:left]}]
+          {:pathim.connect.runner-test/coords [{:pathim.test.geometry-resolvers/x    7
+                      :pathim.test.geometry-resolvers/y    9
+                      :pathim.test.geometry-resolvers/left 7
+                      :left      7}
+                     20]})))
+
+  (testing "planner optimizations checkers"
+    (testing "when combining AND parent with AND children with run-next"
+      (check-all-runners
+        (pci/register [(pbir/constantly-resolver :a 1)
+                       (pbir/constantly-resolver :b 2)
+                       (pco/resolver 'c
+                         {:pathim.connect.operation/input  [:a :b]
+                          :pathim.connect.operation/output [:c]}
+                         (fn [_ _]
+                           {:c true}))
+                       (pco/resolver 'd
+                         {:pathim.connect.operation/input  [:a :b :c]
+                          :pathim.connect.operation/output [:d]}
+                         (fn [_ _]
+                           {:d true}))])
+        {}
+        [:d]
+        {:d true}))
+
+    (testing "when merging sideway OR nodes"
+      (check-all-runners
+        (pci/register [(pco/resolver
+                         {:pathim.connect.operation/op-name 'ab1
+                          :pathim.connect.operation/output  [:a :b]
+                          :pathim.connect.operation/resolve (fn [_ _] {:a 1 :b 2})})
+                       (pco/resolver
+                         {:pathim.connect.operation/op-name 'ab2
+                          :pathim.connect.operation/output  [:a :b]
+                          :pathim.connect.operation/resolve (fn [_ _] {:a 1 :b 2})})
+                       (pco/resolver
+                         {:pathim.connect.operation/op-name  'c1
+                          :pathim.connect.operation/priority 1
+                          :pathim.connect.operation/input    [:a]
+                          :pathim.connect.operation/output   [:c]
+                          :pathim.connect.operation/resolve  (fn [env _]
+                                           (if (:pathim.connect.runner.async/async-runner? env)
+                                             (p/delay 100 {:c 3})
+                                             {:c 3}))})
+                       (pco/resolver
+                         {:pathim.connect.operation/op-name 'c2
+                          :pathim.connect.operation/input   [:b]
+                          :pathim.connect.operation/output  [:c]
+                          :pathim.connect.operation/resolve (fn [_ _]
+                                          (raise! (ex-info "Never call me" {})))})])
+        {}
+        [:a :b :c]
+        {:a 1 :b 2 :c 3}))))
+
+(deftest run-graph!-map-container
+  (testing "simple filtering"
+    (testing "on entity data"
+      (check-all-runners
+        {:pathim.connect.runner-test/map-select? true}
+        {:data ^:pathim.connect.runner/map-container? {:x {:b 1 :c 2}}}
+        [{:data [:b]}]
+        {:data {:x {:b 1}}}))
+
+    (testing "on resolver response"
+      (check-all-runners
+        (pci/register
+          {:pathim.connect.runner-test/map-select? true}
+          (pbir/constantly-resolver :data ^:pathim.connect.runner/map-container? {:x {:b 1 :c 2}}))
+        {}
+        [{:data [:b]}]
+        {:data {:x {:b 1}}}))
+
+    (testing "on mutations"
+      (check-all-runners
+        (pci/register
+          {:pathim.connect.runner-test/map-select? true}
+          (pco/mutation 'do-thing
+            {:pathim.connect.operation/output [{:data [:b :c]}]}
+            (fn [_ _]
+              {:data ^:pathim.connect.runner/map-container? {:x {:b 1 :c 2}}})))
+        {}
+        '[{(do-thing {}) [{:data [:b]}]}]
+        {'do-thing {:data {:x {:b 1}}}})))
+
+  (testing "processing"
+    (testing "on entity data"
+      (check-all-runners
+        (pci/register
+          {:pathim.connect.runner-test/map-select? true}
+          (pbir/alias-resolver :b :z))
+        {:data ^:pathim.connect.runner/map-container? {:x {:b 1 :c 2}}}
+        [{:data [:z]}]
+        {:data {:x {:z 1}}}))
+
+    (testing "on resolver response"
+      (check-all-runners
+        (pci/register
+          {:pathim.connect.runner-test/map-select? true}
+          [(pbir/constantly-resolver :data ^:pathim.connect.runner/map-container? {:x {:b 1 :c 2}})
+           (pbir/alias-resolver :b :z)])
+        {}
+        [{:data [:z]}]
+        {:data {:x {:z 1}}}))
+
+    (testing "on mutations"
+      (check-all-runners
+        (pci/register
+          {:pathim.connect.runner-test/map-select? true}
+          [(pco/mutation 'do-thing
+             {:pathim.connect.operation/output [{:data [:b :c]}]}
+             (fn [_ _]
+               {:data ^:pathim.connect.runner/map-container? {:x {:b 1 :c 2}}}))
+           (pbir/alias-resolver :b :z)])
+        {}
+        '[{(do-thing {}) [{:data [:z]}]}]
+        {'do-thing {:data {:x {:z 1}}}})))
+
+  (testing "path appending"
+    (check-all-runners
+      (pci/register [(pbir/constantly-resolver :pathim.connect.runner-test/map-container
+                                               ^:pathim.connect.runner/map-container? {:foo {}})
+                     (pbir/constantly-fn-resolver :pathim.path/path :pathim.path/path)])
+      {}
+      [{:pathim.connect.runner-test/map-container [:pathim.path/path]}]
+      {:pathim.connect.runner-test/map-container {:foo {:pathim.path/path [:pathim.connect.runner-test/map-container :foo]}}})))
+
+(deftest run-graph!-fail-cases-test
+  (testing "strict mode"
+    (testing "invalid resolver response"
+      (check-all-runners-ex
+        (pci/register
+          (pco/resolver 'foo
+            {:pathim.connect.operation/output [:foo]}
+            (fn [_ _] 123)))
+        {}
+        [:foo]
+        {:ex/message "Resolver foo returned an invalid response: 123"
+         :ex/data    {:pathim.connect.runner/invalid-response 123}}))
+
+    (testing "Exception with details"
+      (is (thrown-with-msg? #"Resolver foo exception: Error"
+            (run-graph (pci/register
+                         (pco/resolver 'foo
+                           {:pathim.connect.operation/output [:foo]}
+                           (fn [_ _] (raise! (ex-info "Error" {})))))
+                       {}
+                       [{:>/inside [:foo]}]))))
+
+    (testing "optionals"
+      (testing "not on index"
+        (is (graph-response? {} {} [(pco/? :foo)] {})))
+
+      (testing "unreachable"
+        (is (graph-response?
+              (pci/register (pbir/alias-resolver :a :foo))
+              {}
+              [(pco/? :foo)] {})))
+
+      (testing "error"
+        (check-all-runners-ex
+          (pci/register (pbir/constantly-fn-resolver :err (fn [_] (raise! (ex-info "error" {})))))
+          {}
+          [(pco/? :err)]
+          {:ex/message "Resolver -unqualified/err--const-fn exception: error"})))
+
+    (testing "bug report #120"
+      (check-all-runners
+        (-> (pci/register [(pco/resolver 'dashboard-chartObjects-1
+                             {:pathim.connect.operation/input  [:portfolioKey :appKey :data-source/friendlyName]
+                              :pathim.connect.operation/output [{:dashboard [:dashboard/chartObjects]}]}
+                             (fn [_ _]
+                               {:dashboard {:dashboard/chartObjects []}}))
+
+                           (pco/resolver 'dashboard-chartObjects-2
+                             {:pathim.connect.operation/input  [:portfolioKey :appKey {:data-sources [:data-source/friendlyName]}]
+                              :pathim.connect.operation/output [{:dashboard [:dashboard/chartObjects]}]}
+                             (fn [_ _]
+                               {:dashboard {:dashboard/chartObjects []}}))
+
+                           (pco/resolver 'data-source
+                             {:pathim.connect.operation/input  [:portfolioKey :appKey]
+                              :pathim.connect.operation/output [:appName :platform]}
+                             (fn [_ _]
+                               {:appName nil :platform nil}))
+
+                           (pco/resolver 'data-sources
+                             {:pathim.connect.operation/input       [:portfolioKey]
+                              :pathim.connect.operation/output      [{:data-sources [:portfolioKey :appKey :appName :platform]}]
+                              :pathim.connect.operation/cache-store :thirty-sec-ttl-cache*}
+                             (fn [_ _]
+                               {:data-sources []}))
+
+                           (pco/resolver 'data-source-friendlyName
+                             {:pathim.connect.operation/input  [:appName]
+                              :pathim.connect.operation/output [:data-source/friendlyName]}
+                             (fn [_ _]
+                               {:data-source/friendlyName "appName"}))]))
+        {:portfolioKey "portfolioKey", :appKey "appKey"}
+        [:data-source/friendlyName {:dashboard [:dashboard/chartObjects]}]
+        {:portfolioKey             "portfolioKey",
+         :appKey                   "appKey",
+         :appName                  nil,
+         :platform                 nil,
+         :data-source/friendlyName "appName",
+         :dashboard                {:dashboard/chartObjects []}}))
+
+    (testing "mutations"
+      (let [err (ex-info "Fail fast" {})]
+        (is (thrown-with-msg? #"Fail fast"
+              (run-graph
+                (pci/register {:pathim.error/lenient-mode? false}
+                              (pco/mutation 'err {} (fn [_ _] (raise! err))))
+                {}
+                ['(err {})]))))
+
+      (let [err (ex-info "Fail fast" {})]
+           (is (thrown-with-msg? #"Fail fast"
+                 (p/await! (run-graph-async
+                    (pci/register {:pathim.error/lenient-mode? false}
+                                  (pco/mutation 'err {} (fn [_ _] (raise! err))))
+                    {}
+                    ['(err {})])))))))
+
+  (testing "lenient mode"
+    (testing "optionals"
+      (testing "not an index"
+        (is (graph-response? {:pathim.error/lenient-mode? true}
+              {}
+              [(pco/? :foo)]
+              {})))
+
+      (testing "unreachable"
+        (is (graph-response?
+              (pci/register (pbir/alias-resolver :a :foo))
+              {}
+              [(pco/? :foo)]
+              {})))
+
+      (testing "error"
+        (check
+          (run-graph
+            (pci/register
+              {:pathim.error/lenient-mode? true}
+              (pbir/constantly-fn-resolver :err (fn [_] (raise! (ex-info "error" {})))))
+            {}
+            [(pco/? :err)])
+          => {:pathim.connect.runner/attribute-errors
+              {:err
+               {:pathim.error/cause
+                :pathim.error/node-errors
+
+                :pathim.error/node-error-details
+                {1 {:pathim.error/cause     :pathim.error/node-exception
+                    :pathim.error/exception {:pathim.error/error-message #"error"}}}}}}))
+
+      (testing "user requests error data in query"
+        (check-all-runners
+          {:pathim.error/lenient-mode? true}
+          {}
+          [:err :pathim.connect.runner/attribute-errors]
+          {:pathim.connect.runner/attribute-errors
+           (m/equals
+             {:err {:pathim.error/cause :pathim.error/attribute-unreachable}})})))))
+
+(deftest run-graph!-fail-resolver-missing-data
+  (testing "single resolver graph"
+    (check-all-runners-ex
+      (pci/register
+        (pco/resolver 'my-resolver
+          {:pathim.connect.operation/output [:foo]}
+          (fn [_ _] {})))
+      {}
+      [:foo]
+      {:ex/message (str
+                     "Required attributes missing:\n"
+                     "- Attribute :foo was expected to be returned from resolver my-resolver but it failed to provide it.")
+       :ex/data    {:pathim.connect.runner/attributes-missing {:foo {}}}})
+
+    (testing "at path"
+      (check-all-runners-ex
+        (pci/register
+          (pco/resolver 'my-resolver
+            {:pathim.connect.operation/output [:foo]}
+            (fn [_ _] {})))
+        {:container {}}
+        [{:container [:foo]}]
+        {:ex/message (str
+                       "Required attributes missing at path [:container]:\n"
+                       "- Attribute :foo was expected to be returned from resolver my-resolver but it failed to provide it.")
+         :ex/data    {:pathim.connect.runner/attributes-missing {:foo {}}}}))
+
+    (testing "multiple options"
+      (check-all-runners-ex
+        (pci/register
+          [(pco/resolver 'a1
+             {:pathim.connect.operation/output [:a]}
+             (fn [_ _]
+               {}))
+
+           (pco/resolver 'a2
+             {:pathim.connect.operation/output [:a]}
+             (fn [_ _]
+               {}))])
+        {}
+        [:a]
+        {:ex/message (str
+                       "Required attributes missing:\n"
+                       "- Attribute :a was expected to be returned from resolvers a1, a2 but all of them failed to provide it.")
+         :ex/data    {:pathim.connect.runner/attributes-missing {:a {}}}})))
+
+  (testing "multiple attributes"
+    (check-all-runners-ex
+      (pci/register
+        (pco/resolver 'my-resolver
+          {:pathim.connect.operation/output [:foo :bar]}
+          (fn [_ _] {})))
+      {}
+      [:foo :bar]
+      {:ex/message (str
+                     "Required attributes missing:\n"
+                     "- Attribute :foo was expected to be returned from resolver my-resolver but it failed to provide it.\n"
+                     "- Attribute :bar was expected to be returned from resolver my-resolver but it failed to provide it.")
+       :ex/data    {:pathim.connect.runner/attributes-missing {:foo {} :bar {}}}})
+
+    (check-all-runners-ex
+      (pci/register
+        [(pco/resolver 'my-resolver-foo
+           {:pathim.connect.operation/output [:foo]}
+           (fn [_ _] {}))
+
+         (pco/resolver 'my-resolver-bar
+           {:pathim.connect.operation/output [:bar]}
+           (fn [_ _] {}))])
+      {}
+      [:foo :bar]
+      {:ex/message (str
+                     "Required attributes missing:\n"
+                     "- Attribute :foo was expected to be returned from resolver my-resolver-foo but it failed to provide it.\n"
+                     "- Attribute :bar was expected to be returned from resolver my-resolver-bar but it failed to provide it.")
+       :ex/data    {:pathim.connect.runner/attributes-missing {:foo {} :bar {}}}}))
+
+  (testing "missing dependency"
+    (testing "missed attribute comes from resolver node"
+      (check-all-runners-ex
+        (pci/register
+          [(pco/resolver 'a
+             {:pathim.connect.operation/output [:a]}
+             (fn [_ _] {}))
+
+           (pco/resolver 'b
+             {:pathim.connect.operation/input  [:a]
+              :pathim.connect.operation/output [:b]}
+             (fn [_ _] {}))])
+        {}
+        [:b]
+        {:ex/message (str
+                       "Required attributes missing:\n"
+                       "- Attribute :b was expected to be returned from resolver b but inputs were missing:\n"
+                       "  - Attribute :a was expected to be returned from resolver a but it failed to provide it.")
+         :ex/data    {:pathim.connect.runner/attributes-missing {:b {}}}})
+
+      (testing "longer chain"
+        (check-all-runners-ex
+          (pci/register
+            [(pco/resolver 'a
+               {:pathim.connect.operation/output [:a]}
+               (fn [_ _] {}))
+
+             (pco/resolver 'b
+               {:pathim.connect.operation/input  [:a]
+                :pathim.connect.operation/output [:b]}
+               (fn [_ _] {}))
+
+             (pco/resolver 'c
+               {:pathim.connect.operation/input  [:b]
+                :pathim.connect.operation/output [:c]}
+               (fn [_ _] {}))])
+          {}
+          [:c]
+          {:ex/message (str
+                         "Required attributes missing:\n"
+                         "- Attribute :c was expected to be returned from resolver c but inputs were missing:\n"
+                         "  - Attribute :b was expected to be returned from resolver b but inputs were missing:\n"
+                         "    - Attribute :a was expected to be returned from resolver a but it failed to provide it.")
+           :ex/data    {:pathim.connect.runner/attributes-missing {:c {}}}})))
+
+    (testing "missed on indirect dependency"
+      (check-all-runners-ex
+        (pci/register
+          [(pco/resolver 'ab
+             {:pathim.connect.operation/output [:a :b]}
+             (fn [_ _] {:a 1}))
+
+           (pco/resolver 'c
+             {:pathim.connect.operation/input  [:a]
+              :pathim.connect.operation/output [:c]}
+             (fn [_ _] {:c 2}))
+
+           (pco/resolver 'd
+             {:pathim.connect.operation/input  [:b :c]
+              :pathim.connect.operation/output [:d]}
+             (fn [_ _] {}))])
+        {}
+        [:d]
+        {:ex/message (str
+                       "Required attributes missing:\n"
+                       "- Attribute :d was expected to be returned from resolver d but inputs were missing:\n"
+                       "  - Attribute :b was expected to be returned from resolver ab but it failed to provide it.")
+         :ex/data    {:pathim.connect.runner/attributes-missing {:d {}}}}))
+
+    (testing "missing with both resolver not returning and missing dependency"
+      (check-all-runners-ex
+        (pci/register
+          [(pco/resolver 'a
+             {:pathim.connect.operation/output [:a]}
+             (fn [_ _] {}))
+
+           (pco/resolver 'b-dep
+             {:pathim.connect.operation/input  [:a]
+              :pathim.connect.operation/output [:b]}
+             (fn [_ _] {}))
+
+           (pco/resolver 'b-direct
+             {:pathim.connect.operation/output [:b]}
+             (fn [_ _] {}))])
+        {}
+        [:b]
+        {:ex/message (str
+                       "Required attributes missing:\n"
+                       "- Attribute :b was expected to be returned from resolver b-direct but it failed to provide it.\n"
+                       "- Attribute :b was expected to be returned from resolver b-dep but inputs were missing:\n"
+                       "  - Attribute :a was expected to be returned from resolver a but it failed to provide it.")
+         :ex/data    {:pathim.connect.runner/attributes-missing {:b {}}}}))
+
+    (testing "missed attribute comes from OR node"
+      (check-all-runners-ex
+        (pci/register
+          [(pco/resolver 'a1
+             {:pathim.connect.operation/output [:a]}
+             (fn [_ _] {}))
+
+           (pco/resolver 'a2
+             {:pathim.connect.operation/output [:a]}
+             (fn [_ _] {}))
+
+           (pco/resolver 'b
+             {:pathim.connect.operation/input  [:a]
+              :pathim.connect.operation/output [:b]}
+             (fn [_ _] {}))])
+        {}
+        [:b]
+        {:ex/message (str
+                       "Required attributes missing:\n"
+                       "- Attribute :b was expected to be returned from resolver b but inputs were missing:\n"
+                       "  - Attribute :a was expected to be returned from resolvers a1, a2 but all of them failed to provide it.")
+         :ex/data    {:pathim.connect.runner/attributes-missing {:b {}}}}))
+
+    (testing "missed multiple from parent node"
+      (check-all-runners-ex
+        (pci/register
+          [(pco/resolver 'ab
+             {:pathim.connect.operation/output [:a :b]}
+             (fn [_ _]
+               {}))
+
+           (pco/resolver 'c
+             {:pathim.connect.operation/input  [:a :b]
+              :pathim.connect.operation/output [:c]}
+             (fn [_ _]
+               {}))])
+        {}
+        [:c]
+        {:ex/message (str
+                       "Required attributes missing:\n"
+                       "- Attribute :c was expected to be returned from resolver c but inputs were missing:\n"
+                       "  - Attribute :a was expected to be returned from resolver ab but it failed to provide it.\n"
+                       "  - Attribute :b was expected to be returned from resolver ab but it failed to provide it.")
+         :ex/data    {:pathim.connect.runner/attributes-missing {:c {}}}}))
+
+    (testing "missed attribute comes from AND node"
+      (check-all-runners-ex
+        (pci/register
+          [(pco/resolver 'a
+             {:pathim.connect.operation/output [:a]}
+             (fn [_ _]
+               {}))
+
+           (pco/resolver 'b
+             {:pathim.connect.operation/output [:b]}
+             (fn [_ _]
+               {}))
+
+           (pco/resolver 'c
+             {:pathim.connect.operation/input  [:a :b]
+              :pathim.connect.operation/output [:c]}
+             (fn [_ _]
+               {}))])
+        {}
+        [:c]
+        {:ex/message (str
+                       "Required attributes missing:\n"
+                       "- Attribute :c was expected to be returned from resolver c but inputs were missing:\n"
+                       "  - Attribute :a was expected to be returned from resolver a but it failed to provide it.\n"
+                       "  - Attribute :b was expected to be returned from resolver b but it failed to provide it.")
+         :ex/data    {:pathim.connect.runner/attributes-missing {:c {}}}}))))
+
+(deftest run-graph!-final-test
+  (testing "map value"
+    (is (graph-response? (pci/register geo/registry)
+          {:item ^:pathim.connect.operation/final {:pathim.test.geometry-resolvers/left 10 :pathim.test.geometry-resolvers/width 30}}
+          [{:item [:pathim.test.geometry-resolvers/left :pathim.test.geometry-resolvers/right]}]
+
+          {:item
+           {:pathim.test.geometry-resolvers/left 10, :pathim.test.geometry-resolvers/width 30}})))
+
+  (testing "sequence"
+    (is (graph-response? (pci/register geo/registry)
+          {:item ^:pathim.connect.operation/final [{:pathim.test.geometry-resolvers/left 10 :pathim.test.geometry-resolvers/width 30}]}
+          [{:item [:pathim.test.geometry-resolvers/left :pathim.test.geometry-resolvers/right]}]
+
+          {:item
+           [{:pathim.test.geometry-resolvers/left 10, :pathim.test.geometry-resolvers/width 30}]})))
+
+  (testing "map container"
+    (is (graph-response? (pci/register geo/registry)
+          {:item ^{:pathim.connect.operation/final          true
+                   :pathim.connect.runner/map-container? true} {:a {:pathim.test.geometry-resolvers/left 10 :pathim.test.geometry-resolvers/width 30}}}
+          [{:item [:pathim.test.geometry-resolvers/left :pathim.test.geometry-resolvers/right]}]
+
+          {:item
+           {:a {:pathim.test.geometry-resolvers/left 10, :pathim.test.geometry-resolvers/width 30}}}))))
+
+(deftest run-graph!-or-test
+  (testing "processing OR nodes"
+    (testing "return the first option that works, don't call the others"
+      (let [spy (atom 0)]
+        (check-all-runners
+          (pci/register
+            [(pco/resolver 'value
+               {:pathim.connect.operation/output [:value]}
+               (fn [_ _]
+                 (swap! spy inc)
+                 {:value 1}))
+             (pco/resolver 'value2
+               {:pathim.connect.operation/output [:value]}
+               (fn [_ _]
+                 (swap! spy inc)
+                 {:value 2}))])
+          {}
+          [:value]
+          {:value 2})
+        (is (or (= @spy 1)
+                (= @spy 3)))))
+
+    (testing "one option fail, one succeed"
+      (let [spy (atom 0)]
+        (is (graph-response?
+              (pci/register
+                [(pco/resolver 'error-long-touch
+                   {:pathim.connect.operation/output   [:error]
+                    :pathim.connect.operation/priority 1}
+                   (fn [_ _]
+                     (swap! spy inc)
+                     (raise! (ex-info "Error" {}))))
+                 (pbir/constantly-resolver :error "value")])
+              {}
+              [:error]
+              {:error "value"}))
+        (is (= @spy 3))))
+
+    (testing "don't call unnecessary intermidiary steps"
+      (let [middle-resolver
+            (h/spy {:return {:resp "resp"}})
+
+            env
+            (pci/register
+              [(pco/resolver 'test
+                 {:pathim.connect.operation/input  [:id]
+                  :pathim.connect.operation/output [:link :payload]}
+                 (fn [_ _]
+                   {:link "foo" :payload "bar"}))
+
+               (pco/resolver 'test-b
+                 {:pathim.connect.operation/input  [:link]
+                  :pathim.connect.operation/output [:resp]}
+                 middle-resolver)
+
+               (pco/resolver 'test2
+                 {:pathim.connect.operation/input  [:id :link :resp]
+                  :pathim.connect.operation/output [:payload]}
+                 (fn [_ _]
+                   {:payload "bar2"}))])]
+        (check-all-runners env {:id 1} [:payload]
+          (fn [x]
+            (and (some-> middle-resolver meta :calls deref empty?)
+                 (= (:payload x) "bar"))))))
+
+    (testing "all options fail"
+      (is (thrown-with-msg? #"All paths from an OR node failed. Expected: \{:error \{}}"
+            (run-graph (pci/register
+                         [(pco/resolver 'error1
+                            {:pathim.connect.operation/output [:error]}
+                            (fn [_ _]
+                              (raise! (ex-info "Error 1" {}))))
+                          (pco/resolver 'error2
+                            {:pathim.connect.operation/output [:error]}
+                            (fn [_ _]
+                              (raise! (ex-info "Error 2" {}))))])
+                       {}
+                       [:error])))
+
+      (testing "async"
+           (is (thrown-with-msg? #"All paths from an OR node failed. Expected: \{:error \{}}"
+                 (p/await! (run-graph-async (pci/register
+                                     [(pco/resolver 'error1
+                                        {:pathim.connect.operation/output [:error]}
+                                        (fn [_ _]
+                                          (raise! (ex-info "Error 1" {}))))
+                                      (pco/resolver 'error2
+                                        {:pathim.connect.operation/output [:error]}
+                                        (fn [_ _]
+                                          (raise! (ex-info "Error 2" {}))))])
+                                   {}
+                                   [:error]))))))
+
+    (testing "custom prioritization"
+      (is (graph-response?
+            (pci/register
+              {:pathim.connect.runner/choose-path
+               (fn [{:pathim.connect.planner/keys [graph]} _or-node options]
+                 (first (into []
+                              (comp (map #(pcp/get-node graph %))
+                                    (filter #(= (:pathim.connect.operation/op-name %) 'value2))
+                                    (map :pathim.connect.planner/node-id))
+                              options)))}
+              [(pco/resolver 'value
+                 {:pathim.connect.operation/output [:value]}
+                 (fn [_ _]
+                   {:value 1}))
+               (pco/resolver 'value2
+                 {:pathim.connect.operation/output [:value]}
+                 (fn [_ _]
+                   {:value 2}))])
+            {}
+            [:value]
+            {:value 2})))
+
+    (testing "stats"
+      (is (graph-response?
+            (pci/register [(pco/resolver 'value
+                             {:pathim.connect.operation/output   [:value]
+                              :pathim.connect.operation/priority 1}
+                             (fn [_ _]
+                               {:value 1}))
+                           (pco/resolver 'value2
+                             {:pathim.connect.operation/output [:value]}
+                             (fn [_ _]
+                               {:value 2}))])
+            {}
+            [:value]
+            (fn [res]
+              (mcs/match?
+                {:pathim.connect.runner/taken-paths  [2]
+                 :pathim.connect.runner/success-path 2}
+                (-> res meta :pathim.connect.runner/run-stats :pathim.connect.runner/node-run-stats (get 3)))))))
+
+    (testing "standard priority"
+      (is (graph-response?
+            (pci/register
+              [(pco/resolver 'value
+                 {:pathim.connect.operation/output [:value]}
+                 (fn [_ _]
+                   {:value 1}))
+               (pco/resolver 'value2
+                 {:pathim.connect.operation/output   [:value]
+                  :pathim.connect.operation/priority 1}
+                 (fn [_ _]
+                   {:value 2}))])
+            {}
+            [:value]
+            {:value 2}))
+
+      (testing "competing priority, look at next lower."
+        (is (graph-response?
+              (pci/register
+                [(pco/resolver 'x
+                   {:pathim.connect.operation/output   [:x :y]
+                    :pathim.connect.operation/priority 9}
+                   (fn [_ _]
+                     {:x 1 :y 2}))
+                 (pco/resolver 'value1
+                   {:pathim.connect.operation/input    [:x]
+                    :pathim.connect.operation/output   [:value]
+                    :pathim.connect.operation/priority 1}
+                   (fn [_ _]
+                     {:value 1}))
+                 (pco/resolver 'value2
+                   {:pathim.connect.operation/input    [:y]
+                    :pathim.connect.operation/output   [:value]
+                    :pathim.connect.operation/priority 2}
+                   (fn [_ _]
+                     {:value 2}))])
+              {}
+              [:y :value]
+              {:x 1, :y 2, :value 2})))
+
+      (testing "distinct inputs"
+        (is (graph-response?
+              (pci/register
+                [(pco/resolver 'value
+                   {:pathim.connect.operation/input  [:a]
+                    :pathim.connect.operation/output [:value]}
+                   (fn [_ _]
+                     {:value 1}))
+                 (pco/resolver 'value2
+                   {:pathim.connect.operation/input    [:b]
+                    :pathim.connect.operation/output   [:value]
+                    :pathim.connect.operation/priority 1}
+                   (fn [_ _]
+                     {:value 2}))
+                 (pbir/constantly-resolver :a 1)
+                 (pbir/constantly-resolver :b 2)])
+              {}
+              [:value]
+              {:b     2
+               :value 2}))
+
+        (testing "complex extension"
+          (is (graph-response?
+                (pci/register
+                  [(pco/resolver 'value
+                     {:pathim.connect.operation/input  [:a :b]
+                      :pathim.connect.operation/output [:value]}
+                     (fn [_ _]
+                       {:value 1}))
+                   (pco/resolver 'value2
+                     {:pathim.connect.operation/input    [:c]
+                      :pathim.connect.operation/output   [:value]
+                      :pathim.connect.operation/priority 1}
+                     (fn [_ _]
+                       {:value 2}))
+                   (pbir/constantly-resolver :a 1)
+                   (pbir/constantly-resolver :b 2)
+                   (pbir/constantly-resolver :c 3)])
+                {}
+                [:value]
+                {:c     3
+                 :value 2})))
+
+        (testing "priority in the middle, ignores it"
+          (check-all-runners
+            (pci/register
+              [(pco/resolver 'value
+                 {:pathim.connect.operation/input  [:a :b]
+                  :pathim.connect.operation/output [:value]}
+                 (fn [_ _]
+                   {:value 1}))
+               (pco/resolver 'value2
+                 {:pathim.connect.operation/input  [:c]
+                  :pathim.connect.operation/output [:value]}
+                 (fn [_ _]
+                   {:value 2}))
+               (pbir/constantly-resolver :a 1)
+               (pbir/constantly-resolver :b 2)
+               (pco/update-config
+                 (pbir/constantly-resolver :c 3)
+                 assoc :pathim.connect.operation/priority 1)])
+            {}
+            [:value]
+            {:value 1}))
+
+        (testing "leaf is a branch"
+          (is (graph-response?
+                (pci/register
+                  [(pco/resolver 'value-b1
+                     {:pathim.connect.operation/input  [:b]
+                      :pathim.connect.operation/output [:a]}
+                     (fn [_ _]
+                       {:a "b1"}))
+                   (pco/resolver 'value-b2
+                     {:pathim.connect.operation/input    [:b]
+                      :pathim.connect.operation/output   [:a]
+                      :pathim.connect.operation/priority 1}
+                     (fn [_ _]
+                       {:a "b2"}))
+                   (pco/resolver 'value-cd
+                     {:pathim.connect.operation/input  [:c :d]
+                      :pathim.connect.operation/output [:a]}
+                     (fn [_ _]
+                       {:a "cd"}))
+                   (pbir/constantly-resolver :b 2)
+                   (pbir/alias-resolver :d :c)
+                   (pbir/constantly-resolver :d 10)])
+                {}
+                [:a]
+                {:a "b2"
+                 :b 2})))))))
+
+(deftest run-graph!-and-test
+  (testing "stats"
+    (is (graph-response?
+          (pci/register [(pco/resolver 'value
+                           {:pathim.connect.operation/output [:value]}
+                           (fn [_ _]
+                             {:value 1}))
+                         (pco/resolver 'value2
+                           {:pathim.connect.operation/output [:value2]}
+                           (fn [_ _]
+                             {:value2 2}))])
+          {}
+          [:value :value2]
+          {:value 1 :value2 2}))))
+
+(deftest run-graph!-weight-sort
+  (testing "pick lighter path"
+    (check-all-runners
+      (-> {:pathim.connect.runner/resolver-weights* (atom '{a1 50 a2 10})}
+          (pci/register
+            [(pco/resolver 'a1 {:pathim.connect.operation/output [:a]} (fn [_ _] {:a 1}))
+             (pco/resolver 'a2 {:pathim.connect.operation/output [:a]} (fn [_ _] {:a 2}))]))
+      {}
+      [:a]
+      {:a 2})
+
+    (check-all-runners
+      (-> {:pathim.connect.runner/resolver-weights* (atom '{a2 2})}
+          (pci/register
+            [(pco/resolver 'a1 {:pathim.connect.operation/output [:a]} (fn [_ _] {:a 1}))
+             (pco/resolver 'a2 {:pathim.connect.operation/output [:a]} (fn [_ _] {:a 2}))]))
+      {}
+      [:a]
+      {:a 1})
+
+    (check-all-runners
+      (-> {:pathim.connect.runner/resolver-weights* (atom '{a1 100 a2 70 a3 5})}
+          (pci/register
+            [(pco/resolver 'a1 {:pathim.connect.operation/output [:a]} (fn [_ _] {:a 1}))
+             (pco/resolver 'a2 {:pathim.connect.operation/output [:a]} (fn [_ _] {:a 2}))
+             (pco/resolver 'a3 {:pathim.connect.operation/input [:b] :pathim.connect.operation/output [:a]} (fn [_ _] {:a 3}))
+             (pco/resolver 'b {:pathim.connect.operation/input [:c] :pathim.connect.operation/output [:b]} (fn [_ _] {:b nil}))
+             (pco/resolver 'c {:pathim.connect.operation/output [:c]} (fn [_ _] {:c nil}))]))
+      {}
+      [:a]
+      {:a 3}))
+
+  (testing "time update"
+    (let [weights* (atom '{a1 10})]
+      (check-serial
+        (-> {:pathim.connect.runner/resolver-weights* weights*}
+            (pci/register
+              [(pco/resolver 'a1 {:pathim.connect.operation/output [:a]} (fn [_ _] {:a 1}))
+               (pco/resolver 'a2 {:pathim.connect.operation/output [:a]} (fn [_ _] {:a 2}))])
+            (p.plugin/register (pbip/resolver-weight-tracker)))
+        {}
+        [:a]
+        {:a 2})
+
+      (check
+        @weights*
+        => {'a2 number?}))
+
+    (testing "doubles on error"
+      (let [weights* (atom '{a1 10 a2 50})]
+        (run-graph
+          (-> {:pathim.connect.runner/resolver-weights* weights*
+               :pathim.error/lenient-mode? true}
+              (pci/register
+                [(pco/resolver 'a1 {:pathim.connect.operation/output [:a]} (fn [_ _] (raise! (ex-info "Err" {}))))
+                 (pco/resolver 'a2 {:pathim.connect.operation/output [:a]} (fn [_ _] (raise! (ex-info "Err" {}))))])
+              (p.plugin/register (pbip/resolver-weight-tracker)))
+          {}
+          [:a])
+
+        (check
+          @weights*
+          => {'a1 20
+              'a2 100})))))
+
+(deftest run-graph-internal-run
+  (check-serial
+    (-> {}
+        (pci/register
+          [(pco/resolver 'a1 {:pathim.connect.operation/output [:a]} (fn [_ _] {:a 1}))
+           (pco/resolver 'b {:pathim.connect.operation/output [:b]} (fn [env _] {:b (p.eql/process env [:a])}))]))
+    {}
+    [:b]
+    {:b {:a 1}})
+
+  (testing "lenient mode"
+    (check-serial
+      (-> {:pathim.error/lenient-mode? true}
+          (pci/register
+            [(pco/resolver 'a1 {:pathim.connect.operation/output [:a]} (fn [_ _] {:a 1}))
+             (pco/resolver 'b {:pathim.connect.operation/output [:b]} (fn [env _] {:b (p.eql/process env [:a])}))]))
+      {}
+      [:b]
+      {:b {:a 1}})))
+
+(deftest run-graph!-unions-test
+  (is (graph-response?
+        (pci/register
+          [(pbir/constantly-resolver :list
+                                     [{:user/id 123}
+                                      {:video/id 2}])
+           (pbir/static-attribute-map-resolver :user/id :user/name
+             {123 "U"})
+           (pbir/static-attribute-map-resolver :video/id :video/title
+             {2 "V"})])
+        {}
+        [{:list
+          {:user/id  [:user/name]
+           :video/id [:video/title]}}]
+        {:list
+         [{:user/id 123 :user/name "U"}
+          {:video/id 2 :video/title "V"}]}))
+
+  (testing "unions that don't match any branch"
+    (testing "get nilified on single item"
+      (is (graph-response?
+            (pci/register
+              [(pbir/constantly-resolver :item
+                                         {:video/id 2})
+               (pbir/static-attribute-map-resolver :user/id :user/name
+                 {123 "U"})
+               (pbir/static-attribute-map-resolver :video/id :video/title
+                 {2 "V"})])
+            {}
+            [{:item
+              {:user/id [:user/name]}}]
+            {:item nil})))
+
+    (testing "are removed from the output in case of sequences"
+      (is (graph-response?
+            (pci/register
+              [(pbir/constantly-resolver :list
+                                         [{:user/id 123}
+                                          {:video/id 2}])
+               (pbir/static-attribute-map-resolver :user/id :user/name
+                 {123 "U"})
+               (pbir/static-attribute-map-resolver :video/id :video/title
+                 {2 "V"})])
+            {}
+            [{:list
+              {:user/id [:user/name]}}]
+            {:list
+             [{:user/id 123 :user/name "U"}]})))))
+
+(deftest run-graph!-nested-inputs-test
+  (testing "data from resolvers"
+    (is (graph-response?
+          (pci/register
+            [(pco/resolver 'users
+               {:pathim.connect.operation/output [{:users [:user/id]}]}
+               (fn [_ _]
+                 {:users [{:user/id 1}
+                          {:user/id 2}]}))
+             (pbir/static-attribute-map-resolver :user/id :user/score
+               {1 10
+                2 20})
+             (pco/resolver 'total-score
+               {:pathim.connect.operation/input  [{:users [:user/score]}]
+                :pathim.connect.operation/output [:total-score]}
+               (fn [_ {:keys [users]}]
+                 {:total-score (reduce + 0 (map :user/score users))}))])
+          {}
+          [:total-score]
+          {:users       [{:user/id 1, :user/score 10} {:user/id 2, :user/score 20}]
+           :total-score 30})))
+
+  (testing "optional nested input"
+    (testing "all items can resolve dependencies"
+      (is (graph-response?
+            (pci/register
+              [(pco/resolver 'users
+                 {:pathim.connect.operation/output [{:users [:user/id]}]}
+                 (fn [_ _]
+                   {:users [{:user/id 1}
+                            {:user/id 2}]}))
+               (pbir/static-attribute-map-resolver :user/id :user/score
+                 {1 10
+                  2 20})
+               (pco/resolver 'total-score
+                 {:pathim.connect.operation/input  [{:users [(pco/? :user/score)]}]
+                  :pathim.connect.operation/output [:total-score]}
+                 (fn [_ {:keys [users]}]
+                   {:total-score (reduce + 0 (map :user/score users))}))])
+            {}
+            [:total-score]
+            {:users       [{:user/id 1, :user/score 10} {:user/id 2, :user/score 20}]
+             :total-score 30})))
+
+    (testing "entities partially fulfill the optional demand"
+      (is (graph-response?
+            (pci/register
+              [(pco/resolver 'users
+                 {:pathim.connect.operation/output [{:users [:user/id]}]}
+                 (fn [_ _]
+                   {:users [{:user/id 1}
+                            {:user/id 2}]}))
+               (pbir/static-attribute-map-resolver :user/id :user/score
+                 {1 10})
+               (pco/resolver 'total-score
+                 {:pathim.connect.operation/input  [{:users [(pco/? :user/score)]}]
+                  :pathim.connect.operation/output [:total-score]}
+                 (fn [_ {:keys [users]}]
+                   {:total-score (reduce + 0 (map #(or (:user/score %) 1) users))}))])
+            {}
+            [:total-score]
+            {:users       [{:user/id 1, :user/score 10} {:user/id 2}]
+             :total-score 11}))))
+
+  (testing "empty collection is a valid input"
+    (is (graph-response?
+          (pci/register
+            [(pco/resolver 'users
+               {:pathim.connect.operation/output [{:users [:user/id]}]}
+               (fn [_ _]
+                 {:users []}))
+             (pbir/static-attribute-map-resolver :user/id :user/score
+               {1 10
+                2 20})
+             (pco/resolver 'total-score
+               {:pathim.connect.operation/input  [{:users [:user/score]}]
+                :pathim.connect.operation/output [:total-score]}
+               (fn [_ {:keys [users]}]
+                 {:total-score (reduce + 0 (map :user/score users))}))])
+          {}
+          [:total-score]
+          {:users       []
+           :total-score 0})))
+
+  (testing "using optional on aggregation"
+    (is (graph-response?
+          (pci/register
+            [(pco/resolver 'users
+               {:pathim.connect.operation/output [{:users [:user/id]}]}
+               (fn [_ _]
+                 {:users
+                  [{:user/id 1}
+                   {:user/id 2}]}))
+             (pbir/static-attribute-map-resolver :user/id :user/score
+               {1 10})
+             (pco/resolver 'total-score
+               {:pathim.connect.operation/input  [{:users [(pco/? :user/score)]}]
+                :pathim.connect.operation/output [:total-score]}
+               (fn [_ {:keys [users]}]
+                 {:total-score (reduce + 0 (keep :user/score users))}))])
+          {}
+          [:total-score]
+          {:users       [{:user/id 1, :user/score 10}
+                         {:user/id 2,}],
+           :total-score 10})))
+
+  (testing "resolver gets only the exact shape it asked for"
+    (is (graph-response?
+          (pci/register
+            [(pco/resolver 'users
+               {:pathim.connect.operation/output [{:users [:user/id]}]}
+               (fn [_ _]
+                 {:users [{:user/id 1}
+                          {:user/id 2}]}))
+             (pbir/static-attribute-map-resolver :user/id :user/score
+               {1 10
+                2 20})
+             (pco/resolver 'total-score
+               {:pathim.connect.operation/input  [{:users [:user/score]}]
+                :pathim.connect.operation/output [:filter-test]}
+               (fn [_ {:keys [users]}]
+                 {:filter-test users}))])
+          {}
+          [:filter-test]
+          {:users       [{:user/id 1, :user/score 10} {:user/id 2, :user/score 20}]
+           :filter-test [{:user/score 10} {:user/score 20}]})))
+
+  (testing "source data in available data"
+    (is (graph-response?
+          (pci/register
+            [(pco/resolver 'total-score
+               {:pathim.connect.operation/input  [{:users [:user/score]}]
+                :pathim.connect.operation/output [:total-score]}
+               (fn [_ {:keys [users]}]
+                 {:total-score (reduce + 0 (map :user/score users))}))])
+          {:users [{:user/score 10}
+                   {:user/score 20}]}
+          [:total-score]
+          {:users       [{:user/score 10} {:user/score 20}]
+           :total-score 30})))
+
+  (testing "source data partially in available data"
+    (is (graph-response?
+          (pci/register
+            [(pbir/static-attribute-map-resolver :user/id :user/score
+               {1 10
+                2 20})
+             (pco/resolver 'total-score
+               {:pathim.connect.operation/input  [{:users [:user/score]}]
+                :pathim.connect.operation/output [:total-score]}
+               (fn [_ {:keys [users]}]
+                 {:total-score (reduce + 0 (map :user/score users))}))])
+          {:users [{:user/id 1}
+                   {:user/id 2}]}
+          [:total-score]
+          {:users       [{:user/id 1, :user/score 10} {:user/id 2, :user/score 20}]
+           :total-score 30})))
+
+  (testing "deep nesting"
+    (is (graph-response?
+          (pci/register
+            [(pbir/static-table-resolver :user/id
+                                         {1 {:user/scores [{:user/score 10}]}
+                                          2 {:user/scores [{:user/score 20}]}})
+             (pco/resolver 'total-score
+               {:pathim.connect.operation/input  [{:users [{:user/scores [:user/score]}]}]
+                :pathim.connect.operation/output [:total-score]}
+               (fn [_ {:keys [users]}]
+                 {:total-score (reduce + 0 (->> users
+                                                (mapcat :user/scores)
+                                                (map :user/score)))}))])
+          {:users [{:user/id 1}
+                   {:user/id 2}]}
+          [:total-score]
+          {:users       [{:user/id 1, :user/scores [{:user/score 10}]}
+                         {:user/id 2, :user/scores [{:user/score 20}]}],
+           :total-score 30})))
+
+  (testing "nested + batch"
+    (is (graph-response?
+          (pci/register
+            [(pco/resolver 'users
+               {:pathim.connect.operation/output [{:users [:user/id]}]}
+               (fn [_ _]
+                 {:users [{:user/id 1}
+                          {:user/id 2}]}))
+             (pco/resolver 'score-from-id
+               {:pathim.connect.operation/input  [:user/id]
+                :pathim.connect.operation/output [:user/score]
+                :pathim.connect.operation/batch? true}
+               (fn [_ items]
+                 (mapv #(hash-map :user/score (* 10 (:user/id %))) items)))
+             (pco/resolver 'total-score
+               {:pathim.connect.operation/input  [{:users [:user/score]}]
+                :pathim.connect.operation/output [:total-score]}
+               (fn [_ {:keys [users]}]
+                 {:total-score (reduce + 0 (map :user/score users))}))])
+          {}
+          [:total-score]
+          {:users       [{:user/id 1, :user/score 10} {:user/id 2, :user/score 20}]
+           :total-score 30}))
+
+    (is (testing "waiting not at root"
+          (graph-response?
+            (pci/register
+              [(pco/resolver 'users
+                 {:pathim.connect.operation/output [{:main-db {:users [:user/id]}}]}
+                 (fn [_ _]
+                   {:main-db
+                    {:users [{:user/id 1}
+                             {:user/id 2}]}}))
+               (pco/resolver 'score-from-id
+                 {:pathim.connect.operation/input  [:user/id]
+                  :pathim.connect.operation/output [:user/score]
+                  :pathim.connect.operation/batch? true}
+                 (fn [_ items]
+                   (mapv #(hash-map :user/score (* 10 (:user/id %))) items)))
+               (pco/resolver 'total-score
+                 {:pathim.connect.operation/input  [{:users [:user/score]}]
+                  :pathim.connect.operation/output [:total-score]}
+                 (fn [_ {:keys [users]}]
+                   {:total-score (reduce + 0 (map :user/score users))}))])
+            {}
+            [{:main-db [:total-score]}]
+            {:main-db
+             {:users       [{:user/id 1, :user/score 10} {:user/id 2, :user/score 20}],
+              :total-score 30}}))))
+
+  (testing "repro-127"
+    (is (graph-response?
+          (pci/register (pco/resolver 'parent-type
+                          {:pathim.connect.operation/input  [{:parent [(pco/? :id)]}]
+                           :pathim.connect.operation/output [:parent-type]}
+                          (fn [_ _] {:parent-type "foo"})))
+          {:items [{:parent {:id 1}}
+                   {:parent {:other.id 3}}]}
+          [{:items
+            [:parent-type]}]
+          {:items [{:parent {:id 1}, :parent-type "foo"}
+                   {:parent {:other.id 3}, :parent-type "foo"}]})))
+
+  (testing "repro-170"
+    (check-all-runners
+      (pci/register
+        (->> '[{:pathim.connect.operation/op-name db-gravie.member-plan->db-gravie.employer/employer-id->id--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan/employer-id],
+                :pathim.connect.operation/output  [:db-gravie.employer/id]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan-participant->db-gravie.member-plan/member-plan-id->id--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan-participant/member-plan-id],
+                :pathim.connect.operation/output  [:db-gravie.member-plan/id]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan-participant->db-gravie.person/participant-id->id--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan-participant/participant-id],
+                :pathim.connect.operation/output  [:db-gravie.person/id]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan-financial->gravie.member-plan-financial/monthly-employer-contribution--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan-financial/monthly-employer-contribution],
+                :pathim.connect.operation/output  [:gravie.member-plan-financial/monthly-employer-contribution]}
+               {:pathim.connect.operation/op-name db-gravie.person->gravie.person/ssn--alias,
+                :pathim.connect.operation/input   [:db-gravie.person/ssn],
+                :pathim.connect.operation/output  [:gravie.person/ssn]}
+               {:pathim.connect.operation/op-name gravie.person->db-gravie.person/ssn--alias,
+                :pathim.connect.operation/input   [:gravie.person/ssn],
+                :pathim.connect.operation/output  [:db-gravie.person/ssn]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan->gravie.member-plan/effective-thru-date--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan/effective-thru-date],
+                :pathim.connect.operation/output  [:gravie.member-plan/effective-thru-date]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan-financial->gravie.member-plan-financial/monthly-plan-premium--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan-financial/monthly-plan-premium],
+                :pathim.connect.operation/output  [:gravie.member-plan-financial/monthly-plan-premium]}
+               {:pathim.connect.operation/op-name db-gravie.person->gravie.person/birth-date--alias,
+                :pathim.connect.operation/input   [:db-gravie.person/birth-date],
+                :pathim.connect.operation/output  [:gravie.person/birth-date]}
+               {:pathim.connect.operation/op-name gravie.person->db-gravie.person/birth-date--alias,
+                :pathim.connect.operation/input   [:gravie.person/birth-date],
+                :pathim.connect.operation/output  [:db-gravie.person/birth-date]}
+               {:pathim.connect.operation/op-name db-gravie.person->gravie.person/external-id--alias,
+                :pathim.connect.operation/input   [:db-gravie.person/external-id],
+                :pathim.connect.operation/output  [:gravie.person/external-id]}
+               {:pathim.connect.operation/op-name gravie.person->db-gravie.person/external-id--alias,
+                :pathim.connect.operation/input   [:gravie.person/external-id],
+                :pathim.connect.operation/output  [:db-gravie.person/external-id]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan->gravie.member-plan/effective-from-date--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan/effective-from-date],
+                :pathim.connect.operation/output  [:gravie.member-plan/effective-from-date]}
+               {:pathim.connect.operation/op-name db-gravie.person->gravie.person/last-name--alias,
+                :pathim.connect.operation/input   [:db-gravie.person/last-name],
+                :pathim.connect.operation/output  [:gravie.person/last-name]}
+               {:pathim.connect.operation/op-name gravie.person->db-gravie.person/last-name--alias,
+                :pathim.connect.operation/input   [:gravie.person/last-name],
+                :pathim.connect.operation/output  [:db-gravie.person/last-name]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan->gravie.member-plan/external-id--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan/external-id],
+                :pathim.connect.operation/output  [:gravie.member-plan/external-id]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan->gravie.member-plan/status--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan/status],
+                :pathim.connect.operation/output  [:gravie.member-plan/status]}
+               {:pathim.connect.operation/op-name db-gravie.person->gravie.person/phone--alias,
+                :pathim.connect.operation/input   [:db-gravie.person/phone],
+                :pathim.connect.operation/output  [:gravie.person/phone]}
+               {:pathim.connect.operation/op-name gravie.person->db-gravie.person/phone--alias,
+                :pathim.connect.operation/input   [:gravie.person/phone],
+                :pathim.connect.operation/output  [:db-gravie.person/phone]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan->gravie.member-plan/member-id--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan/member-id],
+                :pathim.connect.operation/output  [:gravie.member-plan/member-id]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan->gravie.member-plan/product-type--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan/product-type],
+                :pathim.connect.operation/output  [:gravie.member-plan/product-type]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan->gravie.member-plan/network-url--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan/network-url],
+                :pathim.connect.operation/output  [:gravie.member-plan/network-url]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan-financial->gravie.member-plan-financial/monthly-premium-reduction--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan-financial/monthly-premium-reduction],
+                :pathim.connect.operation/output  [:gravie.member-plan-financial/monthly-premium-reduction]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan->gravie.member-plan/enrollment-location--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan/enrollment-location],
+                :pathim.connect.operation/output  [:gravie.member-plan/enrollment-location]}
+               {:pathim.connect.operation/op-name db-gravie.person->gravie.person/first-name--alias,
+                :pathim.connect.operation/input   [:db-gravie.person/first-name],
+                :pathim.connect.operation/output  [:gravie.person/first-name]}
+               {:pathim.connect.operation/op-name gravie.person->db-gravie.person/first-name--alias,
+                :pathim.connect.operation/input   [:gravie.person/first-name],
+                :pathim.connect.operation/output  [:db-gravie.person/first-name]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan->gravie.member-plan/name--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan/name],
+                :pathim.connect.operation/output  [:gravie.member-plan/name]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan-financial->gravie.member-plan-financial/monthly-federal-subsidy--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan-financial/monthly-federal-subsidy],
+                :pathim.connect.operation/output  [:gravie.member-plan-financial/monthly-federal-subsidy]}
+               {:pathim.connect.operation/op-name db-gravie.person->gravie.person/virtual-bank-account-id--alias,
+                :pathim.connect.operation/input   [:db-gravie.person/virtual-bank-account-id],
+                :pathim.connect.operation/output  [:gravie.person/virtual-bank-account-id]}
+               {:pathim.connect.operation/op-name gravie.person->db-gravie.person/virtual-bank-account-id--alias,
+                :pathim.connect.operation/input   [:gravie.person/virtual-bank-account-id],
+                :pathim.connect.operation/output  [:db-gravie.person/virtual-bank-account-id]}
+               {:pathim.connect.operation/op-name db-gravie.person->gravie.person/id--alias,
+                :pathim.connect.operation/input   [:db-gravie.person/id],
+                :pathim.connect.operation/output  [:gravie.person/id]}
+               {:pathim.connect.operation/op-name gravie.person->db-gravie.person/id--alias,
+                :pathim.connect.operation/input   [:gravie.person/id],
+                :pathim.connect.operation/output  [:db-gravie.person/id]}
+               {:pathim.connect.operation/op-name db-gravie.member-plan-participant->gravie.member-plan-participant/tpa-member-number-p1--alias,
+                :pathim.connect.operation/input   [:db-gravie.member-plan-participant/tpa-member-number-p1],
+                :pathim.connect.operation/output  [:gravie.member-plan-participant/tpa-member-number-p1]}
+               {:pathim.connect.operation/op-name gravie.person.resolver/person-external-id->person,
+                :pathim.connect.operation/input   [:gravie.person/external-id],
+                :pathim.connect.operation/output  [:db-gravie.person/bank-account-id
+                               :db-gravie.person/birth-date
+                               :db-gravie.person/class
+                               :db-gravie.person/email
+                               :db-gravie.person/external-id
+                               :db-gravie.person/first-name
+                               :db-gravie.person/hpa-member-number
+                               :db-gravie.person/id
+                               :db-gravie.person/last-name
+                               :db-gravie.person/phone
+                               :db-gravie.person/ssn
+                               :db-gravie.person/timezone
+                               :db-gravie.person/user-id
+                               :db-gravie.person/virtual-bank-account-id]}
+               {:pathim.connect.operation/op-name gravie.person.resolver/person-id->person,
+                :pathim.connect.operation/input   [:db-gravie.person/id],
+                :pathim.connect.operation/output  [:db-gravie.person/bank-account-id
+                               :db-gravie.person/birth-date
+                               :db-gravie.person/class
+                               :db-gravie.person/email
+                               :db-gravie.person/external-id
+                               :db-gravie.person/first-name
+                               :db-gravie.person/hpa-member-number
+                               :db-gravie.person/id
+                               :db-gravie.person/last-name
+                               :db-gravie.person/phone
+                               :db-gravie.person/ssn
+                               :db-gravie.person/timezone
+                               :db-gravie.person/user-id
+                               :db-gravie.person/virtual-bank-account-id]}
+               {:pathim.connect.operation/op-name gravie.person.resolver/person-exists?,
+                :pathim.connect.operation/input   [:db-gravie.person/class],
+                :pathim.connect.operation/output  [:gravie.person/exists?]}
+               {:pathim.connect.operation/op-name gravie.person.resolver/person-is-member?,
+                :pathim.connect.operation/input   [:db-gravie.person/class],
+                :pathim.connect.operation/output  [:gravie.person/member?
+                               :gravie.person/type]}
+               {:pathim.connect.operation/op-name gravie.person.resolver/person->id-number,
+                :pathim.connect.operation/input   [:db-gravie.person/hpa-member-number
+                               :gravie.member-plan-participant/tpa-member-number-p1
+                               :gravie.employer-program/is-javelina?],
+                :pathim.connect.operation/output  [:gravie.person/id-number]}
+               {:pathim.connect.operation/op-name gravie.person.resolver/person->now-zoned,
+                :pathim.connect.operation/input   [:db-gravie.person/timezone],
+                :pathim.connect.operation/output  [:gravie.person/now-zoned]}
+               {:pathim.connect.operation/op-name gravie.person.resolver/person->email,
+                :pathim.connect.operation/input   [:db-gravie.user/username
+                               :db-gravie.person/email],
+                :pathim.connect.operation/output  [:gravie.person/email]}
+               {:pathim.connect.operation/op-name gravie.person.resolver/person-birth-date->age,
+                :pathim.connect.operation/input   [:db-gravie.person/birth-date],
+                :pathim.connect.operation/output  [:graive.person/age]}
+               {:pathim.connect.operation/op-name gravie.person.resolver/person->full-name,
+                :pathim.connect.operation/input   [:db-gravie.person/first-name
+                               :db-gravie.person/last-name],
+                :pathim.connect.operation/output  [:gravie.person/full-name]}
+               {:pathim.connect.operation/op-name gravie.person.resolver/member-external-id->person,
+                :pathim.connect.operation/input   [:gravie.member/external-id],
+                :pathim.connect.operation/output  [:db-gravie.person/bank-account-id
+                               :db-gravie.person/birth-date
+                               :db-gravie.person/class
+                               :db-gravie.person/email
+                               :db-gravie.person/external-id
+                               :db-gravie.person/first-name
+                               :db-gravie.person/hpa-member-number
+                               :db-gravie.person/id
+                               :db-gravie.person/last-name
+                               :db-gravie.person/phone
+                               :db-gravie.person/ssn
+                               :db-gravie.person/timezone
+                               :db-gravie.person/user-id
+                               :db-gravie.person/virtual-bank-account-id]}]
+             (mapv (fn [config]
+                     (assoc config
+                       :pathim.connect.operation/resolve (fn [_env _args]
+                                       (pfsd/query->shape-descriptor
+                                         (:pathim.connect.operation/output config))))))
+             (mapv pco/resolver)))
+      {:gravie.member/external-id "10"}
+      [:gravie.person/full-name]
+      {:gravie.person/full-name {}})))
+
+(deftest run-graph!-optional-inputs-test
+  (testing "data from resolvers"
+    (is (graph-response?
+          (pci/register
+            [(pco/resolver 'foo
+               {:pathim.connect.operation/input  [:x (pco/? :y)]
+                :pathim.connect.operation/output [:foo]}
+               (fn [_ {:keys [x y]}]
+                 {:foo (if y y x)}))
+             (pbir/constantly-resolver :x 10)])
+          {}
+          [:foo]
+          {:x   10
+           :foo 10})))
+
+  (testing "data from resolvers"
+    (is (graph-response?
+          (pci/register
+            [(pco/resolver 'foo
+               {:pathim.connect.operation/input  [:x (pco/? :y)]
+                :pathim.connect.operation/output [:foo]}
+               (fn [_ {:keys [x y]}]
+                 {:foo (if y y x)}))
+             (pbir/constantly-resolver :x 10)
+             (pbir/constantly-resolver :y 42)])
+          {}
+          [:foo]
+          {:x   10
+           :y   42
+           :foo 42})))
+
+  (testing "all optionals"
+    (testing "not available"
+      (is (graph-response?
+            (pci/register
+              [(pco/resolver 'foo
+                 {:pathim.connect.operation/input  [(pco/? :y)]
+                  :pathim.connect.operation/output [:foo]}
+                 (fn [_ {:keys [y]}]
+                   {:foo (if y y "nope")}))])
+            {}
+            [:foo]
+            {:foo "nope"})))
+
+    (testing "available"
+      (is (graph-response?
+            (pci/register
+              [(pco/resolver 'foo
+                 {:pathim.connect.operation/input  [(pco/? :y)]
+                  :pathim.connect.operation/output [:foo]}
+                 (fn [_ {:keys [y]}]
+                   {:foo (if y y "nope")}))
+               (pbir/constantly-resolver :y 42)])
+            {}
+            [:foo]
+            {:y   42
+             :foo 42}))))
+
+  (testing "bug report #126"
+    (check-all-runners (pci/register [(pco/resolver 'bar
+                                        {:pathim.connect.operation/input  [:pathim.connect.runner-test/email]
+                                         :pathim.connect.operation/output [:pathim.connect.runner-test/bar]}
+                                        (fn [_ _] nil))
+
+                                      (pco/resolver 'id
+                                        {:pathim.connect.operation/input  [:pathim.connect.runner-test/bar]
+                                         :pathim.connect.operation/output [:pathim.connect.runner-test/id]}
+                                        (fn [_ _] nil))
+
+                                      (pco/resolver 'display-name
+                                        {:pathim.connect.operation/input  [:pathim.connect.runner-test/id]
+                                         :pathim.connect.operation/output [:pathim.connect.runner-test/display-name]}
+                                        (fn [_ _]
+                                          {:pathim.connect.runner-test/display-name "Octocat"}))])
+      {:pathim.connect.runner-test/email "bar@acme.com"}
+      [:pathim.connect.runner-test/email
+       (pco/? :pathim.connect.runner-test/display-name)]
+      {:pathim.connect.runner-test/email "bar@acme.com"}))
+
+  (testing "multiple options on optional, issue #138"
+    (check-all-runners
+      (pci/register
+        [(pco/resolver 'resolver-a
+           {:pathim.connect.operation/input  [:in]
+            :pathim.connect.operation/output [:out]}
+           (fn [_ {in :in}]
+             (when (= in "a")
+               {:out "A"})))
+
+         (pco/resolver 'resolver-b
+           {:pathim.connect.operation/input  [:in]
+            :pathim.connect.operation/output [:out]}
+           (fn [_ {in :in}]
+             (when (= in "b")
+               {:out "B"})))])
+      {:in "c"}
+      [(pco/? :out)]
+      {}))
+
+  (testing "nested multiple options on optional, issue #139"
+    (check-all-runners
+      (pci/register
+        [(pco/resolver 'one
+           {:pathim.connect.operation/input  []
+            :pathim.connect.operation/output [:pathim.connect.runner-test/one]}
+           (fn [_ _] nil))
+
+         (pco/resolver 'two-a
+           {:pathim.connect.operation/input  [:pathim.connect.runner-test/one]
+            :pathim.connect.operation/output [:pathim.connect.runner-test/two]}
+           (fn [_ _] nil))
+
+         (pco/resolver 'two-b
+           {:pathim.connect.operation/input  [:pathim.connect.runner-test/one]
+            :pathim.connect.operation/output [:pathim.connect.runner-test/two]}
+           (fn [_ _] nil))
+
+         (pco/resolver 'three
+           {:pathim.connect.operation/input  [:pathim.connect.runner-test/two]
+            :pathim.connect.operation/output [:pathim.connect.runner-test/three]}
+           (fn [_ _] nil))])
+      {}
+      [(pco/? :pathim.connect.runner-test/three)]
+      {})
+
+    (check-all-runners
+      (pci/register
+        [(pco/resolver 'one
+           {:pathim.connect.operation/input  []
+            :pathim.connect.operation/output [:pathim.connect.runner-test/one]}
+           (fn [_ _] nil))
+
+         (pco/resolver 'two-a
+           {:pathim.connect.operation/input  [:pathim.connect.runner-test/one]
+            :pathim.connect.operation/output [:pathim.connect.runner-test/two]}
+           (fn [_ _] nil))
+
+         (pco/resolver 'two-b
+           {:pathim.connect.operation/input  [:pathim.connect.runner-test/one]
+            :pathim.connect.operation/output [:pathim.connect.runner-test/two]}
+           (fn [_ _] nil))
+
+         (pco/resolver 'three
+           {:pathim.connect.operation/input  [:pathim.connect.runner-test/two]
+            :pathim.connect.operation/output [:pathim.connect.runner-test/three]}
+           (fn [_ _] nil))
+
+         (pco/resolver 'four
+           {:pathim.connect.operation/input  [(pco/? :pathim.connect.runner-test/three)]
+            :pathim.connect.operation/output [:pathim.connect.runner-test/four]}
+           (fn [_ _] {:pathim.connect.runner-test/four 4}))])
+      {}
+      [:pathim.connect.runner-test/four]
+      {:pathim.connect.runner-test/four 4})
+
+    (check-all-runners
+      (pci/register
+        [(pco/resolver 'one
+           {:pathim.connect.operation/input  []
+            :pathim.connect.operation/output [:pathim.connect.runner-test/one]}
+           (fn [_ _] nil))
+
+         (pco/resolver 'two-a
+           {:pathim.connect.operation/input  [:pathim.connect.runner-test/one]
+            :pathim.connect.operation/output [:pathim.connect.runner-test/two]}
+           (fn [_ _] nil))
+
+         (pco/resolver 'two-b
+           {:pathim.connect.operation/input  [:pathim.connect.runner-test/one]
+            :pathim.connect.operation/output [:pathim.connect.runner-test/two]}
+           (fn [_ _] nil))
+
+         (pco/resolver 'three
+           {:pathim.connect.operation/input  [:pathim.connect.runner-test/two]
+            :pathim.connect.operation/output [:pathim.connect.runner-test/three]}
+           (fn [_ _] nil))
+
+         (pco/resolver 'four
+           {:pathim.connect.operation/input  []
+            :pathim.connect.operation/output [:pathim.connect.runner-test/four]}
+           (fn [_ _] {:pathim.connect.runner-test/four "4"}))
+
+         (pco/resolver 'five
+           {:pathim.connect.operation/input  [(pco/? :pathim.connect.runner-test/three) :pathim.connect.runner-test/four]
+            :pathim.connect.operation/output [:pathim.connect.runner-test/five]}
+           (fn [_ {:pathim.connect.runner-test/keys [three four]}]
+             {:pathim.connect.runner-test/five (str three four)}))])
+      {}
+      [:pathim.connect.runner-test/five]
+      {:pathim.connect.runner-test/five "4"})))
+
+(deftest run-graph!-batch-test
+  (testing "simple batching"
+    (is (graph-response?
+          (pci/register
+            [(batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))])
+          {:list
+           [{:id 1}
+            {:id 2}
+            {:id 3}]}
+          [{:list [:v]}]
+          {:list
+           [{:id 1 :v 10}
+            {:id 2 :v 20}
+            {:id 3 :v 30}]})))
+
+  (testing "bug report - infinite loop when batch has cache disabled and misses output"
+    (check-all-runners-ex
+      (pci/register
+        [(pco/resolver 'batch-no-cache
+           {:pathim.connect.operation/batch? true
+            :pathim.connect.operation/cache? false
+            :pathim.connect.operation/input  [:id]
+            :pathim.connect.operation/output [:name]}
+           (fn [_ input]
+             input))])
+      {:id 1}
+      [:name]
+      {:ex/message (str
+                     "Required attributes missing:\n"
+                     "- Attribute :name was expected to be returned from resolver batch-no-cache but it failed to provide it.")
+       :ex/data    {:pathim.connect.runner/attributes-missing {:name {}}}}))
+
+  (testing "distinct inputs"
+    (is (graph-response?
+          (pci/register
+            [(-> (pbir/single-attr-resolver :id :v #(* 10 %))
+                 (batchfy)
+                 (pco/wrap-resolve (fn [resolve]
+                                     (fn [env inputs]
+                                       (if (not=
+                                             (count inputs)
+                                             (count (distinct inputs)))
+                                         (raise! (ex-info "Repeated inputs" {})))
+                                       (resolve env inputs)))))])
+          {:list
+           [{:id 1}
+            {:id 2}
+            {:id 1}]}
+          [{:list [:v]}]
+          {:list
+           [{:id 1 :v 10}
+            {:id 2 :v 20}
+            {:id 1 :v 10}]})))
+
+  (testing "root batch"
+    (is (graph-response?
+          (pci/register
+            [(batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))])
+          {:id 1}
+          [:v]
+          {:id 1 :v 10}))
+
+    (is (some?
+          (-> (run-graph
+                (pci/register
+                  [(batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))])
+                {:id 1}
+                [:v]) meta :pathim.connect.runner/run-stats))))
+
+  (testing "params"
+    (is (graph-response?
+          (pci/register [batch-param])
+          {:list
+           [{:id 1}
+            {:id 2}
+            {:id 3}]}
+          [{:list [:v]}]
+          {:list
+           [{:id 1 :v 10}
+            {:id 2 :v 20}
+            {:id 3 :v 30}]}))
+
+    (is (graph-response?
+          (pci/register [batch-param])
+          {:list
+           [{:id 1}
+            {:id 2}
+            {:id 3}]}
+          '[{:list [(:v {:multiplier 100})]}]
+          {:list
+           [{:id 1 :v 100}
+            {:id 2 :v 200}
+            {:id 3 :v 300}]}))
+
+    (testing "different parameters get thrown in different calls"
+      (is (graph-response?
+            (pci/register [batch-param])
+            {:path1 {:id 1}
+             :path2 {:id 2}}
+            '[{:path1 [(:v {:multiplier 100})]}
+              {:path2 [(:v {:multiplier 30})]}]
+            {:path1 {:id 1 :v 100}
+             :path2 {:id 2 :v 60}}))))
+
+  (testing "run stats"
+    (is (some? (-> (run-graph
+                     (pci/register
+                       [(pbir/constantly-resolver :id 1)
+                        (batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))])
+                     {}
+                     [{':>/id [:v]}])
+                   :>/id meta :pathim.connect.runner/run-stats)))
+
+    (is (nil? (-> (run-graph
+                    (-> {:pathim.connect.runner/omit-run-stats? true}
+                        (pci/register
+                          [(pbir/constantly-resolver :id 1)
+                           (batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))]))
+                    {}
+                    [{':>/id [:v]}])
+                  :>/id meta :pathim.connect.runner/run-stats))))
+
+  (testing "different plan"
+    (is (graph-response?
+          (pci/register
+            [(batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))
+             (pbir/constantly-resolver :list
+                                       [{:id 1}
+                                        {:id 2 :v 200}
+                                        {:id 3}])])
+          {}
+          [{:list [:v]}]
+          {:list
+           [{:id 1 :v 10}
+            {:id 2 :v 200}
+            {:id 3 :v 30}]})))
+
+  (testing "multiple batches"
+    (is (graph-response?
+          (pci/register
+            [(batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))
+             batch-pre-id])
+          {:list
+           [{:pre-id 1}
+            {:pre-id 2}
+            {:id 3}]}
+          [{:list [:v]}]
+          {:list
+           [{:pre-id 1 :id 2 :v 20}
+            {:pre-id 2 :id 3 :v 30}
+            {:id 3 :v 30}]})))
+
+  (testing "non batching dependency"
+    (is (graph-response?
+          (pci/register
+            [(batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))
+             (pbir/single-attr-resolver :pre-id :id inc)])
+          {:list
+           [{:pre-id 1}
+            {:pre-id 2}
+            {:id 4}]}
+          [{:list [:v]}]
+          {:list
+           [{:pre-id 1 :id 2 :v 20}
+            {:pre-id 2 :id 3 :v 30}
+            {:id 4 :v 40}]})))
+
+  (testing "process after batch"
+    (testing "stop all branches"
+      (testing "AND branch"
+        (is (graph-response?
+              (pci/register
+                [(batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))
+                 (pco/resolver 'multi-dep
+                   {:pathim.connect.operation/input  [:v :x]
+                    :pathim.connect.operation/output [:z]}
+                   (fn [_ {:keys [v x]}]
+                     {:z (+ v x)}))
+                 (pbir/constantly-resolver :x 10)])
+              {:id 5}
+              [:z]
+              {:id 5 :x 10 :v 50 :z 60})))
+
+      (testing "OR branch"
+        (is (graph-response?
+              (pci/register
+                [(pbir/single-attr-resolver :x :v #(* 10 %))
+                 (batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))
+                 (pbir/single-attr-resolver :v :z #(+ 10 %))
+                 (pbir/constantly-fn-resolver :x #(throw (ex-info "Take other path" {})))])
+              {:id 5}
+              [:z]
+              {:id 5, :v 50, :z 60}))))
+
+    (testing "deep process"
+      (is (graph-response?
+            (pci/register
+              [(batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))
+               batch-fetch-nested
+               (pbir/single-attr-resolver :pre-id :id inc)])
+            {:list
+             [{:id 1}
+              {:id 2}
+              {:id 3}]}
+            [{:list [{:n [:v]}]}]
+            {:list
+             [{:id 1, :n {:pre-id 10 :id 11 :v 110}}
+              {:id 2, :n {:pre-id 20 :id 21 :v 210}}
+              {:id 3, :n {:pre-id 30 :id 31 :v 310}}]})))
+
+    (testing "node sequence"
+      (is (graph-response?
+            (pci/register
+              [(batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))
+               (pbir/single-attr-resolver :v :x #(* 100 %))])
+            {:list
+             [{:id 1}
+              {:id 2}
+              {:id 3}]}
+            [{:list [:x]}]
+            {:list
+             [{:id 1 :v 10 :x 1000}
+              {:id 2 :v 20 :x 2000}
+              {:id 3 :v 30 :x 3000}]}))))
+
+  (testing "deep batching"
+    (is (graph-response?
+          (pci/register
+            [(batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))])
+          {:list
+           [{:items [{:id 1}
+                     {:id 2}]}
+            {:items [{:id 3}
+                     {:id 4}]}
+            {:items [{:id 5}
+                     {:id 6}]}]}
+          [{:list [{:items [:v]}]}]
+          {:list [{:items [{:id 1, :v 10} {:id 2, :v 20}]}
+                  {:items [{:id 3, :v 30} {:id 4, :v 40}]}
+                  {:items [{:id 5, :v 50} {:id 6, :v 60}]}]})))
+
+  (testing "cache"
+    (is (graph-response?
+          (pci/register
+            {:pathim.connect.runner/resolver-cache*
+             (volatile!
+               {['-unqualified/id->v--attr-transform {:id 1} {}] {:v 100}
+                ['-unqualified/id->v--attr-transform {:id 3} {}] {:v 300}})}
+            [(batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))])
+          {:list
+           [{:id 1}
+            {:id 2}
+            {:id 3}]}
+          [{:list [:v]}]
+          {:list
+           [{:id 1 :v 100}
+            {:id 2 :v 20}
+            {:id 3 :v 300}]}))
+
+    (testing "custom cache store"
+      (is (graph-response?
+            (pci/register
+              {:pathim.connect.runner-test/custom-cache*
+               (volatile!
+                 {['-unqualified/id->v--attr-transform {:id 1} {}] {:v 100}
+                  ['-unqualified/id->v--attr-transform {:id 3} {}] {:v 300}})}
+              [(-> (batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))
+                   (pco/update-config assoc :pathim.connect.operation/cache-store :pathim.connect.runner-test/custom-cache*))])
+            {:list
+             [{:id 1}
+              {:id 2}
+              {:id 3}]}
+            [{:list [:v]}]
+            {:list
+             [{:id 1 :v 100}
+              {:id 2 :v 20}
+              {:id 3 :v 300}]}))
+
+      (is (graph-response?
+            (pci/register
+              {:pathim.connect.runner-test/custom-cache*
+               (custom-cache
+                 {['-unqualified/id->v--attr-transform {:id 1} {}] {:v 100}
+                  ['-unqualified/id->v--attr-transform {:id 3} {}] {:v 300}})}
+              [(-> (batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))
+                   (pco/update-config assoc :pathim.connect.operation/cache-store :pathim.connect.runner-test/custom-cache*))])
+            {:list
+             [{:id 1}
+              {:id 2}
+              {:id 3}]}
+            [{:list [:v]}]
+            {:list
+             [{:id 1 :v 100}
+              {:id 2 :v 20}
+              {:id 3 :v 300}]})))
+
+    (testing "custom cache key"
+      (is (graph-response?
+            (pci/register
+              {:pathim.connect.runner/resolver-cache*
+               (volatile!
+                 {1 {:v 100}
+                  3 {:v 300}})}
+              [(-> (pbir/single-attr-resolver :id :v #(* 10 %))
+                   (pco/update-config assoc :pathim.connect.operation/cache-key
+                                      (fn [_ {:keys [id]}] id)))])
+            {:list
+             [{:id 1}
+              {:id 2}
+              {:id 3}]}
+            [{:list [:v]}]
+            {:list
+             [{:id 1 :v 100}
+              {:id 2 :v 20}
+              {:id 3 :v 300}]}))
+
+      (is (graph-response?
+            (pci/register
+              {:pathim.connect.runner/resolver-cache*
+               (custom-cache
+                 {1 {:v 100}
+                  3 {:v 300}})}
+              [(-> (pbir/single-attr-resolver :id :v #(* 10 %))
+                   (pco/update-config assoc :pathim.connect.operation/cache-key
+                                      (fn [_ {:keys [id]}] id)))])
+            {:list
+             [{:id 1}
+              {:id 2}
+              {:id 3}]}
+            [{:list [:v]}]
+            {:list
+             [{:id 1 :v 100}
+              {:id 2 :v 20}
+              {:id 3 :v 300}]}))))
+
+  (testing "errors"
+    (is (graph-response?
+          (pci/register
+            {:pathim.error/lenient-mode? true}
+            [batch-fetch-error])
+          {:id 1}
+          [:v]
+          (fn [res]
+            (mcs/match?
+              {:id                                                  1,
+               :pathim.connect.runner/attribute-errors {:v {:pathim.error/cause                               :pathim.error/node-errors,
+                                                                         :pathim.error/node-error-details {1 {:pathim.error/cause                      :pathim.error/node-exception,
+                                                                                                                           :pathim.error/exception any?}}}}}
+              res)))))
+
+  (testing "partial results"
+    (check-all-runners
+      (pci/register
+        [(pco/resolver 'batch-thing
+           {:pathim.connect.operation/input  [:id]
+            :pathim.connect.operation/output [:name]
+            :pathim.connect.operation/batch? true}
+           (fn [_ items]
+             (coll/restore-order2 items
+                                  :id
+                                  [{:id 3 :name "bar"}
+                                   {:id 1 :name "foo"}])))])
+      {:items [{:id 1}
+               {:id 2}
+               {:id 3}]}
+      [{:items [(pco/? :name)]}]
+      {:items [{:name "foo"} {} {:name "bar"}]}))
+
+  (testing "batch in blocks"
+    (testing "ensures each call has the correct max number of items"
+      (check-all-runners
+        (pci/register (pco/resolver 'batch-thing
+                        {:pathim.connect.operation/input                [:id]
+                         :pathim.connect.operation/output               [:name]
+                         :pathim.connect.operation/batch?               true
+                         :pathim.connect.operation/batch-chunk-size     3
+                         :pathim.connect.runner.parallel/batch-hold-delay-ms 100}
+                        (fn [_ items]
+                          (assert (<= (count items) 3) "Expected each call to has at max 3 items")
+                          (mapv #(assoc % :name (str "Item " (:id %))) items))))
+        {:items (mapv #(array-map :id %) (range 10))}
+        [{:items [:name]}]
+        {:items [{:id 0, :name "Item 0"}
+                 {:id 1, :name "Item 1"}
+                 {:id 2, :name "Item 2"}
+                 {:id 3, :name "Item 3"}
+                 {:id 4, :name "Item 4"}
+                 {:id 5, :name "Item 5"}
+                 {:id 6, :name "Item 6"}
+                 {:id 7, :name "Item 7"}
+                 {:id 8, :name "Item 8"}
+                 {:id 9, :name "Item 9"}]}))
+
+    (testing "partial failure"
+      (testing "missing"
+        (check-all-runners
+          (pci/register (pco/resolver 'batch-thing
+                          {:pathim.connect.operation/input                [:id]
+                           :pathim.connect.operation/output               [:name]
+                           :pathim.connect.operation/batch?               true
+                           :pathim.connect.operation/batch-chunk-size     3
+                           :pathim.connect.runner.parallel/batch-hold-delay-ms 100}
+                          (fn [_ items]
+                            (if (= 1 (count items))
+                              [nil]
+                              (mapv #(assoc % :name (str "Item " (:id %))) items)))))
+          {:items (mapv #(array-map :id %) (range 10))}
+          [{:items [(pco/? :name)]}]
+          {:items [{:id 0, :name "Item 0"}
+                   {:id 1, :name "Item 1"}
+                   {:id 2, :name "Item 2"}
+                   {:id 3, :name "Item 3"}
+                   {:id 4, :name "Item 4"}
+                   {:id 5, :name "Item 5"}
+                   {:id 6, :name "Item 6"}
+                   {:id 7, :name "Item 7"}
+                   {:id 8, :name "Item 8"}
+                   {:id 9}]}))
+
+      (testing "error thrown flows up"
+        (check-all-runners-ex
+          ; bigger delay ensuring the batch block will contain all the list items
+          (-> {:pathim.connect.runner.parallel/batch-hold-delay-ms 100}
+              (pci/register (pco/resolver 'batch-thing
+                              {:pathim.connect.operation/input                [:id]
+                               :pathim.connect.operation/output               [:name]
+                               :pathim.connect.operation/batch?               true
+                               :pathim.connect.operation/batch-chunk-size     3
+                               :pathim.connect.runner.parallel/batch-hold-delay-ms 100}
+                              (fn [_ items]
+                                (if (= 1 (count items))
+                                  (raise! (ex-info "Error in batch call" {}))
+                                  (mapv #(assoc % :name (str "Item " (:id %))) items))))))
+          {:items (mapv #(array-map :id %) (range 10))}
+          [{:items [(pco/? :name)]}]
+          {:ex/message (m/regex #".*Batch error on resolver batch-thing at path \[:items]: Error in batch call")
+           :ex/data    {:pathim.connect.runner/batch-error? true}})
+
+        (testing "allows the partial results to flow up in lenient mode"
+          (check-all-runners
+            (-> {:pathim.error/lenient-mode?    true
+                 :pathim.connect.runner.parallel/batch-hold-delay-ms 100}
+                (pci/register (pco/resolver 'batch-thing
+                                {:pathim.connect.operation/input                [:id]
+                                 :pathim.connect.operation/output               [:name]
+                                 :pathim.connect.operation/batch?               true
+                                 :pathim.connect.operation/batch-chunk-size     3
+                                 :pathim.connect.runner.parallel/batch-hold-delay-ms 100}
+                                (fn [_ items]
+                                  (if (= 1 (count items))
+                                    (raise! (ex-info "Error in batch call" {}))
+                                    (mapv #(assoc % :name (str "Item " (:id %))) items))))))
+            {:items (mapv #(array-map :id %) (range 10))}
+            [{:items [:name]}]
+            {:items [{:id 0, :name "Item 0"}
+                     {:id 1, :name "Item 1"}
+                     {:id 2, :name "Item 2"}
+                     {:id 3, :name "Item 3"}
+                     {:id 4, :name "Item 4"}
+                     {:id 5, :name "Item 5"}
+                     {:id 6, :name "Item 6"}
+                     {:id 7, :name "Item 7"}
+                     {:id 8, :name "Item 8"}
+                     {:id 9, :pathim.connect.runner/attribute-errors {}}]})))))
+
+  (testing "uses batch resolver as single resolver when running under a path that batch wont work"
+    (is (graph-response?
+          (pci/register
+            [(batchfy (pbir/single-attr-resolver :id :v #(* 10 %)))])
+          {:list
+           #{{:id 1}
+             {:id 2}
+             {:id 3}}}
+          [{:list [:v]}]
+          {:list
+           #{{:id 1 :v 10}
+             {:id 2 :v 20}
+             {:id 3 :v 30}}})))
+
+  (testing "bug reports"
+    (testing "issue-31 nested batching, actual problem - waiting running multiple times"
+      (let [parents  {1 {:parent/children [{:child/id 1}]}}
+            children {1 {:child/ident :child/good}}
+            good?    (fn [children] (boolean (some #{:child/good} (map :child/ident children))))
+            env      (pci/register
+                       [(pco/resolver 'pc
+                          {:pathim.connect.operation/input  [:parent/id]
+                           :pathim.connect.operation/output [{:parent/children [:child/id]}]
+                           :pathim.connect.operation/batch? true}
+                          (fn [_ items]
+                            (mapv (fn [{:parent/keys [id]}]
+                                    (select-keys (parents id) [:parent/children]))
+                              items)))
+
+                        (pco/resolver 'ci
+                          {:pathim.connect.operation/input  [:child/id]
+                           :pathim.connect.operation/output [:child/ident]
+                           :pathim.connect.operation/batch? true}
+                          (fn [_ items]
+                            (mapv (fn [{:child/keys [id]}]
+                                    (select-keys (children id) [:child/ident]))
+                              items)))
+
+                        (pco/resolver 'parent-good
+                          {:pathim.connect.operation/input  [{:parent/children [:child/ident]}]
+                           :pathim.connect.operation/output [:parent/good?]}
+                          (fn [_ {:parent/keys [children]}] {:parent/good? (good? children)}))])]
+        (is (graph-response? env
+              {:parent/id 1} [:parent/good?]
+              {:parent/id 1, :parent/children [{:child/id 1, :child/ident :child/good}], :parent/good? true}))))
+
+    (testing "issue-49 data merging across different batches"
+      (let [db  {:a {1 {:a/id 1 :a/code "a-1"}
+                     2 {:a/id 2 :a/code "a-2"}}
+                 :f {1 {:f/id 1 :f/code "f-1"}
+                     2 {:f/id 2 :f/code "f-2"}}
+                 :b {1 [{:f/id 1}]}
+                 :c {1 [{:f/id 2}]}}
+            env (pci/register
+                  [(pco/resolver 'a
+                     {:pathim.connect.operation/input  [:a/id]
+                      :pathim.connect.operation/output [:a/code]
+                      :pathim.connect.operation/batch? true}
+                     (fn [_ input]
+                       (mapv #(get-in db [:a (:a/id %)]) input)))
+
+                   (pco/resolver 'f
+                     {:pathim.connect.operation/input  [:f/id]
+                      :pathim.connect.operation/output [:f/code]
+                      :pathim.connect.operation/batch? true}
+                     (fn [_ input]
+                       (mapv #(get-in db [:f (:f/id %)]) input)))
+
+                   (pco/resolver 'b
+                     {:pathim.connect.operation/input  [:a/id]
+                      :pathim.connect.operation/output [{:a/b [:f/id]}]
+                      :pathim.connect.operation/batch? true}
+                     (fn [_ input]
+                       (mapv (fn [{:a/keys [id]}]
+                               {:a/b (get-in db [:b id])}) input)))
+
+                   (pco/resolver 'c
+                     {:pathim.connect.operation/input  [:a/id]
+                      :pathim.connect.operation/output [{:a/c [:f/id]}]}
+                     (fn [_ {:keys [a/id]}]
+                       {:a/c (get-in db [:c id])}))])]
+        (check-all-runners
+          env {}
+          [{[:a/id 1]
+            [:a/code
+             {:a/b [:f/id :f/code]}
+             {:a/c [:f/id :f/code]}]}]
+          {[:a/id 1]
+           {:a/id   1,
+            :a/code "a-1",
+            :a/b    [{:f/id 1, :f/code "f-1"}],
+            :a/c    [{:f/id 2, :f/code "f-2"}]}})))
+
+    (testing "issue-52 partial cycle"
+      (let [env (pci/register
+                  [(pco/resolver 'attribute-sql-projection
+                     {:pathim.connect.operation/input  [:appKey]
+                      :pathim.connect.operation/output [:ont/attribute-sql-projection]}
+                     (fn [_ _] {:ont/attribute-sql-projection "blah"}))
+
+                   (pco/resolver 'event-withs
+                     {:pathim.connect.operation/input  [:appKey :ont/attribute-sql-projection]
+                      :pathim.connect.operation/output [:ont/events-withs-fn]}
+                     (fn [_ _] {:ont/events-withs-fn "event-withs-fn"}))
+
+                   (pco/resolver 'query->portfolioKey-appKey
+                     {:pathim.connect.operation/input    [:query/args]
+                      :pathim.connect.operation/output   [:portfolioKey :appKey]
+                      :pathim.connect.operation/priority 10}
+                     (fn [_ _] {:portfolioKey "p"
+                                :appKey       "a"}))
+
+                   (pco/resolver 'unformatted-metric-honey
+                     {:pathim.connect.operation/input  [:ont/events-withs-fn]
+                      :pathim.connect.operation/output [:entity.metric.query.response/unformatted-metric-honey]}
+                     (fn [_ _] {:entity.metric.query.response/unformatted-metric-honey "something"}))
+
+                   (pco/resolver 'query->entity
+                     {:pathim.connect.operation/input  [:query/args]
+                      :pathim.connect.operation/output [:entity]}
+                     (fn [_ _] {:entity "something"}))
+
+                   (pco/resolver 'entity
+                     {:pathim.connect.operation/input  [:entities :entity]
+                      :pathim.connect.operation/output [:portfolioKey :appKey
+                                    :entity/friendlyName :entity/friendlyName-plural
+                                    :entity/parameters :entity/pkey-expr]}
+                     (fn [_ _] {:portfolioKey               "p"
+                                :appKey                     "a"
+                                :entity/friendlyName        "blah"
+                                :entity/friendlyName-plural "blahs"
+                                :entity/parameters          []
+                                :entity/pkey-expr           "something"}))
+
+                   (pco/resolver 'pega-entities
+                     {:pathim.connect.operation/input  [:portfolioKey (pco/? :appKey)]
+                      :pathim.connect.operation/output [{:entities [:entity/friendlyName :entity/parameters :entity/id :entity :entity/pkey-expr]}]}
+                     (fn [_ _] {:entities [{:entity/friendlyName        "a"
+                                            :entity/friendlyName-plural "as"
+                                            :entity/parameters          []
+                                            :entity/id                  "something"
+                                            :entity/pkey-expr           "something"}]}))])]
+        (check-all-runners env {:query/args []}
+          [:entity.metric.query.response/unformatted-metric-honey]
+          {:query/args                                            []
+           :portfolioKey                                          "p"
+           :appKey                                                "a"
+           :ont/attribute-sql-projection                          "blah"
+           :ont/events-withs-fn                                   "event-withs-fn"
+           :entity.metric.query.response/unformatted-metric-honey "something"})))
+
+    (testing "issue-169 nested batches out of order"
+      (check-all-runners
+        (pci/register
+          [(pco/resolver 'unauthorized-toy
+             {:pathim.connect.operation/input  [:toy/id]
+              :pathim.connect.operation/batch? true
+              :pathim.connect.operation/output [{:toy/unauthorized [:toy/name :toy/id :child/id]}]}
+             (fn [_env _input]
+               [{:toy/unauthorized {:toy/name "Bobby" :toy/id 1 :child/id 1}}]))
+
+           (pco/resolver 'toy
+             {:pathim.connect.operation/input  [{:toy/unauthorized [:toy/name :toy/id :child/id :child/authorized?]}]
+              :pathim.connect.operation/batch? true
+              :pathim.connect.operation/output [:toy/name :toy/id :child/id]}
+             (fn [_env input]
+               (mapv :toy/unauthorized input)))
+
+           (pco/resolver 'child-toys
+             {:pathim.connect.operation/input  [:child/id]
+              :pathim.connect.operation/batch? true
+              :pathim.connect.operation/output [{:child/toys [:toy/id]}]}
+             (fn [_env _input]
+               [{:child/toys [{:toy/id 1}]}]))
+
+           (pco/resolver 'unauthorized-child
+             {:pathim.connect.operation/input  [:child/id]
+              :pathim.connect.operation/batch? true
+              :pathim.connect.operation/output [{:child/unauthorized [:child/name :child/id :parent/id]}]}
+             (fn [_env _input]
+               [{:child/unauthorized {:child/name "Bob" :child/id 1 :parent/id 1}}]))
+
+           (pco/resolver 'child
+             {:pathim.connect.operation/input  [{:child/unauthorized [:child/name :child/id :parent/id :parent/authorized?]}]
+              :pathim.connect.operation/batch? true
+              :pathim.connect.operation/output [:child/name :child/id :parent/id]}
+             (fn [_env input]
+               (mapv :child/unauthorized input)))
+
+           (pco/resolver 'auth-child
+             {:pathim.connect.operation/input  [:child/id :parent/authorized?]
+              :pathim.connect.operation/batch? true
+              :pathim.connect.operation/output [:child/authorized?]}
+             (fn [_env _input]
+               [{:child/authorized? true}]))
+
+           (pco/resolver 'auth-parent
+             {:pathim.connect.operation/input  [:parent/id]
+              :pathim.connect.operation/batch? true
+              :pathim.connect.operation/output [:parent/authorized?]}
+             (fn [_env _input]
+               [{:parent/authorized? true}]))])
+        {}
+        [{[:child/id 1] [:child/name {:child/toys [:toy/id :toy/name]}]}]
+        {[:child/id 1] {:child/name "Bob", :child/toys [{:toy/id 1, :toy/name "Bobby"}]}}))
+
+    (testing "issue 177"
+      (check-all-runners
+        (pci/register
+          [(pco/resolver
+             {:pathim.connect.operation/op-name 'asami-p3-pers-resolver-diy
+              :pathim.connect.operation/batch?  true
+              :pathim.connect.operation/input   [:person/id]
+              :pathim.connect.operation/output  [:person/x
+                             {:person/addresses [:address/id]}]
+              :pathim.connect.operation/resolve (fn [_ _]
+                              [{:person/id        "ann",
+                                :person/x         1
+                                :person/addresses [{:address/id "a-one", :address/street "First St."}
+                                                   {:address/id "a-two", :address/street "Second St."}]}])})
+           (pco/resolver
+             {:pathim.connect.operation/op-name 'asami-p3-addr-resolver-diy
+              :pathim.connect.operation/batch?  true
+              :pathim.connect.operation/input   [:address/id]
+              :pathim.connect.operation/output  [:address/street]
+              :pathim.connect.operation/resolve (fn [_ _]
+                              [{:address/id "a-one", :address/street "First St."}
+                               {:address/id "a-two", :address/street "Second St."}])})])
+        {}
+        [{[:person/id "aann"] [:person/x {:person/addresses [:address/street]}]}]
+        {[:person/id "aann"] {:person/x         1,
+                              :person/addresses [{:address/street "First St."}
+                                                 {:address/street "Second St."}]}}))))
+
+(deftest run-graph!batch-optional
+  (testing "bug #107"
+    (check-all-runners
+      (pci/register
+        [(pco/resolver 'timezone-batch-resolver
+           {:pathim.connect.operation/input  [:timezone/id]
+            :pathim.connect.operation/output [:timezone/label]
+            :pathim.connect.operation/batch? true}
+           (fn [_ items]
+             (mapv (fn [{:keys [timezone/id]}]
+                     {:timezone/label (str id " label")})
+               items)))
+
+         (pco/resolver 'item-checks
+           {:pathim.connect.operation/input  [{(pco/? :item/timezone) [:timezone/id :timezone/label]}]
+            :pathim.connect.operation/output [:item/checks]}
+           (fn [_ item] {:item/checks item}))])
+      {:item/timezone {:timezone/id "UTC"}}
+      [:item/checks]
+      {:item/timezone {:timezone/id "UTC", :timezone/label "UTC label"}
+       :item/checks   {:item/timezone {:timezone/id "UTC", :timezone/label "UTC label"}}})))
+
+(deftest run-graph!-dynamic-resolvers-test
+  (testing "dynamic resolver"
+    (is (graph-response?
+          (pci/register
+            [(pco/resolver 'dynamic
+               {:pathim.connect.operation/dynamic-resolver? true
+                :pathim.connect.operation/cache?            false}
+               (fn [_ {:pathim.connect.runner/keys [node-resolver-input]
+                       :pathim.connect.planner/keys [foreign-ast]}]
+                 {:b foreign-ast
+                  :c node-resolver-input}))
+             (pco/resolver 'dyn-entry
+               {:pathim.connect.operation/input        [:a]
+                :pathim.connect.operation/output       [:b]
+                :pathim.connect.operation/dynamic-name 'dynamic})
+             (pco/resolver 'dyn-entry2
+               {:pathim.connect.operation/input        [:a]
+                :pathim.connect.operation/output       [:c]
+                :pathim.connect.operation/dynamic-name 'dynamic})])
+          {:a 1}
+          [:b :c]
+          {:a 1,
+           :b {:type     :root,
+               :children [{:type :prop, :dispatch-key :b, :key :b}
+                          {:type :prop, :dispatch-key :c, :key :c}]},
+           :c {:a 1}}))))
+
+(deftest run-graph!-dynamic-mutation-test
+  (testing "dynamic resolver"
+    (is (graph-response?
+          (pci/register
+            [(pco/resolver 'dynamic
+               {:pathim.connect.operation/dynamic-resolver? true
+                :pathim.connect.operation/cache?            false}
+               (fn [_ input]
+                 {'dyn-mutation input}))
+             (pco/mutation 'dyn-mutation
+               {:pathim.connect.operation/dynamic-name 'dynamic})])
+          {}
+          [(list 'dyn-mutation {:foo "bar"})]
+          '{dyn-mutation {:pathim.connect.planner/foreign-ast
+                          {:type     :root,
+                           :children [{:dispatch-key dyn-mutation,
+                                       :key          dyn-mutation,
+                                       :params       {:foo "bar"},
+                                       :type         :call}]}}}))))
+
+(deftest run-graph!-batch-dynamic-resolvers-test
+  (testing "dynamic resolver batching"
+    (is (graph-response?
+          (pci/register
+            [(pco/resolver 'dynamic
+               {:pathim.connect.operation/dynamic-resolver? true
+                :pathim.connect.operation/batch?            true
+                :pathim.connect.operation/cache?            false}
+               (fn [_ inputs]
+                 (mapv
+                   (fn [{:pathim.connect.runner/keys [node-resolver-input]
+                         :pathim.connect.planner/keys [foreign-ast]}]
+                     {:b foreign-ast
+                      :c node-resolver-input})
+                   inputs)))
+             (pco/resolver 'dyn-entry
+               {:pathim.connect.operation/input        [:a]
+                :pathim.connect.operation/output       [:b]
+                :pathim.connect.operation/dynamic-name 'dynamic})
+             (pco/resolver 'dyn-entry2
+               {:pathim.connect.operation/input        [:a]
+                :pathim.connect.operation/output       [:c]
+                :pathim.connect.operation/dynamic-name 'dynamic})])
+          {:list
+           [{:a 1}
+            {:a 2
+             :c 10}
+            {:a 3}]}
+          [{:list [:b :c]}]
+          {:list [{:a 1,
+                   :b {:type     :root,
+                       :children [{:type :prop, :dispatch-key :b, :key :b}
+                                  {:type :prop, :dispatch-key :c, :key :c}]},
+                   :c {:a 1}}
+                  {:a 2,
+                   :c 10,
+                   :b {:type :root, :children [{:type :prop, :dispatch-key :b, :key :b}]}}
+                  {:a 3,
+                   :b {:type     :root,
+                       :children [{:type :prop, :dispatch-key :b, :key :b}
+                                  {:type :prop, :dispatch-key :c, :key :c}]},
+                   :c {:a 3}}]}))))
+
+(deftest run-graph!-run-stats
+  (is (graph-response?
+        (pci/register
+          [(pco/resolver 'a {:pathim.connect.operation/output [:a]} (fn [_ _] {:a 1}))
+           (pco/resolver 'b {:pathim.connect.operation/output [:b]
+                             :pathim.connect.operation/input  [:a]} (fn [_ _] {:b 2}))])
+        {}
+        [:b]
+        (fn [res]
+          (let [stats (-> res meta :pathim.connect.runner/run-stats)]
+            (and (= (-> (get-in stats [:pathim.connect.runner/node-run-stats 2])
+                        (select-keys [:pathim.connect.runner/node-resolver-input
+                                      :pathim.connect.runner/node-resolver-output]))
+                    {:pathim.connect.runner/node-resolver-input  {}
+                     :pathim.connect.runner/node-resolver-output {:a 1}})
+                 (= (-> (get-in stats [:pathim.connect.runner/node-run-stats 1])
+                        (select-keys [:pathim.connect.runner/node-resolver-input
+                                      :pathim.connect.runner/node-resolver-output]))
+                    {:pathim.connect.runner/node-resolver-input  {:a 1}
+                     :pathim.connect.runner/node-resolver-output {:b 2}}))))))
+
+  (is (graph-response?
+        (pci/register
+          {:pathim.connect.runner/omit-run-stats-resolver-io? true}
+          [(pco/resolver 'a {:pathim.connect.operation/output [:a]} (fn [_ _] {:a 1}))
+           (pco/resolver 'b {:pathim.connect.operation/output [:b]
+                             :pathim.connect.operation/input  [:a]} (fn [_ _] {:b 2}))])
+        {}
+        [:b]
+        (fn [res]
+          (let [stats (-> res meta :pathim.connect.runner/run-stats)]
+            (and (= (-> (get-in stats [:pathim.connect.runner/node-run-stats 2])
+                        (select-keys [:pathim.connect.runner/node-resolver-input-shape
+                                      :pathim.connect.runner/node-resolver-output-shape]))
+                    {:pathim.connect.runner/node-resolver-input-shape  {}
+                     :pathim.connect.runner/node-resolver-output-shape {:a {}}})
+                 (= (-> (get-in stats [:pathim.connect.runner/node-run-stats 1])
+                        (select-keys [:pathim.connect.runner/node-resolver-input-shape
+                                      :pathim.connect.runner/node-resolver-output-shape]))
+                    {:pathim.connect.runner/node-resolver-input-shape  {:a {}}
+                     :pathim.connect.runner/node-resolver-output-shape {:b {}}}))))))
+
+  (testing "error"
+    (is (graph-response?
+          (pci/register
+            {:pathim.error/lenient-mode? true}
+            [(pco/resolver 'a {:pathim.connect.operation/output [:x]}
+               (fn [_ _] (raise! (ex-info "Err" {}))))])
+          {}
+          [:x]
+          #(mcs/match?
+             {:pathim.connect.runner/node-run-stats {1 {:pathim.connect.runner/node-error             any?
+                                       :pathim.connect.runner/node-resolver-input    map?
+                                       :pathim.connect.runner/node-resolver-output   any?
+                                       :pathim.connect.runner/node-run-finish-ms     number?
+                                       :pathim.connect.runner/node-run-start-ms      number?
+                                       :pathim.connect.runner/resolver-run-finish-ms number?
+                                       :pathim.connect.runner/resolver-run-start-ms  number?}}}
+             (-> % meta :pathim.connect.runner/run-stats)))))
+
+  (testing "batch"
+    (is (graph-response?
+          (pci/register
+            [(pco/resolver 'a {:pathim.connect.operation/input  [:id]
+                               :pathim.connect.operation/output [:x]
+                               :pathim.connect.operation/batch? true}
+               (fn [_ items] (mapv #(array-map :x (inc (:id %))) items)))])
+          {:items [{:id 1} {:id 2}]}
+          [{:items [:x]}]
+          #(mcs/match?
+             {:pathim.connect.runner/node-run-stats {1 {:pathim.connect.runner/node-run-start-ms      number?
+                                       :pathim.connect.runner/node-run-finish-ms     number?
+                                       :pathim.connect.runner/resolver-run-start-ms  number?
+                                       :pathim.connect.runner/resolver-run-finish-ms number?
+                                       :pathim.connect.runner/node-resolver-output   any?
+                                       :pathim.connect.runner/node-resolver-input    map?
+                                       :pathim.connect.runner/batch-run-start-ms     number?
+                                       :pathim.connect.runner/batch-run-finish-ms    number?}}}
+             (-> % :items first meta :pathim.connect.runner/run-stats))))
+
+    (is (graph-response?
+          (pci/register
+            {:pathim.connect.runner/omit-run-stats-resolver-io? true}
+            [(pco/resolver 'a {:pathim.connect.operation/input  [:id]
+                               :pathim.connect.operation/output [:x]
+                               :pathim.connect.operation/batch? true}
+               (fn [_ items] (mapv #(array-map :x (inc (:id %))) items)))])
+          {:items [{:id 1} {:id 2}]}
+          [{:items [:x]}]
+          #(mcs/match?
+             {:pathim.connect.runner/node-run-stats {1 {:pathim.connect.runner/node-run-start-ms          number?
+                                       :pathim.connect.runner/node-run-finish-ms         number?
+                                       :pathim.connect.runner/resolver-run-start-ms      number?
+                                       :pathim.connect.runner/resolver-run-finish-ms     number?
+                                       :pathim.connect.runner/node-resolver-output       m/absent
+                                       :pathim.connect.runner/node-resolver-input        m/absent
+                                       :pathim.connect.runner/node-resolver-output-shape any?
+                                       :pathim.connect.runner/node-resolver-input-shape  map?
+                                       :pathim.connect.runner/batch-run-start-ms         number?
+                                       :pathim.connect.runner/batch-run-finish-ms        number?}}}
+             (-> % :items first meta :pathim.connect.runner/run-stats)))))
+
+  (testing "mutations"
+    (is (graph-response?
+          (pci/register
+            [(pco/mutation 'call {}
+               (fn [_ {:keys [this]}] {:result this}))])
+          {}
+          ['(call {})]
+          #(mcs/match?
+             {:pathim.connect.runner/node-run-stats {'call (match-keys? [:pathim.connect.runner/mutation-run-start-ms
+                                                        :pathim.connect.runner/mutation-run-finish-ms
+                                                        :pathim.connect.runner/node-run-start-ms
+                                                        :pathim.connect.runner/node-run-finish-ms])}}
+             (-> % meta :pathim.connect.runner/run-stats))))))
+
+(deftest run-graph!-params-test
+  (is (graph-response?
+        (pci/register todos-resolver)
+        {}
+        [:pathim.connect.runner-test/todos]
+        {:pathim.connect.runner-test/todos [{:pathim.connect.runner-test/todo-message "Write demo on params"
+                   :pathim.connect.runner-test/todo-done?   true}
+                  {:pathim.connect.runner-test/todo-message "Pathom in Rust"
+                   :pathim.connect.runner-test/todo-done?   false}]}))
+
+  (is (graph-response?
+        (pci/register todos-resolver)
+        {}
+        '[(:pathim.connect.runner-test/todos {:pathim.connect.runner-test/todo-done? true})]
+        {:pathim.connect.runner-test/todos [{:pathim.connect.runner-test/todo-message "Write demo on params"
+                   :pathim.connect.runner-test/todo-done?   true}]})))
+
+(deftest run-graph!-cache-test
+  (testing "store result in cache"
+    (let [cache* (atom {})]
+      (is (graph-response?
+            (-> (pci/register
+                  [(pbir/constantly-resolver :x 10)
+                   (pbir/single-attr-resolver :x :y #(* 2 %))])
+                (assoc :pathim.connect.runner/resolver-cache* cache*))
+            {}
+            [:y]
+            {:x 10
+             :y 20}))
+      (is (= @cache*
+             '{[-unqualified/x->y--attr-transform {:x 10} {}] {:y 20}})))
+
+    (testing "with params"
+      (let [cache* (atom {})]
+        (is (graph-response?
+              (-> (pci/register
+                    [(pbir/constantly-resolver :x 10)
+                     (pbir/single-attr-resolver :x :y #(* 2 %))])
+                  (assoc :pathim.connect.runner/resolver-cache* cache*))
+              {}
+              ['(:y {:foo "bar"})]
+              {:x 10
+               :y 20}))
+        (is (= @cache*
+               '{[-unqualified/x->y--attr-transform {:x 10} {:foo "bar"}] {:y 20}}))))
+
+    (testing "custom cache store"
+      (let [cache*    (atom {})
+            my-cache* (atom {})]
+        (is (graph-response?
+              (-> (pci/register
+                    [(pbir/constantly-resolver :x 10)
+                     (-> (pbir/single-attr-resolver :x :y #(* 2 %))
+                         (pco/update-config assoc :pathim.connect.operation/cache-store :pathim.connect.runner-test/my-cache))])
+                  (assoc :pathim.connect.runner/resolver-cache* cache*)
+                  (assoc :pathim.connect.runner-test/my-cache my-cache*))
+              {}
+              [:y]
+              {:x 10
+               :y 20}))
+        (is (= @cache*
+               '{}))
+        (is (= @my-cache*
+               '{[-unqualified/x->y--attr-transform {:x 10} {}] {:y 20}}))))
+
+    (testing "custom cache key"
+      (let [cache* (atom {1 {:v 100}})]
+        (is (graph-response?
+              (pci/register
+                {:pathim.connect.runner/resolver-cache* cache*}
+                [(-> (pbir/single-attr-resolver :id :v #(* 10 %))
+                     (pco/update-config assoc :pathim.connect.operation/cache-key
+                                        (fn [_ {:keys [id]}] id)))])
+              {:items [{:id 1}
+                       {:id 2}]}
+              [{:items [:v]}]
+              {:items [{:id 1 :v 100}
+                       {:id 2 :v 20}]}))
+        (is (= @cache*
+               '{1 {:v 100}
+                 2 {:v 20}})))))
+
+  (testing "cache hit"
+    (is (graph-response?
+          (-> (pci/register
+                [(pbir/constantly-resolver :x 10)
+                 (pbir/single-attr-resolver :x :y #(* 2 %))])
+              (assoc :pathim.connect.runner/resolver-cache* (atom {'[-unqualified/x->y--attr-transform {:x 10} {}] {:y 30}})))
+          {}
+          [:y]
+          {:x 10
+           :y 30})))
+
+  (testing "cache don't hit with different params"
+    (let [cache* (atom {'[-unqualified/x->y--attr-transform {:x 10} {}] {:y 30}})]
+      (is (graph-response?
+            (-> (pci/register
+                  [(pbir/constantly-resolver :x 10)
+                   (pbir/single-attr-resolver :x :y #(* 2 %))])
+                (assoc :pathim.connect.runner/resolver-cache* cache*))
+            {}
+            ['(:y {:z 42})]
+            {:x 10
+             :y 20}))
+
+      (is (= @cache*
+             {'[-unqualified/x->y--attr-transform {:x 10} {}]      {:y 30}
+              '[-unqualified/x->y--attr-transform {:x 10} {:z 42}] {:y 20}}))))
+
+  (testing "resolver with cache disabled"
+    (is (graph-response?
+          (-> (pci/register
+                [(pbir/constantly-resolver :x 10)
+                 (assoc-in (pbir/single-attr-resolver :x :y #(* 2 %))
+                   [:config :pathim.connect.operation/cache?] false)])
+              (assoc :pathim.connect.runner/resolver-cache* (atom {'[x->y-single-attr-transform {:x 10}] {:y 30}})))
+          {}
+          [:y]
+          {:x 10
+           :y 20}))))
+
+(deftest run-graph!-placeholders-test
+  (check-all-runners
+    (pci/register (pbir/constantly-resolver :foo "bar"))
+    {}
+    [{:>/path [:foo]}]
+    {:>/path {:foo "bar"}})
+
+  (check-all-runners (pci/register (pbir/constantly-resolver :foo "bar"))
+    {:foo "baz"}
+    [{:>/path [:foo]}]
+    {:foo    "baz"
+     :>/path {:foo "baz"}})
+
+  (testing "keep split when placeholder uses different parameters"
+    (check-all-runners
+      (pci/register
+        (pco/resolver 'param-dep-resolver
+          {:pathim.connect.operation/output [:x]}
+          (fn [env _]
+            {:x (str "foo - " (:foo (pco/params env)))})))
+      {}
+      ['(:x {:foo 1})
+       {:>/b ['(:x {:foo 2})]}]
+      {:x "foo - 1", :>/b {:x "foo - 2"}})
+
+    (check-all-runners
+      (pci/register
+        (pco/resolver 'param-dep-resolver
+          {:pathim.connect.operation/output [:x]}
+          (fn [env _]
+            {:x (str "foo - " (:foo (pco/params env)))})))
+      {}
+      [{:>/a ['(:x {:foo 1})]}
+       {:>/b ['(:x {:foo 2})]}]
+      {:>/a {:x "foo - 1"}, :>/b {:x "foo - 2"}}))
+
+  (testing "with batch"
+    (check-all-runners
+      (pci/register
+        [(pco/resolver 'batch
+           {:pathim.connect.operation/batch? true
+            :pathim.connect.operation/input  [:x]
+            :pathim.connect.operation/output [:y]}
+           (fn [_ xs]
+             (mapv #(array-map :y (inc (:x %))) xs)))])
+      {:x 10}
+      '[:y
+        {:>/go [:y]}]
+      {:x    10
+       :y    11
+       :>/go {:x 10
+              :y 11}}))
+
+  (testing "placeholder-data-params"
+    (check-all-runners
+      (-> (pci/register
+            [(pbir/single-attr-resolver :x :y #(* 2 %))])
+          (p.plugin/register (pbip/placeholder-data-params)))
+      {}
+      '[{(:>/path {:x 20}) [:y]}]
+      {:>/path {:x 20
+                :y 40}})
+
+    (check-all-runners
+      (-> (pci/register
+            [(pbir/constantly-resolver :x 10)
+             (pbir/single-attr-resolver :x :y #(* 2 %))])
+          (p.plugin/register (pbip/placeholder-data-params)))
+      {}
+      '[{(:>/path {:x 20}) [:y]}]
+      {:>/path {:x 20
+                :y 40}})
+
+    (check-all-runners
+      (-> (pci/register
+            [(pbir/constantly-resolver :x 10)
+             (pbir/single-attr-resolver :x :y #(* 2 %))])
+          (p.plugin/register (pbip/placeholder-data-params)))
+      {}
+      '[:x
+        {(:>/path {:x 20}) [:y]}]
+      {:>/path {:x 20
+                :y 40}})
+
+    (testing "different parameters"
+      (check-all-runners
+        (-> (pci/register
+              [(pbir/constantly-resolver :x 10)
+               (pbir/single-attr-with-env-resolver :x :y #(* (:m (pco/params %) 2) %2))])
+            (p.plugin/register (pbip/placeholder-data-params)))
+        {}
+        '[:x
+          {:>/m2 [(:y)]}
+          {:>/m3 [(:y {:m 3})]}
+          {:>/m4 [(:y {:m 4})]}]
+        {:x    10
+         :y    20
+         :>/m2 {:x 10
+                :y 20}
+         :>/m3 {:x 10
+                :y 30}
+         :>/m4 {:x 10
+                :y 40}}))))
+
+(deftest run-graph!-recursive-test
+  (testing "unbounded recursive query"
+    (is (graph-response?
+          (pci/register
+            [(pbir/static-table-resolver :name
+                                         {"a" {:children [{:name "b"}
+                                                          {:name "c"}]}
+                                          "b" {:children [{:name "e"}]}
+                                          "e" {:children [{:name "f"}]}
+                                          "f" {:children [{:name "g"}]}
+                                          "c" {:children [{:name "d"}]}})])
+          {:name "a"}
+          [:name
+           {:children '...}]
+          {:name     "a",
+           :children [{:name     "b",
+                       :children [{:name "e", :children [{:name "f", :children [{:name "g"}]}]}]}
+                      {:name "c", :children [{:name "d"}]}]})))
+
+  (testing "bounded recursive query"
+    (is (graph-response?
+          (pci/register
+            [(pbir/static-table-resolver :name
+                                         {"a" {:children [{:name "b"}
+                                                          {:name "c"}]}
+                                          "b" {:children [{:name "e"}]}
+                                          "e" {:children [{:name "f"}]}
+                                          "f" {:children [{:name "g"}]}
+                                          "c" {:children [{:name "d"}]}})])
+          {:name "a"}
+          [:name
+           {:children 2}]
+          {:name     "a",
+           :children [{:name "b", :children [{:name "e", :children [{:name "f"}]}]}
+                      {:name "c", :children [{:name "d"}]}]}))
+
+    (is (graph-response?
+          (pci/register
+            [(pbir/static-table-resolver :name
+                                         {"a" {:children [{:name "b"}
+                                                          {:name "c"}]}
+                                          "b" {:children [{:name "e"}]}
+                                          "e" {:children [{:name "f"}]}
+                                          "f" {:children [{:name "g"}]}
+                                          "c" {:children [{:name "d"}]}})
+             (pbir/single-attr-resolver :name :name+ #(str % "+"))])
+          {:name "a"}
+          [:name+
+           {:children 1}]
+          {:name     "a",
+           :name+    "a+",
+           :children [{:name "b", :name+ "b+", :children [{:name "e"}]}
+                      {:name "c", :name+ "c+", :children [{:name "d"}]}]})))
+
+  (testing "recursion over known data"
+    (is (graph-response?
+          (pci/register
+            [(pbir/single-attr-resolver :name :name+ #(str % "+"))])
+          {:name     "a",
+           :children [{:name     "b",
+                       :children [{:name "e"}]}
+                      {:name "c"}]}
+          [:name+
+           {:children '...}]
+          {:name     "a"
+           :name+    "a+"
+           :children [{:name     "b"
+                       :name+    "b+"
+                       :children [{:name  "e"
+                                   :name+ "e+"}]}
+                      {:name  "c"
+                       :name+ "c+"}]})))
+
+  (testing "recursive nested input"
+    (check-all-runners
+      (pci/register
+        {:pathim.error/lenient-mode? true}
+        [(pco/resolver 'nested-input-recursive
+           {:pathim.connect.operation/input  [:name {:children '...}]
+            :pathim.connect.operation/output [:names]}
+           (fn [_ input]
+             {:names
+              (mapv :name (tree-seq :children :children input))}))
+         (pbir/static-table-resolver :name
+                                     {"a" {:children [{:name "b"}
+                                                      {:name "c"}]}
+                                      "b" {:children [{:name "e"}]}
+                                      "e" {:children [{:name "f"}]}
+                                      "f" {:children [{:name "g"}]}
+                                      "c" {:children [{:name "d"}]}})])
+      {:name "a"}
+      [:names]
+      {:name "a",
+       :children [{:name "b",
+                   :children [{:name "e",
+                               :children [{:name "f",
+                                           :children [{:name "g",
+                                                       :pathim.connect.runner/attribute-errors {:names {:pathim.error/cause :pathim.error/node-errors,
+                                                                                                                     :pathim.error/node-error-details {1 {:pathim.error/cause :pathim.error/attribute-missing}}},
+                                                                                                             :children {:pathim.error/cause :pathim.error/node-errors,
+                                                                                                                        :pathim.error/node-error-details {2 {:pathim.error/cause :pathim.error/attribute-missing}}}}}],
+                                           :names ["f" "g"]}],
+                               :names ["e" "f" "g"]}],
+                   :names ["b" "e" "f" "g"]}
+                  {:name "c",
+                   :children [{:name "d",
+                               :pathim.connect.runner/attribute-errors {:names {:pathim.error/cause :pathim.error/node-errors,
+                                                                                             :pathim.error/node-error-details {1 {:pathim.error/cause :pathim.error/attribute-missing}}},
+                                                                                     :children {:pathim.error/cause :pathim.error/node-errors,
+                                                                                                :pathim.error/node-error-details {2 {:pathim.error/cause :pathim.error/attribute-missing}}}}}],
+                   :names ["c" "d"]}],
+       :names ["a" "b" "e" "f" "g" "c" "d"]})))
+
+(deftest run-graph!-mutations-test
+  (testing "simple call"
+    (is (graph-response? (pci/register (pco/mutation 'call {}
+                                         (fn [_ {:keys [this]}] {:result this})))
+          {}
+          '[(call {:this "thing"})]
+          '{call {:result "thing"}})))
+
+  (testing "mutation join"
+    (is (graph-response?
+          (pci/register
+            [(pbir/alias-resolver :result :other)
+             (pco/mutation 'call {}
+               (fn [_ {:keys [this]}] {:result this}))])
+          {}
+          '[{(call {:this "thing"}) [:other]}]
+          '{call {:result "thing"
+                  :other  "thing"}})))
+
+  (testing "mutation error"
+    (let [err (ex-info "Error" {})]
+      (is (graph-response?
+            (pci/register
+              {:pathim.error/lenient-mode? true}
+              [(pbir/alias-resolver :result :other)
+               (pco/mutation 'call {}
+                 (fn [_ _] (raise! err)))])
+            {}
+            '[{(call {:this "thing"}) [:other]}]
+            {'call {:pathim.connect.runner/mutation-error err}}))))
+
+  (testing "wrap-mutation"
+    (check-all-runners
+      (-> {:pathim.error/lenient-mode? true}
+          (pci/register
+            [(pco/mutation 'foo2
+               {}
+               (fn [_env _params]
+                 (raise! (ex-info "Err" {}))))])
+          (p.plugin/register
+            {:pathim.plugin/id 'err
+             :pathim.connect.runner/wrap-mutate
+             (fn [mutate]
+               (fn [env params]
+                 (try
+                   (mutate env params)
+                   (catch Throwable err
+                     {:pathim.connect.runner/mutation-error (ex-message err)}))))}))
+      {}
+      '[(foo {})
+        (foo2 {})]
+      '{foo  {:pathim.connect.runner/mutation-error "Mutation foo not found"},
+        foo2 {:pathim.connect.runner/mutation-error "Err"}}))
+
+  (testing "mutation not found"
+    (is (graph-response?
+          (pci/register
+            {:pathim.error/lenient-mode? true}
+            [(pbir/alias-resolver :result :other)])
+          {}
+          '[(not-here {:this "thing"})]
+          (fn [res]
+            (mcs/match?
+              {'not-here {:pathim.connect.runner/mutation-error (fn [e]
+                                                 (and (= "Mutation not-here not found"
+                                                         (ex-message e))
+                                                      (= {:pathim.connect.operation/op-name 'not-here}
+                                                         (ex-data e))))}}
+              res)))))
+
+  (testing "mutations run before anything else"
+    (is (graph-response?
+          (-> (pci/register
+                [(pbir/constantly-fn-resolver :pathim.connect.runner-test/env-var (comp deref :pathim.connect.runner-test/env-var))
+                 (pco/mutation 'call {} (fn [{:pathim.connect.runner-test/keys [env-var]} _] (swap! env-var inc)))])
+              (assoc :pathim.connect.runner-test/env-var (atom 0)))
+          {}
+          '[:pathim.connect.runner-test/env-var
+            (call)]
+          #(= (:pathim.connect.runner-test/env-var %) (get % 'call)))))
+
+  (testing "multiple calls for the same mutation"
+    (let [acc (atom [])]
+      (check-all-runners
+        (-> (pci/register
+              (pco/mutation 'doit
+                {:pathim.connect.operation/output [:res]
+                 :pathim.connect.operation/params [:in]}
+                (fn [{:keys [acc]} {:keys [in]}]
+                  (swap! acc conj in)
+                  {:res in :acc @acc})))
+            (assoc :acc acc))
+        {}
+        '[(doit {:in 1}) (doit {:in 2})]
+        (fn [res]
+          (reset! acc [])
+          (= res '{doit {:res 2 :acc [1 2]}}))))))
+
+(deftest run-graph!-wrap-resolve-test
+  (testing "extending resolver execution"
+    (is (graph-response?
+          (-> (pci/register (pbir/constantly-resolver :foo "bar"))
+              (p.plugin/register {:pathim.plugin/id      'wrap
+                                  :pathim.connect.runner/wrap-resolve (fn [resolve]
+                                                       (fn [env input]
+                                                         (resolve env input)))}))
+          {}
+          [:foo]
+          {:foo "bar"}))))
+
+(deftest run-graph!-wrap-process-sequence-item-test
+  (testing "filter out error items"
+    (is (graph-response?
+          (-> (pci/register
+                [(pbir/global-data-resolver {:items [{:x "a"}
+                                                     {:x "b"
+                                                      :y "y"}
+                                                     {:y "xx"}
+                                                     {:x "c"
+                                                      :y "y2"}]})])
+              (p.plugin/register (pbip/filtered-sequence-items-plugin)))
+          {}
+          [^:pathim.connect.built-in.plugins/remove-error-items {:items [:x :y]}]
+          {:items [{:x "b", :y "y"} {:x "c", :y "y2"}]}))))
+
+(deftest run-graph!-user-reports
+  (testing "issue 136"
+    (check-all-runners
+      (pci/register [(pco/resolver 'get-comment
+                       {:pathim.connect.operation/output [{:comment/author [:user/id]}]}
+                       (fn [_ _]
+                         {:comment/author {:user/id "user-id"}}))
+
+                     (pbir/equivalence-resolver :comment/author :user)
+
+                     (pco/resolver 'user-resolver
+                       {:pathim.connect.operation/input  [:user/id]
+                        :pathim.connect.operation/output [:user/avatar-filename]}
+                       (fn
+                         [_ _]
+                         {:user/avatar-filename "avatar-filename"}))
+
+                     (pco/resolver 'avatar
+                       {:pathim.connect.operation/input  [{:user [:user/avatar-filename]}]
+                        :pathim.connect.operation/output [:user/avatar]}
+                       (fn
+                         [_ {:keys [user]}]
+                         {:user/avatar user}))
+
+                     (pco/resolver 'user-object-resolver
+                       {:pathim.connect.operation/output [{:user [:user/id]}]}
+                       (fn
+                         [_ _]
+                         {:user {:user/id "user-id"}}))])
+      {}
+      [{:user [:user/avatar]}]
+      {:user {:user/avatar {:user/avatar-filename "avatar-filename"}}})
+
+    (testing "issue 152"
+      (check-all-runners
+        (pci/register
+          [(-> (pbir/global-data-resolver {:simple     1
+                                           :dual-opt   1
+                                           :blank-nest nil})
+               (update 0 pco/update-config assoc :pathim.connect.operation/op-name 'global-data))
+           (pbir/single-attr-resolver :simple :pathway (fn [_] (raise! (ex-info "Don't reach me" {}))))
+           (pbir/alias-resolver :pathway :dual-opt)])
+        {}
+        [{:blank-nest [:simple]} :dual-opt]
+        {:blank-nest nil, :dual-opt 1}))
+
+    (testing "issue idents on 2022-08-26"
+      (check-all-runners
+        {}
+        {}
+        [{[:a 42]
+          [:a
+           {[:x 99] [:x]}]}]
+        {[:a 42] {:a 42, [:x 99] {:x 99}}}))))
+
+(deftest run-graph!-wrap-merge-attribute
+  (testing "modify result"
+    (check-all-runners
+      (-> (pci/register [(pbir/constantly-resolver :x 1)])
+          (p.plugin/register
+            {:pathim.plugin/id 'x-env
+             :pathim.connect.runner/wrap-merge-attribute
+             (fn [merge-attr]
+               (fn [env m k _v]
+                 (merge-attr env m k "mudei")))}))
+      {}
+      [:x]
+      {:x "mudei"}))
+
+  (testing "modify env"
+    (check-all-runners
+      (-> (pci/register [(pbir/constantly-fn-resolver :x :x)])
+          (p.plugin/register
+            {:pathim.plugin/id 'x-env
+             :pathim.connect.runner/wrap-merge-attribute
+             (fn [merge-attr]
+               (fn [env m k v]
+                 (if-let [x (-> env :pathim.connect.planner/graph (pcp/entry-ast k) :params :xx)]
+                   (merge-attr (assoc env :x x) m k v)
+                   (merge-attr env m k v))))}))
+      {}
+      [{'(:>/foo {:xx 42}) [:x]}]
+      {:>/foo {:x 42}}))
+
+  (testing "works on idents"
+    (check-all-runners
+      (-> (pci/register [(pbir/constantly-resolver :x 1)])
+          (p.plugin/register
+            {:pathim.plugin/id 'x-env
+             :pathim.connect.runner/wrap-merge-attribute
+             (fn [merge-attr]
+               (fn [env m k _v]
+                 (merge-attr env m k "mudei")))}))
+      {}
+      [{[:a 1] [:x]}]
+      {[:a 1] "mudei"})))
+
+(deftest run-graph!-list-input-order
+  (check-all-runners
+    (pci/register
+      (pco/resolver
+        'reverse-inputs
+        {:pathim.connect.operation/input  [{:a [:b]}]
+         :pathim.connect.operation/output [:input]}
+        (fn [_ input] {:input input})))
+    {:a (list {:b 1} {:b 2})}
+    [:input]
+    {:input {:a [{:b 1} {:b 2}]}}))
+
+(deftest run-graph!-async-tests
+     (testing "async env"
+       (is (= (p/await! (run-graph-async
+                 (p/promise (pci/register [(pbir/constantly-resolver :x 10)]))
+                 {}
+                 [:x]))
+              {:x 10}))))
+
+(deftest placeholder-merge-entity-test
+  (testing "forwards source entity data down"
+    (is (= (pcr/placeholder-merge-entity
+             {:pathim.connect.planner/graph          {:pathim.connect.planner/nodes        {}
+                                    :pathim.connect.planner/placeholders #{:>/p1}
+                                    :pathim.connect.planner/index-ast    {:>/p1 {:key          :>/p1
+                                                               :dispatch-key :>/p1
+                                                               :params       {:x 10}
+                                                               :pathim.connect.planner/placeholder-use-source-entity? true}}}
+              :pathim.entity-tree/entity-tree* (volatile! {:x 20 :y 40 :z true})
+              :pathim.connect.runner/source-entity  {:z true}})
+           {:>/p1 {:z true}})))
+
+  (testing "forwards data down to placeholders on fast merge"
+    (is (= (pcr/placeholder-merge-entity
+             {:pathim.connect.planner/graph          {:pathim.connect.planner/nodes        {}
+                                    :pathim.connect.planner/placeholders #{:>/p1}
+                                    :pathim.connect.planner/index-ast    {:>/p1 {:key          :>/p1
+                                                               :dispatch-key :>/p1
+                                                               :params       {:x 10}}}}
+              :pathim.entity-tree/entity-tree* (volatile! {:x 20 :y 40 :z true})
+              :pathim.connect.runner/source-entity  {:z true}})
+           {:>/p1 {:x 20, :y 40, :z true}}))))
+
+(defn set-done [k]
+  (fn [process]
+    (fn [env ast-or-graph entity-tree*]
+      (clet [res (process env ast-or-graph entity-tree*)]
+        (assoc res k true)))))
+
+(deftest plugin-extensions-tests
+  (testing "wrap graph execution"
+    (is (graph-response? (p.plugin/register
+                           [{:pathim.plugin/id         'wrap
+                             :pathim.connect.runner/wrap-run-graph! (set-done :done?)}])
+          {:foo {:bar "baz"}}
+          [{:foo [:bar]}]
+          {:foo {:bar "baz", :done? true}, :done? true})))
+
+  (testing "wrap graph root execution"
+    (is (graph-response? (p.plugin/register
+                           [{:pathim.plugin/id              'wrap
+                             :pathim.connect.runner/wrap-root-run-graph! (set-done :done?)}])
+          {:foo {:bar "baz"}}
+          [{:foo [:bar]}]
+          {:foo {:bar "baz"}, :done? true})))
+
+  (testing "wrap mutation"
+    (let [err* (atom nil)
+          err  (ex-info "Error" {})]
+      (is (graph-response? (-> (pci/register
+                                 (pco/mutation 'foo {} (fn [_ _] (raise! err))))
+                               (p.plugin/register
+                                 {:pathim.plugin/id
+                                  'log
+
+                                  :pathim.connect.runner/wrap-mutate
+                                  (fn [mutation]
+                                    (fn [env ast]
+                                      (try
+                                        (mutation env ast)
+                                        (catch Throwable e
+                                          (reset! err* e)
+                                          nil))))}))
+            {}
+            ['(foo)]
+            (fn [_]
+              (= @err* err)))))
+
+    (testing "wrapper gets ast"
+      (is (graph-response? (-> (pci/register
+                                 (pco/mutation 'foo {} (fn [_ _] {})))
+                               (p.plugin/register
+                                 {:pathim.plugin/id
+                                  'log
+
+                                  :pathim.connect.runner/wrap-mutate
+                                  (fn [mutation]
+                                    (fn [env ast]
+                                      (assoc (mutation env ast) :k (:key ast))))}))
+            {}
+            ['(foo)]
+            '{foo {:k foo}}))))
+
+  (testing "wrap mutation-error"
+    (let [err* (atom nil)
+          err  (ex-info "Error" {})]
+      (check-all-runners
+        (-> (pci/register
+              (pco/mutation 'foo {} (fn [_ _] (raise! err))))
+            (assoc :pathim.error/lenient-mode? true)
+            (p.plugin/register
+              {:pathim.plugin/id
+               'log
+
+               :pathim.connect.runner/wrap-mutation-error
+               (fn [mutation-error]
+                 (fn [env ast e]
+                   (let [e' (mutation-error env ast e)]
+                     (reset! err* e')
+                     e')))}))
+        {}
+        ['(foo)]
+        (fn [_] (= @err* err))))))
+
+(deftest combine-inputs-with-responses-test
+  (is (= (let [groups    {1 [:a :b]
+                          2 [:c]}
+               inputs    [1 2]
+               responses ["a" "b"]]
+           (pcr/combine-inputs-with-responses groups inputs responses))
+         [[:a "a"] [:b "a"] [:c "b"]])))
+
+(deftest priority-sort-test
+  (let [env   (pci/register [(pco/resolver 'a1 {:pathim.connect.operation/output   [:a]
+                                                :pathim.connect.operation/priority 2} (fn [_ _]))
+                             (pco/resolver 'a2 {:pathim.connect.operation/output [:a]} (fn [_ _]))
+                             (pco/resolver 'a3 {:pathim.connect.operation/output   [:a]
+                                                :pathim.connect.operation/priority 2} (fn [_ _]))
+                             (pco/resolver 'a4 {:pathim.connect.operation/input    [:b]
+                                                :pathim.connect.operation/output   [:a]
+                                                :pathim.connect.operation/priority 1} (fn [_ _]))
+                             (pco/resolver 'b {:pathim.connect.operation/output [:b]} (fn [_ _]))])
+        graph (pcp/compute-run-graph
+                (assoc env :edn-query-language.ast/node (eql/query->ast [:a])))]
+
+    (check
+      (pcr/priority-sort (assoc env :pathim.connect.planner/graph graph)
+                         {:pathim.connect.planner/expects {:a {}},
+                          :pathim.connect.planner/node-id 7,
+                          :pathim.connect.planner/run-or  #{1 6 3 2}}
+                         #{1 6 3 2})
+      => #{3 2})))

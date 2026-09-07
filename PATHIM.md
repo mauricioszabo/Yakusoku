@@ -24,13 +24,44 @@ query.
 
 ## What is here
 
-The synchronous engine, end to end: EQL query/AST conversion, the connect indexes, the
-planner, the sync runner, the EQL interface, plugins, caching, the built-in resolvers
-(`pbir`) and built-in plugins, and `connect/foreign` for dynamic resolvers.
+The engine, end to end: EQL query/AST conversion, the connect indexes, the planner, all
+three runners — sync, async and parallel — the EQL interfaces, plugins, caching, the
+built-in resolvers (`pbir`) and built-in plugins, and `connect/foreign` for dynamic
+resolvers.
 
-Not here: SmartMaps, the async and parallel runners, transit, and `clojure.spec` /
-guardrails — dropped rather than ported, since Pathom uses them for development-time
-checking rather than behaviour.
+Not here: SmartMaps, transit, and `clojure.spec` / guardrails — dropped rather than ported,
+since Pathom uses them for development-time checking rather than behaviour.
+
+### The async and parallel runners
+
+Resolvers may return promises. `pathim.interface.async.eql/process` returns one too, and
+runs the async runner; add `::p.a.eql/parallel? true` to the env for the parallel runner.
+
+```clojure
+(require '[pathim.interface.async.eql :as p.a.eql]
+         '[yakusoku.core :as p])
+
+(pco/defresolver profile [env {:user/keys [id]}]
+  {::pco/input [:user/id] ::pco/output [:user/profile]}
+  (p/delay 50 {:user/profile (str "profile-" id)}))
+
+(p/await! (p.a.eql/process env {:user/id 1} [:user/profile]))
+```
+
+The two runners differ in a way worth knowing before choosing: the **async** runner walks
+the same plan the sync one does, awaiting each node, so a single query is no faster — what
+it buys is not blocking a thread, so many queries can be in flight at once. The **parallel**
+runner overlaps independent branches *within* a query, and batches through a debouncer. The
+benchmark in [examples/](examples/) measures both, on jank and on real Pathom.
+
+Upstream builds the parallel runner's batch debouncer on core.async. jank has none, and
+none is needed: `yakusoku.exec/debouncer` is that loop, built on a restartable Asio timer.
+
+Both runners compile a throwaway query on the calling thread before dispatching anything —
+see the note in `src/pathim/connect/runner/async.jank`. jank compiles a function on its
+first call and its compiler is not reentrant, so without that a query that fans out across
+workers dies inside clang. Programs of any size should also run jank with
+`--eagerness eager`.
 
 ## Differences from upstream, and why
 
@@ -99,6 +130,18 @@ them. All were reproduced against `jank 0.1-noble`.
    substitutes `reverse` for `rseq`.
 9. A two-element vector *is* a map entry, which makes `make-map-entry` trivial.
 
+**Threads**
+
+10. jank's compiler is not reentrant. It compiles a function on its first call, and two
+    threads reaching that compilation at once crash inside clang or LLVM — which is easy to
+    do here, since the async and parallel runners resolve promises on pool workers while the
+    caller carries on. Both runners compile a throwaway query on the calling thread first
+    (`pathim.connect.runner.async/warm-path!`), and anything substantial should run jank with
+    `--eagerness eager`, which compiles at load time and removes the race entirely.
+11. `cpp/box` emits a `_jank_eval_str` per call site, so it re-enters the compiler at
+    runtime and cannot be called from two threads. Yakusoku boxes its native handles in C++
+    instead; see the note in `native/yakusoku.hpp`.
+
 ## Tests
 
 Two suites, and they check different things.
@@ -116,3 +159,10 @@ Requires `bb` on the path.
 
 **The ported suite** is Pathom's own tests: the planner, operation, indexes, format and
 interface suites, adapted only where jank genuinely differs.
+
+There is no oracle for the async and parallel runners: promesa does not load under babashka
+(`defrecord ... found: Supplier`), which is why Pathom itself carries a `:bb` branch. Two
+things stand in for it — upstream's `runner_test`, which asserts that all three runners
+produce the same answer, and the benchmark in [examples/](examples/), which runs the same
+graph through all three runners on jank, Clojure and ClojureScript and checks that every
+runtime agreed before it reports a timing.

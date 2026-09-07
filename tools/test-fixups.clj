@@ -3,7 +3,8 @@
 ;;
 ;; Each exists because jank genuinely differs from Clojure, not for convenience; keeping
 ;; them here means the whole port is reproducible with one command.
-(require '[clojure.string :as str] '[babashka.fs :as fs])
+(require '[clojure.string :as str] '[babashka.fs :as fs]
+         '[rewrite-clj.zip :as z] '[rewrite-clj.node :as n])
 
 (def root (or (first *command-line-args*) "test/pathim"))
 
@@ -36,6 +37,43 @@
     (when (and (re-find #"\(raise!\s" s) (not (str/includes? s "pathim.misc :refer")))
       (spit (str f) (str/replace-first s "(:require\n"
                                        "(:require\n    [pathim.misc :refer [raise!]]\n")))))
+
+(defn await-derefs!
+  "Rewrites @(f ...) into (p/await! (f ...)) for the named fns.
+
+   A string replacement cannot do this: the closing paren has to go after the form the
+   deref covers, so the rewrite has to understand the shape. rewrite-clj does."
+  [rel fns]
+  (let [path (str root "/" rel)]
+    (when (fs/exists? path)
+      (let [before (slurp path)
+            after (loop [l (z/of-string before {:track-position? false})]
+                    (if (z/end? l)
+                      (z/root-string l)
+                      (if (and (= :deref (z/tag l))
+                               (contains? fns (some-> l z/down z/down z/sexpr)))
+                        (let [inner (z/node (z/down l))]
+                          (recur (z/next (z/replace l (n/list-node
+                                                        [(n/token-node 'p/await!)
+                                                         (n/spaces 1)
+                                                         inner])))))
+                        (recur (z/next l)))))]
+        (when (not= before after)
+          (spit path after)
+          (println "  awaited promise derefs in" rel))))))
+
+;; runner_test is the joint suite: it asserts that the sync, async and parallel runners
+;; agree. Two libraries it leans on are stood in for by small compatible subsets here --
+;; check, as the other suites already do, and matcher-combinators, of which it uses four
+;; things. And it derefs the async runners' promises with @, which cannot work: jank has no
+;; deftype, so our promises carry no deref behaviour. p/await! is the same wait.
+(edit! "connect/runner_test.jank"
+  "    [check.core :refer [check =>]]" "    [pathim.test.check :refer [check]]"
+  "    [matcher-combinators.matchers :as m]\n" "    [pathim.test.matchers :as m]\n"
+  "    [matcher-combinators.standalone :as mcs]\n" "    [pathim.test.matchers :as mcs]\n"
+  "    [matcher-combinators.test]\n" "")
+
+(await-derefs! "connect/runner_test.jank" '#{run-graph-async run-graph-parallel})
 
 (edit! "test/helpers.jank"
   "(defmacro catch-exception [& body]
@@ -85,8 +123,9 @@
 ;; SmartMaps are not part of this port, and a resolver is not directly callable here.
 (edit! "connect/built_in/resolvers_test.jank"
   "    [pathim.interface.smart-map :as psm]))" "    ))"
-  "    [pathim.connect.operation :as pco]"
-  "    [pathim.connect.operation :as pco]\n    [pathim.connect.operation.protocols :as pop]"
+  ;; anchored on the smart-map line's replacement above so a re-run cannot add it twice
+  "    [pathim.connect.operation :as pco]\n    ))"
+  "    [pathim.connect.operation :as pco]\n    [pathim.connect.operation.protocols :as pop]\n    ))"
   "(is (= (resolver {} {})" "(is (= (pop/-op-resolve resolver {} {})"
   "\n    (let [sm (psm/smart-map (pci/register resolvers) {:my.system/user-id 4})]
       (is (= (:my.system.user/name sm) \"Anne\")))))"
