@@ -622,6 +622,18 @@
     (warm-up!))
   nil)
 
+(defmacro do!
+  "Alias of `do`. promesa carries both spellings, and code ported from it uses each.
+
+   Written out rather than delegating to `do` so that it can live *before* it: `do` has to
+   remain the last form in this namespace, and a macro cannot expand into one that is not
+   defined yet."
+  [& body]
+  (clojure.core/reduce (fn [acc form]
+                         `(then ~acc (fn [_#] ~form)))
+                       `(resolved nil)
+                       body))
+
 ;; ---------------------------------------------------------------------- do ----
 ;;
 ;; Defined last, deliberately. jank resolves a macro named `do` ahead of the special form,

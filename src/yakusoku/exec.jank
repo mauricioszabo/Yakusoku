@@ -102,6 +102,76 @@
              (::pool (default-pool)))]
      (impl/schedule! p ms f))))
 
+(defn- pool-of
+  "The io_context behind an executor: its own if it is a pool, the default pool's
+   otherwise. Timers need a real event loop, and the inline and thread executors have
+   none."
+  [executor]
+  (if (= :pool (::kind executor))
+    (::pool executor)
+    (::pool (default-pool))))
+
+(defn timer
+  "Creates a restartable timer on a pool.
+
+   Restarting a timer that has a wait outstanding cancels that wait, which is all
+   debouncing is. Timers are permanent -- see native/yakusoku.hpp -- so make one per
+   long-lived thing that needs to debounce, not one per event."
+  ([]
+   (timer (default-pool)))
+  ([executor]
+   (impl/ensure-warm!)
+   (impl/make-timer (pool-of executor))))
+
+(defn restart!
+  "Arms a timer to run a zero-arity function after ms milliseconds, dropping whatever was
+   pending."
+  [t ms f]
+  (impl/restart-timer! t ms f))
+
+(defn cancel-timer!
+  "Cancels a timer's pending wait. Its callback is dropped, not run."
+  [t]
+  (impl/cancel-timer! t))
+
+(defn debouncer
+  "Buffers items and hands them to f in arrival order, as a single vector.
+
+   The buffer is flushed once it has been quiet for window-ms, or -- when a threshold is
+   given -- as soon as it holds that many items. Returns a one-argument function; call it
+   with an item to buffer that item. f always runs on a pool worker, never on the caller.
+
+   This is the shape batching wants: producers push work items in as they discover them,
+   and f sees each burst as one call."
+  ([f window-ms]
+   (debouncer (default-pool) f window-ms nil))
+  ([f window-ms threshold]
+   (debouncer (default-pool) f window-ms threshold))
+  ([executor f window-ms threshold]
+   (let [ex (if (= :pool (::kind executor)) executor (default-pool))
+         t (timer ex)
+         buffer (atom [])
+         ;; One atomic take, so a flush and a concurrent push cannot lose an item between
+         ;; them. A flush that finds nothing simply does nothing.
+         take! (fn [] (first (swap-vals! buffer (fn [_] []))))
+         flush! (fn []
+                  (let [items (take!)]
+                    (when (seq items)
+                      (f items))))]
+     (fn [item]
+       (let [n (count (swap! buffer conj item))]
+         (if (and threshold (>= n threshold))
+           ;; Threshold flush. The items are taken here rather than by a zero-delay timer:
+           ;; a producer faster than the pool would keep restarting that timer and starve
+           ;; the flush it was meant to trigger. f still runs on a worker.
+           (do
+             (cancel-timer! t)
+             (let [items (take!)]
+               (when (seq items)
+                 (exec! ex (fn [] (f items))))))
+           (restart! t window-ms flush!)))
+       nil))))
+
 (defn shutdown!
   "Drains a pool: workers finish queued work and pending timers, then stop. Blocks until
    every worker has exited. A no-op for the inline and thread executors."

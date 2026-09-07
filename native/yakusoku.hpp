@@ -296,6 +296,87 @@ namespace yakusoku
     });
   }
 
+  /* ---------------------------------------------------------------- timers ---- */
+
+  /* A restartable timer, which is all a debouncer is.
+
+     `expires_after` on a timer with a wait outstanding cancels that wait, so
+     asio::steady_timer already *is* a debouncer: every restart pushes the deadline out,
+     and only a quiet window lets the callback through. Nothing here coordinates time by
+     hand.
+
+     Two hazards need handling. A timer may be restarted from any thread while a wait is
+     pending on a pool worker, and asio::steady_timer is not safe for concurrent use, so a
+     mutex guards every touch of it. And cancelling a wait does not unschedule its handler:
+     the handler still runs, usually with operation_aborted, but a wait that was already
+     firing when the restart arrived reports success instead. A generation counter settles
+     that: a handler runs the callback only when no restart has happened since it armed.
+
+     Like pools, timers are allocated uncollectable. A pending handler holds a raw pointer
+     to the timer, and the timer holds the jank callback, which BDWGC must be able to trace
+     -- uncollectable memory is both a root and scanned, which covers both. It also makes
+     timers permanent, which is acceptable here: they are created per batch processor, not
+     per query, so a program holds a handful for its lifetime. */
+  struct timer
+  {
+    std::mutex mutex;
+    asio::steady_timer t;
+    object_ref fn;
+    unsigned long generation{ 0 };
+
+    explicit timer(asio::io_context &ctx)
+      : t{ ctx }
+    {
+    }
+  };
+
+  inline timer *timer_create(pool * const p)
+  {
+    void * const mem{ GC_MALLOC_UNCOLLECTABLE(sizeof(timer)) };
+    return new(mem) timer{ p->ctx };
+  }
+
+  /* Arms the timer to call fn after ms milliseconds, cancelling whatever was pending.
+
+     async_wait is called under the lock along with expires_after, since the two together
+     are what must not interleave with another thread's restart. It does not run the
+     handler inline -- even an already-elapsed deadline posts it to the io_context -- so
+     holding the lock across it cannot deadlock against the handler below. */
+  inline void timer_restart(timer * const tm, long const ms, object_ref const fn)
+  {
+    std::lock_guard<std::mutex> const lock{ tm->mutex };
+    auto const gen{ ++tm->generation };
+    tm->fn = fn;
+    tm->t.expires_after(std::chrono::milliseconds{ ms });
+    tm->t.async_wait([tm, gen](auto const &ec) {
+      if(ec)
+      {
+        return;
+      }
+
+      object_ref fn{};
+      {
+        std::lock_guard<std::mutex> const handler_lock{ tm->mutex };
+        if(tm->generation != gen)
+        {
+          return;
+        }
+        fn = tm->fn;
+      }
+
+      /* Called outside the lock: the callback is free to restart this very timer. */
+      safe_call(fn);
+    });
+  }
+
+  /* Cancels a pending wait. The callback is dropped, not run. */
+  inline void timer_cancel(timer * const tm)
+  {
+    std::lock_guard<std::mutex> const lock{ tm->mutex };
+    ++tm->generation;
+    tm->t.cancel();
+  }
+
   /* Called on jank-created worker threads. A handler that throws something we did not
      anticipate must not silently retire a worker, so we resume the loop. */
   inline void pool_run(pool * const p)

@@ -183,3 +183,102 @@
             (is (= 300 (count result)))))
         (finally
           (exec/shutdown! pool))))))
+
+(deftest timer-test
+  (testing "a timer fires after its delay"
+    (let [pool (exec/pool 2)]
+      (try
+        (let [fired (atom false)]
+          (exec/restart! (exec/timer pool) 30 (fn [] (reset! fired true)))
+          (is (wait-for 3000 (fn [] (deref fired)))))
+        (finally (exec/shutdown-now! pool)))))
+
+  (testing "restarting defers the callback rather than firing twice"
+    (let [pool (exec/pool 2)]
+      (try
+        (let [t (exec/timer pool)
+              runs (atom 0)
+              cb (fn [] (swap! runs inc))]
+          ;; Five rearms inside one window: the first four waits are cancelled.
+          (dotimes [_ 5]
+            (exec/restart! t 60 cb)
+            (cpp/clojure.core_native.sleep 10))
+          (is (wait-for 3000 (fn [] (pos? (deref runs)))))
+          ;; Give any cancelled wait ample time to fire late, if it were going to.
+          (cpp/clojure.core_native.sleep 200)
+          (is (= 1 (deref runs)) "a cancelled wait must not run its callback"))
+        (finally (exec/shutdown-now! pool)))))
+
+  (testing "cancel drops the callback"
+    (let [pool (exec/pool 2)]
+      (try
+        (let [t (exec/timer pool)
+              fired (atom false)]
+          ;; Compile cancel-timer! before it is timed against a deadline. jank compiles a
+          ;; function on its first call, and that compile can take longer than a short
+          ;; delay -- a 40 ms deadline fired legitimately, mid-compile, before the cancel
+          ;; below ever ran. Warming it, and leaving a second of headroom, removes the
+          ;; compiler from the measurement.
+          (exec/cancel-timer! t)
+          (exec/restart! t 1000 (fn [] (reset! fired true)))
+          (exec/cancel-timer! t)
+          (cpp/clojure.core_native.sleep 1400)
+          (is (false? (deref fired))))
+        (finally (exec/shutdown-now! pool))))))
+
+(deftest debouncer-test
+  (testing "a quiet window flushes the buffer, once, in arrival order"
+    (let [pool (exec/pool 2)]
+      (try
+        (let [batches (atom [])
+              push! (exec/debouncer pool (fn [items] (swap! batches conj items)) 60 nil)]
+          (dotimes [i 5]
+            (push! i)
+            (cpp/clojure.core_native.sleep 10))
+          (is (wait-for 3000 (fn [] (seq (deref batches)))))
+          (cpp/clojure.core_native.sleep 200)
+          (is (= [[0 1 2 3 4]] (deref batches))
+              "one flush, holding every item in the order it arrived"))
+        (finally (exec/shutdown-now! pool)))))
+
+  (testing "two bursts separated by quiet produce two batches"
+    (let [pool (exec/pool 2)]
+      (try
+        (let [batches (atom [])
+              push! (exec/debouncer pool (fn [items] (swap! batches conj items)) 40 nil)]
+          (push! :a)
+          (push! :b)
+          (is (wait-for 3000 (fn [] (= 1 (count (deref batches))))))
+          (push! :c)
+          (is (wait-for 3000 (fn [] (= 2 (count (deref batches))))))
+          (is (= [[:a :b] [:c]] (deref batches))))
+        (finally (exec/shutdown-now! pool)))))
+
+  (testing "the threshold flushes before the window elapses"
+    (let [pool (exec/pool 2)]
+      (try
+        (let [batches (atom [])
+              ;; A window long enough that a timer flush inside the assertion would be a
+              ;; bug: only the threshold can produce a batch this quickly.
+              push! (exec/debouncer pool (fn [items] (swap! batches conj items)) 10000 3)]
+          (push! 1)
+          (push! 2)
+          (push! 3)
+          (is (wait-for 3000 (fn [] (seq (deref batches)))))
+          (is (= [[1 2 3]] (deref batches))))
+        (finally (exec/shutdown-now! pool)))))
+
+  (testing "every item is delivered exactly once under a burst"
+    (let [pool (exec/pool 4)]
+      (try
+        (let [n 500
+              seen (atom [])
+              ;; Order holds within a batch, not across them: several workers may be
+              ;; running flushes at once. What must hold is that no item is dropped and
+              ;; none is delivered twice.
+              push! (exec/debouncer pool (fn [items] (swap! seen into items)) 30 64)]
+          (dotimes [i n] (push! i))
+          (is (wait-for 5000 (fn [] (= n (count (deref seen))))))
+          (is (= (set (range n)) (set (deref seen))) "every item arrives")
+          (is (= n (count (deref seen))) "no item arrives twice"))
+        (finally (exec/shutdown-now! pool))))))

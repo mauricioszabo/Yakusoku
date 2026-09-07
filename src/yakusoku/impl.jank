@@ -121,6 +121,34 @@
   (let [ctx (cpp/unbox (:* yakusoku.pool) (::pool p))]
     (cpp/yakusoku.pool_stop ctx)))
 
+;; ------------------------------------------------------------------ timers ----
+
+(defn timer?
+  "True if x is a Yakusoku timer handle."
+  [x]
+  (and (map? x) (contains? x ::timer)))
+
+(defn make-timer
+  "Creates a restartable timer on a pool. Timers are permanent -- see the note in
+   native/yakusoku.hpp -- so create one per long-lived thing that needs to debounce, not
+   one per event."
+  [p]
+  (let [ctx (cpp/unbox (:* yakusoku.pool) (::pool p))]
+    {::timer (cpp/box (cpp/yakusoku.timer_create ctx))}))
+
+(defn restart-timer!
+  "Arms the timer to run a zero-arity function after ms milliseconds, cancelling any
+   pending wait. Restarting before the deadline is what makes this a debouncer."
+  [t ms f]
+  (let [tm (cpp/unbox (:* yakusoku.timer) (::timer t))]
+    (cpp/yakusoku.timer_restart tm (cpp/cast cpp/long ms) f)))
+
+(defn cancel-timer!
+  "Cancels a pending wait. The callback is dropped, not run."
+  [t]
+  (let [tm (cpp/unbox (:* yakusoku.timer) (::timer t))]
+    (cpp/yakusoku.timer_cancel tm)))
+
 ;; ------------------------------------------------------- jank's own objects ----
 
 (defn native-promise?
@@ -182,6 +210,10 @@
     (pool? pool)
     (post! pool (fn [] nil))
     (schedule! pool 0 (fn [] nil))
+    (let [t (make-timer pool)]
+      (timer? t)
+      (restart-timer! t 0 (fn [] nil))
+      (cancel-timer! t))
     (drain! pool)
     (stop! pool)
     ;; The context is already stopped, so this returns immediately -- but it leaves the
@@ -189,15 +221,19 @@
     (run-loop! pool)
     nil))
 
-(def ^:private warmed
-  (delay (warm-up!)))
+(def ^:private warmed (atom false))
 
 (defn ensure-warm!
   "Runs warm-up! once per process, the first time anything is about to start a thread.
 
    Deliberately not run at namespace load: calling these functions while this very module
-   is still being loaded re-enters jank's compiler and segfaults. jank's delay is
-   mutex-guarded, so this is safe to call from anywhere."
+   is still being loaded re-enters jank's compiler and segfaults.
+
+   Guarded by a compare-and-set rather than a delay. A delay here does not memoise: with
+   `(def warmed (delay (warm-up!)))`, every `(deref warmed)` from another namespace ran the
+   body again, so each pool or timer created leaked another throwaway pool. yakusoku.core
+   guards its own warm-up the same way."
   []
-  (deref warmed)
+  (when (compare-and-set! warmed false true)
+    (warm-up!))
   nil)
