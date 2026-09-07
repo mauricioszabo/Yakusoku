@@ -1,13 +1,9 @@
-# Benchmark: the three runners, on jank and on Clojure
+# Benchmark: a complex resolver graph, on jank and on Clojure
 
-Two programs, one benchmark. `bench.jank` runs it against **pathim and Yakusoku on jank**;
-`bench.clj` runs the same thing against **real [Pathom 3](https://github.com/wilkerlucio/pathom3)
-and promesa on Clojure**, so the port can be compared against what it was ported from — both
-for speed and for whether it computes the same answers.
-
-The two files are deliberately independent. Each is ordinary code for its own dialect, and
-neither is generated from the other: the only differences are the namespaces, the clock, the
-sleep, and how a promise is awaited.
+Two programs, one benchmark. `bench.jank` runs it against **pathim on jank**; `bench.clj`
+runs the same thing against **real [Pathom 3](https://github.com/wilkerlucio/pathom3) on
+Clojure**. The two files are deliberately independent: each is ordinary code for its own
+dialect, and neither is generated from the other.
 
 ```bash
 # jank
@@ -17,70 +13,96 @@ jank --eagerness eager run $(bin/jank-flags) --module-path src:examples examples
 cd examples && lein run
 ```
 
-Each prints its own table, with the answer beside each timing so the two runs can be checked
+Each prints its own table with the answer beside each timing, so the two runs can be checked
 against each other. A benchmark that computed something different is not a faster one.
 
 **`--eagerness eager` is not optional on jank.** Its compiler is not reentrant, and with the
 default lazy compilation a pool worker compiling a callback can race the main thread
 compiling something else — the crash lands inside clang.
 
-## What is being measured
+## The graph
 
-The graph has three user resolvers — two independent ones that take ~50 ms each and a third
-that joins them and takes ~10 ms — plus a batched item resolver (~60 ms for the whole batch,
-however large) and a deliberately non-batched twin (~20 ms per item). The latency is
-simulated: the sync resolvers block for it, the async ones resolve a promise after it.
+Nothing here sleeps. Every millisecond is either arithmetic or Pathom deciding what to run,
+which is what makes the two numbers worth comparing: the difference is the two runtimes, not
+two schedulers waiting on the same timer.
+
+The shape is modelled on [duck-repled](https://gitlab.com/clj-editors/duck-repled), where
+five different resolvers can all produce `:definition/filename`, several inputs are optional
+(`pco/?`), and answers are reached through a long chain of small steps. Three properties are
+copied deliberately:
+
+* **OR nodes.** `:task/data` has three resolvers that can produce it, at descending
+  priorities — a registry lookup that only answers for known ids, a derivation that only
+  answers for even ids, and a default that always answers. `:calc/sum` has two: a cheap one
+  gated on an optional `:calc/memo`, and the expensive one. So the planner builds OR nodes,
+  and a query whose better branches miss pays for the backtrack.
+* **Depth.** `:task/id` reaches `:report/line` through seven dependent steps:
+
+  ```
+  :task/id → :task/data → :spec/kind + :spec/scale → :calc/operands
+           → :calc/sum → :calc/product → :calc/signature → :report/line
+  ```
+
+* **Real computation.** Peano arithmetic — addition by counting, `sum(0,y) = y` and
+  `sum(x,y) = sum(x-1,y+1)` — with multiplication as repeated addition and a naively
+  recursive Fibonacci built on both. Deliberately the slow way round: the point is to spend
+  time in millions of small calls, where a runtime's codegen shows.
 
 | benchmark | what it does |
 | --- | --- |
-| `throughput` | 20 independent user queries |
-| `single-query` | one query whose two expensive resolvers are independent |
-| `batched` | 30 items through the batched resolver |
-| `one-by-one` | the same 30 items through the non-batched twin |
+| `raw/*` | the identical arithmetic called directly, no Pathom at all |
+| `chain` | one query for `:report/line`, id in the registry — first OR branch hits |
+| `chain-fallback` | the same for an odd, unknown id — both better branches miss first |
+| `many` | 24 tasks through one nested join, so one plan covers all of them |
 
 Each runs once to warm up (discarded) and then three times; the table shows the median.
 
-## Reading the results
+## Results
 
-The three runners differ in ways worth stating, because the numbers only make sense against
-them:
+Measured on this machine — 4 cores, jank 0.1-noble, OpenJDK 21:
 
-* **The async runner does not make one query faster.** It walks the same plan and awaits
-  each node, so `async/single-query` costs the same ~112 ms as `sync/single-query`. What it
-  buys is not blocking a thread: `async/throughput` runs all 20 queries at once and finishes
-  in the time of roughly one, against ~2.2 s for the sync runner.
-* **The parallel runner overlaps independent work inside one query.** That is why
-  `parallel/single-query` is ~62 ms rather than ~112: the two 50 ms resolvers run at the same
-  time and only the 10 ms join is serial. `parallel/one-by-one` shows it at its most
-  dramatic — 30 independent items resolved together, ~26 ms against ~620 ms.
-* **Batching is not a parallel-only win.** All three runners batch, so `batched` is about the
-  same everywhere; it is here because `one-by-one` only means something next to it.
+| benchmark | jank (pathim) | Clojure (Pathom 3) | jank / Clojure |
+| --- | ---: | ---: | ---: |
+| raw / chain | 4.7 | 2.7 | 1.7× |
+| raw / many | 139.0 | 80.3 | 1.7× |
+| sync / chain | 19.2 | 18.4 | 1.04× |
+| sync / chain-fallback | 20.4 | 14.6 | 1.4× |
+| sync / many | 152.2 | 85.7 | 1.8× |
+| async / chain | 22.7 | 16.8 | 1.4× |
+| async / many | 226.6 | 122.5 | 1.8× |
+| parallel / chain | 26.9 | 13.3 | 2.0× |
+| parallel / many | 123.0 | 57.5 | 2.1× |
 
-Measured on this machine, medians in milliseconds:
+Three things stand out.
 
-| benchmark | jank (pathim) | Clojure (Pathom 3) |
-| --- | ---: | ---: |
-| sync / throughput | 2246.9 | 2258.1 |
-| sync / single-query | 112.1 | 112.8 |
-| sync / batched | 65.3 | 66.1 |
-| sync / one-by-one | 620.8 | 623.0 |
-| async / single-query | 113.2 | 115.0 |
-| async / throughput | 124.0 | 126.0 |
-| async / batched | 73.6 | 69.3 |
-| async / one-by-one | 629.7 | 627.7 |
-| parallel / single-query | 62.4 | 62.3 |
-| parallel / throughput | 75.3 | 72.8 |
-| parallel / batched | 79.2 | 74.8 |
-| parallel / one-by-one | 26.3 | 23.4 |
+**jank runs this arithmetic about 1.7× slower than the JVM.** That is the `raw` row, and it
+is the cleanest signal in the table: no Pathom, no promises, just Peano addition,
+multiplication and a doubly-recursive Fibonacci. For a young compiler against a JIT that has
+had twenty-five years of tuning, 1.7× on call-heavy integer code is a respectable place to
+be starting from.
 
-## Fairness, and what these numbers are not
+**The port's planner is not the slow part.** Subtract `raw/chain` from `sync/chain` and you
+get what Pathom costs to plan and run one query: **14.5 ms on jank, 15.7 ms on Clojure**.
+Those are the same within noise, which says the ported planner and runner are not carrying a
+penalty — the gap in the totals comes from the arithmetic underneath them, not from pathim.
+It also says something about the graph: a single query spends most of its time *planning*,
+because nothing here caches plans between calls. That is why `many` — 24 tasks under one
+plan — is so much cheaper per task than 24 separate `chain` runs would be.
 
-The timings are dominated by simulated latency on purpose: what is being compared is how
-each runner *schedules* work, not how fast each runtime executes Clojure. Do not read
-`jank vs Clojure` here as a language benchmark — the resolvers spend their time sleeping.
+**Parallelism helps, and helps less than the core count suggests.** `parallel/many` is 1.2×
+`sync/many` on jank and 1.5× on Clojure, on four cores. The chain is mostly serial — each
+step needs the one before it — so the only thing to overlap is the 24 tasks in the join, and
+each of those still pays a thread hop per expensive resolver. The jank side hands its work
+to a `yakusoku.exec/pool` rather than `p/future`, because jank's `future` spawns a raw OS
+thread per call with no pooling; measuring through that would have measured thread creation.
 
-Two things do bias the raw numbers, and both are handled. jank compiles a function on its
-first call and the JVM's JIT warms up, so every benchmark discards a warm-up pass. On jank
-that warm-up runs over a one-element input rather than the real one, which reaches the same
-code without any of it running concurrently — see the comment on `run-async!` in
-`bench.jank` for why that distinction matters there.
+## Fairness
+
+Both files use `cond` where `case` would be idiomatic. That is not a handicap for Clojure —
+it is because jank miscompiles a `case` whose branch is a primitive literal (`(case k :sum 4 5)`
+does not build), and the two sides should do the same work. That bug and the others this
+benchmark turned up are written up in [../JANK-ISSUES.md](../JANK-ISSUES.md).
+
+The `raw` baseline is the honest way to read the rest: it separates "how fast is the
+runtime" from "what does the graph machinery cost", and those two questions have quite
+different answers here.

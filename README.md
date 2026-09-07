@@ -230,8 +230,8 @@ collections while jank values sit in Asio's queue.
 The repository also carries pathim, a port of
 [Pathom 3](https://github.com/wilkerlucio/pathom3) built on Yakusoku — sync, async and
 parallel runners. See [PATHIM.md](PATHIM.md), and [examples/](examples/) for a pair of
-benchmark programs — one on jank, one on Clojure — that run the same resolver graph so the
-port can be compared against the original.
+benchmark programs — one on jank, one on Clojure — that run the same resolver graph, with OR
+nodes and real computation, so the port can be compared against the original.
 
 The jank rough edges this turned up are written up as filable bug reports in
 [JANK-ISSUES.md](JANK-ISSUES.md).

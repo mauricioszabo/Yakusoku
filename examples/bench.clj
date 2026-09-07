@@ -3,26 +3,42 @@
 ;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 (ns bench
-  "Benchmarks Pathom 3's three runners on Clojure.
+  "Benchmarks Pathom 3 on Clojure against a resolver graph that actually works for its
+   answers.
 
    Run it with:
 
      cd examples && lein run
 
-   examples/bench.jank is the same benchmark against pathim and Yakusoku on jank, so the
-   two can be compared. The files are deliberately independent: each is ordinary code for
-   its own dialect, and neither is generated from the other.
+   examples/bench.jank is the same benchmark against pathim on jank. The two files are
+   deliberately independent: each is ordinary code for its own dialect, and neither is
+   generated from the other.
 
-   What each runner buys is worth stating, because the benchmarks are shaped around it:
+   ## What this measures, and why it is shaped this way
 
-     * The async runner does not overlap the steps of one query -- it walks the same plan,
-       awaiting each node. What it buys is not blocking a thread, so many queries can be in
-       flight at once. `throughput` measures that.
-     * The parallel runner overlaps independent branches *within* one query, and that is
-       what `single-query` and `one-by-one` measure.
-     * Batching turns N resolver calls into one. All three runners batch, so `batched` is
-       about the same everywhere; it is here because `one-by-one` only means something
-       next to it."
+   Nothing here sleeps. Every millisecond is either arithmetic or Pathom deciding what to
+   run, which is what makes the Clojure and jank numbers worth comparing: the difference is
+   the two runtimes, not two schedulers waiting on the same timer.
+
+   The graph is modelled on the shape of
+   [duck-repled](https://gitlab.com/clj-editors/duck-repled), where five different resolvers
+   can all produce `:definition/filename`, several inputs are optional, and answers are
+   reached through a long chain of small steps. Three properties are copied deliberately:
+
+     * **OR nodes.** `:task/data` and `:calc/sum` each have several resolvers that can
+       produce them. The planner builds an OR node and the runner walks the branches in
+       priority order until one succeeds -- so a query whose first branch misses costs a
+       backtrack, and `chain-fallback` below measures exactly that.
+     * **Depth.** `:task/id` reaches `:report/line` through seven dependent steps, so a
+       single query is a real plan, not one resolver call.
+     * **Real computation.** The kernels are Peano arithmetic -- addition by counting, as
+       `sum(0,y) = y` and `sum(x,y) = sum(x-1,y+1)` -- with multiplication built on addition
+       and a naively recursive Fibonacci built on both. They are deliberately the slow way
+       round: what is being compared is how each runtime executes a few million small calls.
+
+   `raw` runs the identical computation with no Pathom at all. The gap between it and
+   `sync/chain` is what the graph machinery costs; the gap between the two runtimes on `raw`
+   is the language."
   (:require
     [com.wsscode.pathom3.connect.operation :as pco]
     [com.wsscode.pathom3.connect.indexes :as pci]
@@ -35,155 +51,275 @@
 (defn- now-ms []
   (/ (double (System/nanoTime)) 1000000.0))
 
-(defn- sleep-ms [ms]
-  (Thread/sleep (long ms)))
-
 (defn- await! [promise]
   (deref promise))
 
-;; ---------------------------------------------------------------- workload ----
+;; ------------------------------------------------------- expensive kernels ----
 ;;
-;; Simulated latency, in milliseconds, standing in for network calls: the sync resolvers
-;; block for it, the async ones resolve a promise after it.
+;; Peano arithmetic: addition by counting one down and the other up. Multiplication is
+;; repeated addition, and Fibonacci is the naive double recursion over both. Every one of
+;; these has a one-line fast equivalent, which is the point -- they exist to spend time in
+;; small function calls and arithmetic, where a runtime's codegen shows.
 
-(def slow-ms 50)   ; each of the two independent user resolvers
-(def join-ms 10)   ; the resolver that depends on both of them
-(def batch-ms 60)  ; one batched call, however many items it covers
-(def item-ms 20)   ; one call of the non-batched twin, per item
+(defn peano-add
+  "sum(0, y) = y; sum(x, y) = sum(x - 1, y + 1). Costs x steps."
+  [x y]
+  (loop [x x y y]
+    (if (zero? x) y (recur (dec x) (inc y)))))
 
-(def user-ids (vec (range 1 21)))
-(def items (mapv (fn [id] {:item/id id}) (range 1 31)))
-(def items-entity {:items items})
+(defn peano-mul
+  "Repeated addition: x additions of y. Costs roughly x * y steps."
+  [x y]
+  (loop [n x acc 0]
+    (if (zero? n) acc (recur (dec n) (peano-add y acc)))))
 
-;; ----------------------------------------------------------- sync resolvers ----
+(defn peano-fib
+  "Naive Fibonacci, adding the Peano way. Doubly recursive, so this is call overhead as
+   much as arithmetic."
+  [n]
+  (if (< n 2)
+    n
+    (peano-add (peano-fib (- n 1)) (peano-fib (- n 2)))))
 
-(pco/defresolver profile-sync [env input]
-  {::pco/input  [:user/id]
-   ::pco/output [:user/profile]}
-  (sleep-ms slow-ms)
-  {:user/profile (str "profile-" (:user/id input))})
+(defn- wrap
+  "Positive remainder. Written as a subtraction rather than with `rem` so that it matches
+   bench.jank, where `rem` on two integers answers a double."
+  [n k]
+  (- n (* k (quot n k))))
 
-(pco/defresolver orders-sync [env input]
-  {::pco/input  [:user/id]
-   ::pco/output [:user/orders]}
-  (sleep-ms slow-ms)
-  {:user/orders (* 3 (:user/id input))})
-
-(pco/defresolver summary-sync [env input]
-  {::pco/input  [:user/profile :user/orders]
-   ::pco/output [:user/summary]}
-  (sleep-ms join-ms)
-  {:user/summary (str (:user/profile input) "/" (:user/orders input))})
-
-(pco/defresolver price-batch-sync [env inputs]
-  {::pco/input  [:item/id]
-   ::pco/output [:item/price]
-   ::pco/batch? true}
-  (sleep-ms batch-ms)
-  (mapv (fn [item] {:item/price (* 10 (:item/id item))}) inputs))
-
-(pco/defresolver price-one-sync [env input]
-  {::pco/input  [:item/id]
-   ::pco/output [:item/slow-price]}
-  (sleep-ms item-ms)
-  {:item/slow-price (* 10 (:item/id input))})
-
-;; ---------------------------------------------------------- async resolvers ----
+;; ------------------------------------------------------------ problem sizes ----
 ;;
-;; The same graph, with every resolver returning a promise rather than blocking.
+;; Tuned so one full chain is a few tens of milliseconds: long enough that the arithmetic
+;; dominates the measurement, short enough that the whole benchmark finishes.
 
-(pco/defresolver profile-async [env input]
-  {::pco/input  [:user/id]
-   ::pco/output [:user/profile]}
-  (p/delay slow-ms {:user/profile (str "profile-" (:user/id input))}))
+(def fib-n 19)
+(def mul-cap 150)
+(def task-count 24)
 
-(pco/defresolver orders-async [env input]
-  {::pco/input  [:user/id]
-   ::pco/output [:user/orders]}
-  (p/delay slow-ms {:user/orders (* 3 (:user/id input))}))
+;; A registry only some ids appear in, so the first OR branch misses for the rest.
+(def registry
+  {1 {:kind :sum   :scale 7}
+   4 {:kind :prod  :scale 5}
+   9 {:kind :mixed :scale 6}})
 
-(pco/defresolver summary-async [env input]
-  {::pco/input  [:user/profile :user/orders]
-   ::pco/output [:user/summary]}
-  (p/delay join-ms {:user/summary (str (:user/profile input) "/" (:user/orders input))}))
+(def task-ids (vec (range 1 (inc task-count))))
 
-(pco/defresolver price-batch-async [env inputs]
-  {::pco/input  [:item/id]
-   ::pco/output [:item/price]
-   ::pco/batch? true}
-  (p/delay batch-ms (mapv (fn [item] {:item/price (* 10 (:item/id item))}) inputs)))
+;; -------------------------------------------------------------- the graph ----
+;;
+;; :task/id -> :task/data -> :spec/kind + :spec/scale -> :calc/operands -> :calc/sum
+;;          -> :calc/product -> :calc/signature -> :report/line
+;;
+;; with OR nodes at :task/data (three producers) and :calc/sum (two).
 
-(pco/defresolver price-one-async [env input]
-  {::pco/input  [:item/id]
-   ::pco/output [:item/slow-price]}
-  (p/delay item-ms {:item/slow-price (* 10 (:item/id input))}))
+;; --- OR node 1: three ways to get :task/data, in priority order ---------------
 
-;; --------------------------------------------------------------------- envs ----
+(pco/defresolver data-from-registry
+  "Highest priority, but only answers for ids the registry knows."
+  [env input]
+  {::pco/input    [:task/id]
+   ::pco/output   [:task/data]
+   ::pco/priority 30}
+  (when-let [entry (get registry (:task/id input))]
+    {:task/data entry}))
 
-(def sync-env
-  (pci/register [profile-sync orders-sync summary-sync price-batch-sync price-one-sync]))
+(pco/defresolver data-from-parity
+  "Second choice: derives a spec for even ids, and misses for odd ones."
+  [env input]
+  {::pco/input    [:task/id]
+   ::pco/output   [:task/data]
+   ::pco/priority 20}
+  (let [id (:task/id input)]
+    (when (zero? (wrap id 2))
+      {:task/data {:kind :prod :scale (+ 3 (wrap id 5))}})))
+
+(pco/defresolver data-from-default
+  "Last resort, and always answers -- so every query terminates, and the ones that get here
+   have paid for two failed branches first."
+  [env input]
+  {::pco/input    [:task/id]
+   ::pco/output   [:task/data]
+   ::pco/priority 10}
+  {:task/data {:kind :sum :scale (+ 2 (wrap (:task/id input) 4))}})
+
+;; --- flattening, the way duck-repled's separate-data does ---------------------
+
+(pco/defresolver separate-data [env input]
+  {::pco/input  [:task/data]
+   ::pco/output [:spec/kind :spec/scale {:task/spec [:spec/kind :spec/scale]}]}
+  (let [{:keys [kind scale]} (:task/data input)]
+    {:spec/kind  kind
+     :spec/scale scale
+     :task/spec  {:spec/kind kind :spec/scale scale}}))
+
+(pco/defresolver operands [env input]
+  {::pco/input  [:task/id :spec/kind :spec/scale]
+   ::pco/output [:calc/operands]}
+  (let [id (:task/id input)
+        scale (:spec/scale input)
+        kind (:spec/kind input)
+        ;; `cond` rather than `case` to match bench.jank, where a `case` with a literal
+        ;; branch does not compile. Both sides do the same work this way.
+        n (cond (= :sum kind) 4 (= :prod kind) 3 :else 5)]
+    {:calc/operands (mapv (fn [i] (+ 1 (* scale (+ i (wrap id 3))))) (range n))}))
+
+;; --- OR node 2: a cheap answer when a memo is present, the slow one otherwise --
+
+(pco/defresolver sum-from-memo
+  "Cheap, but only when the caller supplied a memo covering these operands. The optional
+   input is what makes this a branch the planner has to consider and the runner has to
+   skip, rather than one it can rule out while planning."
+  [env input]
+  {::pco/input    [:calc/operands (pco/? :calc/memo)]
+   ::pco/output   [:calc/sum]
+   ::pco/priority 30}
+  (when-let [memo (:calc/memo input)]
+    (when-let [hit (get memo (:calc/operands input))]
+      {:calc/sum hit})))
+
+(pco/defresolver sum-from-peano
+  "The expensive branch: fold the operands with counting addition."
+  [env input]
+  {::pco/input    [:calc/operands]
+   ::pco/output   [:calc/sum]
+   ::pco/priority 10}
+  {:calc/sum (reduce (fn [acc n] (peano-add n acc)) 0 (:calc/operands input))})
+
+;; --- the deep tail ------------------------------------------------------------
+
+(pco/defresolver product [env input]
+  {::pco/input  [:calc/sum :calc/operands]
+   ::pco/output [:calc/product]}
+  (let [operands (:calc/operands input)
+        a (wrap (:calc/sum input) mul-cap)
+        b (wrap (reduce (fn [acc n] (+ acc n)) 0 operands) mul-cap)]
+    {:calc/product (peano-mul a b)}))
+
+(pco/defresolver signature [env input]
+  {::pco/input  [:calc/product]
+   ::pco/output [:calc/signature]}
+  {:calc/signature (peano-fib (+ fib-n (wrap (:calc/product input) 3)))})
+
+(pco/defresolver report-line [env input]
+  {::pco/input  [:task/id :spec/kind :calc/sum :calc/product :calc/signature]
+   ::pco/output [:report/line]}
+  {:report/line (str (:task/id input) ":" (name (:spec/kind input))
+                     "/" (:calc/sum input)
+                     "/" (:calc/product input)
+                     "/" (:calc/signature input))})
+
+(def resolvers
+  [data-from-registry data-from-parity data-from-default
+   separate-data operands
+   sum-from-memo sum-from-peano
+   product signature report-line])
+
+(def sync-env (pci/register resolvers))
+
+;; --- the same graph, with the two expensive steps handed to the pool ----------
+;;
+;; A resolver that returns an already-resolved promise gives the parallel runner nothing to
+;; overlap, since the work is done before the promise exists. Handing the computation to
+;; `p/future` is what lets independent branches of one query occupy different cores, so
+;; this is the version where "parallel" can mean parallel for CPU work rather than for
+;; waiting.
+
+(pco/defresolver sum-from-memo-async [env input]
+  {::pco/input    [:calc/operands (pco/? :calc/memo)]
+   ::pco/output   [:calc/sum]
+   ::pco/priority 30}
+  (when-let [memo (:calc/memo input)]
+    (when-let [hit (get memo (:calc/operands input))]
+      (p/resolved {:calc/sum hit}))))
+
+(pco/defresolver sum-from-peano-async [env input]
+  {::pco/input    [:calc/operands]
+   ::pco/output   [:calc/sum]
+   ::pco/priority 10}
+  (p/future {:calc/sum (reduce (fn [acc n] (peano-add n acc)) 0 (:calc/operands input))}))
+
+(pco/defresolver signature-async [env input]
+  {::pco/input  [:calc/product]
+   ::pco/output [:calc/signature]}
+  (p/future {:calc/signature (peano-fib (+ fib-n (wrap (:calc/product input) 3)))}))
 
 (def async-env
-  (pci/register [profile-async orders-async summary-async price-batch-async price-one-async]))
+  (pci/register [data-from-registry data-from-parity data-from-default
+                 separate-data operands
+                 sum-from-memo-async sum-from-peano-async
+                 product signature-async report-line]))
 
 (def parallel-env
   (assoc async-env ::p.a.eql/parallel? true))
 
-(def batch-query [{:items [:item/price]}])
-(def one-by-one-query [{:items [:item/slow-price]}])
+;; ------------------------------------------------------------- the queries ----
+
+(def chain-query [:report/line])
+(def many-query [{:tasks [:report/line]}])
+
+(def in-registry-id 4)   ; the first OR branch answers straight away
+(def fallback-id 7)      ; odd and unknown: both better branches miss first
+
+(def tasks-entity {:tasks (mapv (fn [id] {:task/id id}) task-ids)})
+
+;; ---------------------------------------------------------- raw comparison ----
+
+(defn raw-chain
+  "The same arithmetic the graph performs for one task, called directly. The difference
+   between this and sync/chain is what Pathom costs; the difference between the two
+   runtimes here is the language."
+  [id]
+  (let [data (or (get registry id)
+                 (if (zero? (wrap id 2))
+                   {:kind :prod :scale (+ 3 (wrap id 5))}
+                   {:kind :sum :scale (+ 2 (wrap id 4))}))
+        scale (:scale data)
+        kind (:kind data)
+        n (cond (= :sum kind) 4 (= :prod kind) 3 :else 5)
+        operands (mapv (fn [i] (+ 1 (* scale (+ i (wrap id 3))))) (range n))
+        sum (reduce (fn [acc x] (peano-add x acc)) 0 operands)
+        a (wrap sum mul-cap)
+        b (wrap (reduce (fn [acc x] (+ acc x)) 0 operands) mul-cap)
+        prod (peano-mul a b)
+        sig (peano-fib (+ fib-n (wrap prod 3)))]
+    (str id ":" (name (:kind data)) "/" sum "/" prod "/" sig)))
 
 ;; --------------------------------------------------------------- benchmarks ----
 ;;
-;; Each returns {:ms .. :answer ..}. The answer is a plain value so the two runtimes can be
-;; checked against each other before any timing is compared: a benchmark that computed
-;; something different is not a faster one.
+;; Each returns {:ms .. :answer ..}. The answer travels with the timing so the two
+;; runtimes can be checked against each other: a benchmark that computed something
+;; different is not a faster one.
 
-(defn sync-throughput [ids]
+(defn bench-raw [id]
   (let [start (now-ms)
-        answer (mapv (fn [id]
-                       (:user/summary (p.eql/process sync-env {:user/id id} [:user/summary])))
-                     ids)]
+        answer (raw-chain id)]
     {:ms (- (now-ms) start) :answer answer}))
 
-(defn sync-single-query []
+(defn bench-raw-many [ids]
   (let [start (now-ms)
-        answer (:user/summary (p.eql/process sync-env {:user/id 1} [:user/summary]))]
+        answer (mapv (fn [id] (raw-chain id)) ids)]
+    {:ms (- (now-ms) start) :answer (last answer)}))
+
+(defn sync-chain [id]
+  (let [start (now-ms)
+        answer (:report/line (p.eql/process sync-env {:task/id id} chain-query))]
     {:ms (- (now-ms) start) :answer answer}))
 
-(defn sync-batched [entity]
+(defn sync-many [entity]
   (let [start (now-ms)
-        answer (mapv :item/price (:items (p.eql/process sync-env entity batch-query)))]
-    {:ms (- (now-ms) start) :answer answer}))
+        answer (mapv :report/line (:tasks (p.eql/process sync-env entity many-query)))]
+    {:ms (- (now-ms) start) :answer (last answer)}))
 
-(defn sync-one-by-one [entity]
-  (let [start (now-ms)
-        answer (mapv :item/slow-price (:items (p.eql/process sync-env entity one-by-one-query)))]
-    {:ms (- (now-ms) start) :answer answer}))
-
-(defn async-throughput
-  "Every query started before any of them finishes."
-  [env ids]
+(defn async-chain [env id]
   (let [start (now-ms)]
-    (p/then (p/all (mapv (fn [id] (p.a.eql/process env {:user/id id} [:user/summary])) ids))
-            (fn [results]
-              {:ms (- (now-ms) start) :answer (mapv :user/summary results)}))))
+    (p/then (p.a.eql/process env {:task/id id} chain-query)
+            (fn [result] {:ms (- (now-ms) start) :answer (:report/line result)}))))
 
-(defn async-single-query [env]
+(defn async-many [env entity]
   (let [start (now-ms)]
-    (p/then (p.a.eql/process env {:user/id 1} [:user/summary])
-            (fn [result] {:ms (- (now-ms) start) :answer (:user/summary result)}))))
-
-(defn async-batched [env entity]
-  (let [start (now-ms)]
-    (p/then (p.a.eql/process env entity batch-query)
+    (p/then (p.a.eql/process env entity many-query)
             (fn [result]
-              {:ms (- (now-ms) start) :answer (mapv :item/price (:items result))}))))
-
-(defn async-one-by-one [env entity]
-  (let [start (now-ms)]
-    (p/then (p.a.eql/process env entity one-by-one-query)
-            (fn [result]
-              {:ms (- (now-ms) start) :answer (mapv :item/slow-price (:items result))}))))
+              {:ms (- (now-ms) start)
+               :answer (last (mapv :report/line (:tasks result)))}))))
 
 ;; ------------------------------------------------------------------ running ----
 
@@ -192,79 +328,70 @@
    warm before anything is measured."
   3)
 
-(def ^:private one-user (vec (take 1 user-ids)))
-(def ^:private one-item {:items (vec (take 1 items))})
-
 (defn- median [xs]
   (let [sorted (vec (sort xs))]
     (nth sorted (quot (count sorted) 2))))
 
 (defn- ms-str
-  "Milliseconds to one decimal place.
-
-   The remainder is subtracted rather than taken with `rem`: in jank, `(rem 22457 10)`
-   answers 7.0 -- a double from two integers -- which would print as \"2245.7.0\"."
+  "Milliseconds to one decimal place, the same way bench.jank formats them."
   [ms]
   (let [tenths (long (+ 0.5 (* 10.0 ms)))
         whole (quot tenths 10)]
     (str whole "." (- tenths (* 10 whole)))))
 
 (defn- pad-left [s n]
-  (let [s (str s)
-        gap (- n (count s))]
+  (let [s (str s) gap (- n (count s))]
     (str (apply str (repeat (max 0 gap) " ")) s)))
 
 (defn- pad-right [s n]
-  (let [s (str s)
-        gap (- n (count s))]
+  (let [s (str s) gap (- n (count s))]
     (str s (apply str (repeat (max 0 gap) " ")))))
 
-(defn- clip [s n]
-  (let [s (str s)]
-    (if (> (count s) n) (str (subs s 0 (- n 3)) "...") s)))
-
 (defn- row! [label result]
-  (println (str "  " (pad-right label 22)
+  (println (str "  " (pad-right label 24)
                 (pad-left (ms-str (:ms result)) 10)
-                "   " (clip (pr-str (:answer result)) 44))))
+                "   " (:answer result))))
 
-(defn- run-sync!
-  "The blocking benchmarks. A one-element warm-up pass first, then the timed ones."
-  []
-  (println)
-  (println "  sync runner")
-  (doseq [[label warm run]
-          [["throughput" (fn [] (sync-throughput one-user)) (fn [] (sync-throughput user-ids))]
-           ["single-query" sync-single-query sync-single-query]
-           ["batched" (fn [] (sync-batched one-item)) (fn [] (sync-batched items-entity))]
-           ["one-by-one" (fn [] (sync-one-by-one one-item)) (fn [] (sync-one-by-one items-entity))]]]
-    (warm)
-    (let [runs (mapv (fn [_] (run)) (range iterations))]
-      (row! label (assoc (first runs) :ms (median (mapv :ms runs)))))))
+(defn- timed!
+  "Warm-up pass, then `iterations` timed ones; reports the median."
+  [label f]
+  (f)
+  (let [runs (mapv (fn [_] (f)) (range iterations))]
+    (row! label (assoc (first runs) :ms (median (mapv :ms runs))))))
 
-(defn- run-async!
-  "The non-blocking benchmarks, driven one at a time from this thread. single-query goes
-   first because it is the only one that runs a single query at a time, so it warms the
-   whole path before anything concurrent starts."
-  [label env]
-  (println)
-  (println (str "  " label " runner"))
-  (doseq [[name warm run]
-          [["single-query" (fn [] (async-single-query env)) (fn [] (async-single-query env))]
-           ["throughput" (fn [] (async-throughput env one-user)) (fn [] (async-throughput env user-ids))]
-           ["batched" (fn [] (async-batched env one-item)) (fn [] (async-batched env items-entity))]
-           ["one-by-one" (fn [] (async-one-by-one env one-item)) (fn [] (async-one-by-one env items-entity))]]]
-    (await! (warm))
-    (let [runs (mapv (fn [_] (await! (run))) (range iterations))]
-      (row! name (assoc (first runs) :ms (median (mapv :ms runs)))))))
+(defn- timed-async! [label f]
+  (await! (f))
+  (let [runs (mapv (fn [_] (await! (f))) (range iterations))]
+    (row! label (assoc (first runs) :ms (median (mapv :ms runs))))))
 
 (defn -main [& _]
   (println)
-  (println (str "Pathom 3 on Clojure -- median of " iterations " passes, milliseconds (lower is better)"))
-  (println (str "  " (pad-right "benchmark" 22) (pad-left "ms" 10) "   answer"))
-  (run-sync!)
-  (run-async! "async" async-env)
-  (run-async! "parallel" parallel-env)
+  (println (str "Pathom 3 on Clojure -- median of " iterations
+                " passes, milliseconds (lower is better)"))
+  (println (str "  " (pad-right "benchmark" 24) (pad-left "ms" 10) "   answer"))
+
+  (println)
+  (println "  no Pathom (baseline)")
+  (timed! "raw/chain" (fn [] (bench-raw fallback-id)))
+  (timed! "raw/many" (fn [] (bench-raw-many task-ids)))
+
+  (println)
+  (println "  sync runner")
+  (timed! "sync/chain" (fn [] (sync-chain in-registry-id)))
+  (timed! "sync/chain-fallback" (fn [] (sync-chain fallback-id)))
+  (timed! "sync/many" (fn [] (sync-many tasks-entity)))
+
+  (println)
+  (println "  async runner")
+  (timed-async! "async/chain" (fn [] (async-chain async-env in-registry-id)))
+  (timed-async! "async/chain-fallback" (fn [] (async-chain async-env fallback-id)))
+  (timed-async! "async/many" (fn [] (async-many async-env tasks-entity)))
+
+  (println)
+  (println "  parallel runner")
+  (timed-async! "parallel/chain" (fn [] (async-chain parallel-env in-registry-id)))
+  (timed-async! "parallel/chain-fallback" (fn [] (async-chain parallel-env fallback-id)))
+  (timed-async! "parallel/many" (fn [] (async-many parallel-env tasks-entity)))
   (println)
   (shutdown-agents)
   (System/exit 0))

@@ -17,7 +17,8 @@ Ubuntu 24.04.4 LTS, x86_64
 Entries are grouped by how well they reproduce **on that build, today**. That distinction
 matters: three of these were recorded earlier in the port and two of them no longer
 reproduce, so they are held back rather than filed. Issues 7 and 8 came out of writing the
-benchmark in `examples/`, after the rest.
+benchmark in `examples/`, after the rest; issue 9 came out of rewriting that benchmark
+around a duck-repled-shaped resolver graph.
 
 ---
 
@@ -253,6 +254,58 @@ rather than a deliberate numeric-tower choice.
 **Where it bit:** formatting a number to one decimal place with
 `(str (quot tenths 10) "." (rem tenths 10))` printed `2245.7.0`. The workaround is to
 subtract instead: `(- tenths (* 10 (quot tenths 10)))`.
+
+---
+
+### 9. `case` miscompiles when a branch's value is a primitive literal
+
+**Severity:** high — `case` is everywhere in ordinary Clojure, and the error points at
+jank's own `core.jank` rather than at the user's code.
+
+```clojure
+(ns repro)
+(defn f [k] (case k :sum 4 :prod 3 5))
+(println (f :sum))
+```
+
+**Actual:** a C++ compile error inside jank's `case` macro:
+
+```
+/…/src/jank/clojure/core.jank:4551:4: error: no viable overloaded '='
+ 4551 | v2 = std::move(v32);
+note: candidate function not viable: no known conversion from
+      'typename std::remove_reference<int &>::type' (aka 'int') to
+      'const oref<jank::runtime::object>' for 1st argument
+```
+
+A string branch fails differently, in the same macro:
+
+```clojure
+(defn f [k] (case k :sum "a" :prod "b" "c"))
+```
+```
+/…/src/jank/clojure/core.jank:3961:18: error: brackets are not allowed here;
+      to declare an array, place the brackets after the name
+ 3961 | const char[2] v12{ };
+```
+
+**Expected:** both compile, as in Clojure.
+
+**What works, which narrows it:** the same `case` is fine when the branches are anything
+other than a primitive literal —
+
+```clojure
+(defn f [k] (case k :sum :four :prod :three :five))   ; => works
+(defn f [k] (case k :sum (g) :prod (g) (g)))          ; => works
+(def four 4)
+(defn f [k] (case k :sum four :prod four four))       ; => works
+```
+
+So the branch value is being emitted unboxed and then assigned to an `oref`. Integer tests
+(`(case k 1 4 2 3 5)`) fail the same way as keyword tests, so it is the result that matters,
+not the test.
+
+**Workaround:** `cond`, or bind the literal to a var first.
 
 ---
 
