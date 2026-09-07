@@ -1,0 +1,49 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+(ns pathim.warm
+  "Compiles the port's C++-interop functions before any of them can first run on a worker
+   thread.
+
+   jank compiles a function on its first call. Compiling a function whose body contains C++
+   interop while running on a pool or timer worker corrupts the heap -- the finding behind
+   yakusoku.impl/warm-up!, which does the same for Yakusoku's own bridge. The sync runner
+   never met this, because it never leaves the calling thread; the async and parallel
+   runners resolve promises on Asio workers, and the functions they reach from there
+   include these.
+
+   Its own namespace rather than a member of pathim.misc: everything below is required from
+   here, and pathim.misc is what those namespaces would require if they needed anything."
+  (:require
+    [pathim.misc :as misc]
+    [pathim.misc.coll :as coll]
+    [pathim.misc.refs :as refs]
+    [pathim.misc.time :as time]))
+
+(def ^:private warmed (atom false))
+
+(defn- warm-up! []
+  (time/now-ms)
+  (refs/atom? (atom nil))
+  (refs/box? (volatile! nil))
+  (refs/greset! (atom nil) 1)
+  (refs/gswap! (atom 0) inc)
+  (coll/native-map? {})
+  ;; raise! is reached from every worker that has to report an error, and it is the one
+  ;; place in the port that throws.
+  (try
+    (misc/raise! (ex-info "warm-up" {}))
+    (catch cpp/jank.runtime.object_ref _ nil))
+  nil)
+
+(defn ensure-warm!
+  "Runs the warm-up once per process. Called from the async and parallel run-graph!
+   entry points, which are the only ways into code that runs on workers.
+
+   Guarded by a compare-and-set rather than a delay: a delay defined at namespace level
+   does not memoise across namespaces in jank -- yakusoku.impl hit exactly that."
+  []
+  (when (compare-and-set! warmed false true)
+    (warm-up!))
+  nil)

@@ -8,7 +8,9 @@
     [pathim.connect.operation :as pco]
     [pathim.connect.planner :as pcp]
     [pathim.connect.runner :as pcr]
+    [pathim.connect.runner.async :as pcra]
     [pathim.format.shape-descriptor :as pfsd]
+    [pathim.interface.async.eql :as p.a.eql]
     [pathim.interface.eql :as p.eql]
     [pathim.plugin :as p.plugin]
     [pathim.promise-macros :refer [clet ctry]]))
@@ -23,10 +25,10 @@
    (fn mutation-resolve-params-external [mutate]
      (fn mutation-resolve-params-internal [env {:keys [key] :as ast}]
        (let [{::pco/keys [params]} (pci/mutation-config env key)]
-         ;; Upstream picks the async interface when running under the async runner. This
-         ;; port carries only the sync runner, so params always resolve through it.
          (clet [params' (if params
-                          (p.eql/process env (:params ast) params)
+                          (if (::pcra/async-runner? env)
+                            (p.a.eql/process env (:params ast) params)
+                            (p.eql/process env (:params ast) params))
                           (:params ast))]
            (mutate env (assoc ast :params params'))))))})
 

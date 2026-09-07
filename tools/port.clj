@@ -162,7 +162,13 @@
    "connect/operation_test"
    "connect/planner_test"
    "connect/built_in/resolvers_test"
+   "connect/runner_test"
    "interface/eql_test"])
+
+(def test-files-clj
+  "Upstream test files that are .clj rather than .cljc -- the async interface's suite is
+   JVM-only upstream, since it needs blocking derefs."
+  ["interface/async/eql_test"])
 
 (let [[pathom eql misc out] *command-line-args*]
   (when-not out
@@ -174,6 +180,8 @@
                               "plugin" "format/eql" "format/shape_descriptor"
                               "connect/operation" "connect/indexes" "connect/planner" "connect/foreign"
                               "connect/runner" "connect/runner/stats" "interface/eql"
+                              "connect/runner/async" "connect/runner/parallel"
+                              "interface/async/eql"
                               "connect/built_in/resolvers" "connect/built_in/plugins"]]
                        [(str pathom "/src/main/com/wsscode/pathom3/" f ".cljc") (str f ".jank")])
                      [[(str eql "/src/edn_query_language/core.cljc") "eql.jank"]]
@@ -181,6 +189,9 @@
                        [(str misc "/src/main/com/wsscode/misc/" f ".cljc") (str "misc/" f ".jank")])
                      (for [f test-files]
                        [(str pathom "/test/com/wsscode/pathom3/" f ".cljc")
+                        (str "TESTS/" f ".jank")])
+                     (for [f test-files-clj]
+                       [(str pathom "/test/com/wsscode/pathom3/" f ".clj")
                         (str "TESTS/" f ".jank")]))]
     (when (fs/exists? in)
       (port-file in (str out "/" rel)))))
