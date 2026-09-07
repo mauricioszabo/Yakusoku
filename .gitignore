@@ -3,3 +3,4 @@ target/
 *.o
 *.so
 *.a
+pom.xml

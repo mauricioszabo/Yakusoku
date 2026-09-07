@@ -36,10 +36,22 @@ lines, most of it explaining itself.
 - Standalone Asio headers — `apt install libasio-dev`, `brew install asio`, or vendored at
   `third-party/asio`
 
+The same applies to any project that *depends* on Yakusoku: its `lein compile` runs
+Yakusoku's `jank-build.bb`, which compiles Asio, so Asio's headers need to be present there
+too. Leiningen's jank build also sandboxes build scripts with bubblewrap, so `bwrap` must be
+installed (or pass `lein --disable-sandbox`).
+
 ## Usage
 
 With Leiningen and `lein-jank`, add the dependency and let `jank-build.bb` do the rest; it
-locates Asio, compiles it, and emits the include/link flags.
+locates Asio, compiles it, and emits the include/link flags:
+
+```clojure
+:dependencies [[org.clojars.mauricioszabo/yakusoku "0.1.0"]]
+```
+
+Verified end to end from a project created with `lein new org.jank-lang/jank`: `lein compile`,
+`lein run` and `lein repl` all work against the published jar.
 
 Without Leiningen:
 
