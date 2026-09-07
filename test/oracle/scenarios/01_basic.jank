@@ -1,0 +1,32 @@
+;; Resolver basics: a single resolver, a dependency chain, and inputs already present.
+(ns oracle.01-basic
+  (:require [pathim.connect.operation :as pco]
+            [pathim.connect.indexes :as pci]
+            [pathim.interface.eql :as p.eql]))
+
+(pco/defresolver full-name [{:keys [first-name last-name]}]
+  {:full-name (str first-name " " last-name)})
+
+(pco/defresolver greeting [{:keys [full-name]}]
+  {:greeting (str "Hello, " full-name "!")})
+
+(pco/defresolver initials [{:keys [first-name last-name]}]
+  {:initials (str (subs first-name 0 1) (subs last-name 0 1))})
+
+(def env (pci/register [full-name greeting initials]))
+
+;; one hop
+(prn (p.eql/process env {:first-name "Ada" :last-name "Lovelace"} [:full-name]))
+;; two hops: greeting depends on full-name, which depends on the input
+(prn (p.eql/process env {:first-name "Ada" :last-name "Lovelace"} [:greeting]))
+;; several attributes at once
+(prn (p.eql/process env {:first-name "Ada" :last-name "Lovelace"} [:greeting :initials :full-name]))
+;; attributes already in the entity are returned as-is
+(prn (p.eql/process env {:first-name "Ada" :last-name "Lovelace"} [:first-name]))
+;; an attribute nothing can resolve: Pathom refuses to plan, in both implementations
+(prn (try
+       (p.eql/process env {:first-name "Ada"} [:greeting])
+       (catch cpp/jank.runtime.object_ref e
+         [:error (ex-message e)])))
+;; empty query
+(prn (p.eql/process env {:first-name "Ada"} []))

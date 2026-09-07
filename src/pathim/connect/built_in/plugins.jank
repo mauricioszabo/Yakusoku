@@ -1,0 +1,180 @@
+(ns pathim.connect.built-in.plugins
+  (:require
+    [pathim.misc :refer [raise!]]
+    [pathim.log :as l]
+    [pathim.misc.coll :as coll]
+    [pathim.misc.time :as time]
+    [pathim.connect.indexes :as pci]
+    [pathim.connect.operation :as pco]
+    [pathim.connect.planner :as pcp]
+    [pathim.connect.runner :as pcr]
+    [pathim.format.shape-descriptor :as pfsd]
+    [pathim.interface.eql :as p.eql]
+    [pathim.plugin :as p.plugin]
+    [pathim.promise-macros :refer [clet ctry]]))
+
+(p.plugin/defplugin mutation-resolve-params
+  "Remove the run stats from the result meta. Use this in production to avoid sending
+  the stats. This is important for performance and security.
+
+  TODO: error story is not complete, still up to decide what to do when params can't
+  get fulfilled."
+  {::pcr/wrap-mutate
+   (fn mutation-resolve-params-external [mutate]
+     (fn mutation-resolve-params-internal [env {:keys [key] :as ast}]
+       (let [{::pco/keys [params]} (pci/mutation-config env key)]
+         ;; Upstream picks the async interface when running under the async runner. This
+         ;; port carries only the sync runner, so params always resolve through it.
+         (clet [params' (if params
+                          (p.eql/process env (:params ast) params)
+                          (:params ast))]
+           (mutate env (assoc ast :params params'))))))})
+
+
+
+(defn resolver-weight-tracker
+  "Starts an atom to track the weight of a resolver. The weight is calculated by measuring
+  the time a resolver takes to run. The time is added to last known time (or 1 in case of
+  no previous data) and divided by two to get the new weight.
+
+  You should use this plugin to enable weight sorting."
+  []
+  (let [weights* (atom {})]
+    {::p.plugin/id
+     `resolver-weight-tracker
+
+     ::pcr/wrap-root-run-graph!
+     (fn [process]
+       (fn [env ast entity*]
+         (process (coll/merge-defaults env {::pcr/resolver-weights* weights*}) ast entity*)))
+
+     ::pcr/wrap-resolve
+     (fn [resolve]
+       (fn [{::pcr/keys [resolver-weights*]
+             ::pcp/keys [node]
+             :as        env} input]
+         (let [{::pco/keys [op-name]} node]
+           (ctry
+             (clet [start   (time/now-ms)
+                    result  (resolve env input)
+                    elapsed (- (time/now-ms) start)]
+               (swap! resolver-weights* update op-name #(/ (+ (or % 1) elapsed) 2))
+               result)
+             (catch cpp/jank.runtime.object_ref e
+               (swap! resolver-weights* update op-name #(* (or % 10) 2))
+               (raise! e))))))}))
+
+(defn filtered-sequence-items-plugin
+  "By default, in Pathom strict mode, when an error occurs with one item in a sequence
+  that will stop the process completly. This plugin provides a way to add some tolerance
+  there. The way it does it is by filtering out of the output sequence any items that
+  are unable to process fully.
+
+  In is default form, this plugin will only apply to cases where the use sets the meta
+  `::pbip/remove-error-items` in the query join, eg:
+
+      (p.eql/process
+        (p.plugin/register env (pbip/filtered-sequence-items-plugin))
+        [^::pbip/remove-error-items {:some-join [:x :y]}])
+
+  Now the items that can't conform from inside :some-join will get filtered out.
+
+  You can also make this applies everywhere by starting the plugin with the `apply
+  everywhere` configuration:
+
+      (p.eql/process
+        (p.plugin/register env (pbip/filtered-sequence-items-plugin {::pbip/apply-everywhere? true}))
+        [^::pbip/remove-error-items {:some-join [:x :y]}])"
+  ([] (filtered-sequence-items-plugin {}))
+  ([{::keys [apply-everywhere?]}]
+   {::p.plugin/id
+    `filtered-sequence-items-plugin
+
+    ::pcr/wrap-process-sequence-item
+    (fn [map-subquery]
+      (fn [env ast m]
+        (ctry
+          (map-subquery env ast m)
+          (catch cpp/jank.runtime.object_ref e
+            (if (or apply-everywhere?
+                    (-> ast :meta ::remove-error-items))
+              nil
+              (raise! e))))))}))
+
+(defn env-wrap-plugin
+  "Plugin to help extend the environment with something dynamic. This will run once
+  around the whole request.
+
+      (p.plugin/register env (pbip/env-modify-plugin #(assoc % :data \"bar\")))"
+  [env-modifier]
+  {::p.plugin/id
+   `env-wrap-plugin
+
+   ::pcr/wrap-root-run-graph!
+   (fn track-request-root-run-external [process]
+     (fn track-request-root-run-internal [env ast entity*]
+       (process
+         (env-modifier env)
+         ast
+         entity*)))})
+
+(defn dev-linter
+  "This plugin adds linting features to help developers find sources of issues while
+  Pathom runs its system.
+
+  Checks done:
+
+  - Verify if all the output that comes out of the resolver is declared in the resolver
+    output. This means the user missed some attribute declaration in the resolver output
+    and that may cause inconsistent behavior on planning/running."
+  []
+  {::p.plugin/id
+   `dev-linter
+
+   ::pcr/wrap-resolve
+   (fn [resolve]
+     (fn [env input]
+       (clet [{::pco/keys [provides op-name]} (pci/resolver-config env (-> env ::pcp/node ::pco/op-name))
+              res              (resolve env input)
+              unexpected-shape (pfsd/difference (pfsd/data->shape-descriptor res) provides)]
+         (if (seq unexpected-shape)
+           (l/warn ::undeclared-output
+                   {::pco/op-name      op-name
+                    ::pco/provides     provides
+                    ::unexpected-shape unexpected-shape}))
+         res)))})
+
+(defn placeholder-data-params
+  "This plugin will make placeholder params change data from the entity they point to.
+  This behavior used to happen by default in the past, but it's now provided in the form
+  of this plugin.
+
+      (p.plugin/register env (pbip/placeholder-data-params))
+
+  Then you can do:
+
+      (p.eql/process env [{'(:>/foo {:some-data \"value\"}) [:some-data]}]
+      => {:some-data \"value\"}"
+  []
+  {::p.plugin/id
+   `placeholder-data-params
+
+   ::pcr/wrap-placeholder-merge-entity
+   (fn placeholder-data-external [_]
+     (fn placeholder-data-internal
+       [{::pcp/keys [graph] ::pcr/keys [source-entity]}]
+       (reduce
+         (fn [out ph]
+           (let [data (:params (pcp/entry-ast graph ph))]
+             (assoc out ph (merge source-entity data))))
+         {}
+         (::pcp/placeholders graph))))})
+
+(defn ^:deprecated attribute-errors-plugin
+  "DEPRECATED: attribute errors are now built-in, you can just remove it
+  from your setup.
+
+  This plugin makes attributes errors visible in the data."
+  []
+  {::p.plugin/id
+   `attribute-errors-plugin})

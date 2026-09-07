@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Runs every oracle scenario through both the jank port and real Pathom 3 on babashka, and
+# compares the results.
+#
+# A scenario is written once, against pathim. The Pathom variant is generated from it by
+# rewriting namespace prefixes, so the two runs execute the same code against the two
+# implementations. Namespaced keywords in the output are rewritten the same way before
+# comparing, since ::pco/foo differs only by namespace between them.
+set -uo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+work="${TMPDIR:-/tmp}/pathim-oracle"
+bb="${BB:-bb}"
+mkdir -p "$work"
+
+[ -f "${root}/target/native/libyakusoku-asio.so" ] || "${root}/bin/build-native" >/dev/null
+
+pass=0; fail=0
+for scenario in "${root}"/test/oracle/scenarios/*.jank; do
+  name="$(basename "$scenario" .jank)"
+
+  # the jank side
+  jank run $("${root}/bin/jank-flags") --module-path "${root}/src:${root}/test/oracle/scenarios" \
+    "$scenario" > "${work}/${name}.jank.out" 2>"${work}/${name}.jank.err"
+  if [ $? -ne 0 ]; then
+    echo "  ERROR ${name} (jank run failed)"; sed 's/^/        /' "${work}/${name}.jank.err" | head -12
+    fail=$((fail+1)); continue
+  fi
+
+  # the Pathom side: same source, upstream namespaces
+  # Namespaces, plus the one piece of syntax the two dialects genuinely disagree on: jank
+  # catches the runtime's object_ref where Clojure catches a class.
+  sed -e 's/pathim\.connect\.built-in\./com.wsscode.pathom3.connect.built-in./g' \
+      -e 's/pathim\.eql/edn-query-language.core/g' \
+      -e 's/pathim\./com.wsscode.pathom3./g' \
+      -e 's|cpp/jank\.runtime\.object_ref|Throwable|g' \
+      "$scenario" > "${work}/${name}.pathom.clj"
+  (cd "${root}/test/oracle" && "$bb" "${work}/${name}.pathom.clj") \
+    > "${work}/${name}.pathom.out" 2>"${work}/${name}.pathom.err"
+  if [ $? -ne 0 ]; then
+    echo "  ERROR ${name} (pathom run failed)"; sed 's/^/        /' "${work}/${name}.pathom.err" | head -12
+    fail=$((fail+1)); continue
+  fi
+
+  # keyword namespaces differ only by prefix; align them before comparing
+  sed -e 's/com\.wsscode\.pathom3\./PATHOMNS./g' -i "${work}/${name}.pathom.out"
+  sed -e 's/pathim\./PATHOMNS./g' -i "${work}/${name}.jank.out"
+
+  if "$bb" "${root}/test/oracle/compare.clj" "$name" "${work}/${name}.jank.out" "${work}/${name}.pathom.out"; then
+    pass=$((pass+1))
+  else
+    fail=$((fail+1))
+  fi
+done
+
+echo
+echo "oracle: ${pass} passed, ${fail} failed"
+[ "$fail" -eq 0 ]

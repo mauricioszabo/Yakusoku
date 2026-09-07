@@ -1,0 +1,32 @@
+;; Idents and unions -- the EQL shapes beyond plain properties and joins.
+(ns oracle.08-idents-unions
+  (:require [pathim.connect.operation :as pco]
+            [pathim.connect.indexes :as pci]
+            [pathim.interface.eql :as p.eql]))
+
+(pco/defresolver user [{:user/keys [id]}]
+  {::pco/output [:user/name :user/kind]}
+  {:user/name (str "user-" id)
+   :user/kind (if (odd? id) :admin :guest)})
+
+(pco/defresolver admin-extra [{:user/keys [id]}]
+  {:admin/level (* id 10)})
+
+(pco/defresolver guest-extra [{:user/keys [id]}]
+  {:guest/expires (str "day-" id)})
+
+(pco/defresolver feed []
+  {::pco/output [{:feed [:user/id]}]}
+  {:feed [{:user/id 1} {:user/id 2}]})
+
+(def env (pci/register [user admin-extra guest-extra feed]))
+
+;; an ident query
+(prn (p.eql/process env [{[:user/id 1] [:user/name :user/kind]}]))
+;; ident with a deeper attribute
+(prn (p.eql/process env [{[:user/id 3] [:admin/level]}]))
+;; a union over a sequence, dispatching on :user/kind
+(prn (p.eql/process env [{:feed {:admin [:user/name :admin/level]
+                                 :guest [:user/name :guest/expires]}}]))
+;; unions need a dispatch key present
+(prn (p.eql/process env [{:feed [:user/name :user/kind]}]))

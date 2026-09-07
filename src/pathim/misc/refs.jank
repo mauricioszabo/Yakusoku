@@ -1,0 +1,44 @@
+;; Ported from com.wsscode.misc.refs (cljc-misc), MPL-2.0.
+
+(ns pathim.misc.refs
+  "Uniform access to atoms and volatiles.
+
+   Upstream does this with a GenericBox protocol extended to Atom and Volatile. jank has
+   neither protocols nor a working `instance?`, so dispatch asks the runtime for the
+   object's type instead -- the same approach yakusoku.impl uses to recognise native
+   promises. clojure.core/volatile? already works in jank, so only atom? is defined here.")
+
+(defn kw-identical?
+  "Efficient keyword comparison."
+  [kw-a kw-b]
+  (identical? kw-a kw-b))
+
+(defn atom?
+  "True if x is an atom."
+  [x]
+  (cpp/== cpp/jank.runtime.object_type.atom (.get_type x)))
+
+(defn box?
+  "True if x is something greset!/gswap! can write to."
+  [x]
+  (or (atom? x) (volatile? x)))
+
+(defn greset!
+  "Sets the value of an atom or a volatile."
+  [this value]
+  (if (atom? this)
+    (reset! this value)
+    (vreset! this value)))
+
+(defn gswap!
+  "Applies f to the value of an atom or a volatile, in place."
+  ([this f]
+   (if (atom? this) (swap! this f) (vswap! this f)))
+  ([this f x]
+   (if (atom? this) (swap! this f x) (vswap! this f x)))
+  ([this f x y]
+   (if (atom? this) (swap! this f x y) (vswap! this f x y)))
+  ([this f x y & more]
+   (if (atom? this)
+     (apply swap! this f x y more)
+     (vreset! this (apply f (deref this) x y more)))))

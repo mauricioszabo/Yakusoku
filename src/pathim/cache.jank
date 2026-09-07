@@ -1,0 +1,59 @@
+(ns pathim.cache
+  "Ported from com.wsscode.pathom3.cache, MPL-2.0.
+
+   Upstream defines a CacheStore protocol and extends it to Atom and Volatile. jank has
+   neither protocols nor a working instance?, so a cache store here is simply an atom or a
+   volatile, recognised by asking the runtime for its type (see pathim.misc.refs).
+
+   A custom cache store therefore cannot be plugged in the way it can upstream; that needs
+   protocols, or a dispatch key this port does not yet define."
+  (:require
+    [pathim.misc.refs :as refs]))
+
+(defn cache-store?
+  "True for something the cache functions can read and write: an atom or a volatile."
+  [x]
+  (refs/box? x))
+
+(defn -cache-lookup-or-miss
+  "Reads cache-key from the store, or computes it with f and caches that. Always returns a
+   value. f is a function of no arguments."
+  [this cache-key f]
+  (let [cache (deref this)]
+    (if-let [entry (find cache cache-key)]
+      (val entry)
+      (let [res (f)]
+        (refs/gswap! this assoc cache-key res)
+        res))))
+
+(defn -cache-find
+  "Reads cache-key from the store, returning a map entry on a hit and nil on a miss. The
+   map entry is what distinguishes a miss from a cached nil."
+  [this cache-key]
+  (find (deref this) cache-key))
+
+(defn cached
+  "Try to read some value from a cache, otherwise run and cache it.
+
+  cache-container is a keyword for the cache container name, consider that the environment
+  has multiple cache atoms. If the cache-container key is not present in the env, the
+  cache will be ignored and will always run f.
+
+  cache-key is how you decide, in that cache container, what key should be used for
+  this cache try.
+
+  f needs to be a function of zero arguments.
+
+  Example:
+
+      (cached ::my-cache {::my-cache (atom {})} [3 :foo]
+        (fn [] (run-expensive-operation)))"
+  [cache-container env cache-key f]
+  (if-let [cache* (get env cache-container)]
+    (-cache-lookup-or-miss cache* cache-key f)
+    (f)))
+
+(defn cache-find
+  "Read from cache, without trying to set."
+  [cache cache-key]
+  (-cache-find cache cache-key))

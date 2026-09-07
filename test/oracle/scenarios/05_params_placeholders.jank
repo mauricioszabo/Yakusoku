@@ -1,0 +1,27 @@
+;; Placeholders and resolver parameters.
+(ns oracle.05-params-placeholders
+  (:require [pathim.connect.operation :as pco]
+            [pathim.connect.indexes :as pci]
+            [pathim.interface.eql :as p.eql]))
+
+(pco/defresolver answer []
+  {:answer 42})
+
+(pco/defresolver echo-params [env _]
+  {::pco/output [:params-seen]}
+  {:params-seen (or (pco/params env) {})})
+
+(pco/defresolver person [{:keys [id]}]
+  {::pco/output [:name :age]}
+  {:name (str "person-" id) :age (* id 2)})
+
+(def env (pci/register [answer echo-params person]))
+
+;; placeholders let the same entity be queried under several keys
+(prn (p.eql/process env {:id 3} [{:>/summary [:name]} {:>/details [:name :age]}]))
+;; params reach the resolver
+(prn (p.eql/process env ['(:params-seen {:limit 10})]))
+;; params on a join
+(prn (p.eql/process env {:id 1} [{'(:>/aliased {:x 1}) [:name]}]))
+;; a plain nested placeholder
+(prn (p.eql/process env {:id 5} [{:>/nested [{:>/deeper [:age]}]}]))

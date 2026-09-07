@@ -1,0 +1,17 @@
+(ns pathim.placeholder
+  (:require
+    [pathim.path :as p.path]))
+
+
+
+(defn placeholder-key?
+  "Check if a given key is a placeholder."
+  [{::p.path/keys [placeholder-prefixes]} k]
+  (let [placeholder-prefixes (or placeholder-prefixes #{">"})]
+    (and (keyword? k)
+         (contains? placeholder-prefixes (namespace k)))))
+
+(defn find-closest-non-placeholder-parent-join-key
+  "Find the closest parent key that's not a placeholder key."
+  [{::p.path/keys [path] :as env}]
+  (->> (or path []) rseq (drop 1) (remove #(placeholder-key? env %)) first))

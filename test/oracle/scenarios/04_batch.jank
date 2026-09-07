@@ -1,0 +1,30 @@
+;; Batch resolvers: Pathom collects inputs across a sequence and resolves them in one call.
+(ns oracle.04-batch
+  (:require [pathim.connect.operation :as pco]
+            [pathim.connect.indexes :as pci]
+            [pathim.interface.eql :as p.eql]))
+
+(def call-count (atom 0))
+
+(pco/defresolver batch-double [items]
+  {::pco/input  [:n]
+   ::pco/output [:double]
+   ::pco/batch? true}
+  (swap! call-count inc)
+  (mapv (fn [{:keys [n]}] {:double (* 2 n)}) items))
+
+(pco/defresolver items []
+  {::pco/output [{:list [:n]}]}
+  {:list [{:n 1} {:n 2} {:n 3} {:n 4}]})
+
+(def env (pci/register [batch-double items]))
+
+;; the batch resolver runs once for the whole sequence
+(reset! call-count 0)
+(prn (p.eql/process env [{:list [:n :double]}]))
+(prn [:resolver-calls @call-count])
+
+;; a single entity still works through the same resolver
+(reset! call-count 0)
+(prn (p.eql/process env {:n 21} [:double]))
+(prn [:resolver-calls @call-count])

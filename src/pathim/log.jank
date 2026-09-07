@@ -1,0 +1,23 @@
+;; Stands in for com.wsscode.log, which this port does not carry.
+
+(ns pathim.log
+  "Minimal logging, in place of com.wsscode.log.
+
+   Upstream's log library carries a richer notion of events and handlers. Pathom uses only
+   `warn`, and only to report conditions that are surprising but recoverable, so this
+   prints to stderr and stays out of the way.
+
+   Bind *log-fn* to route these somewhere else, or to nil to silence them.")
+
+(def ^:dynamic *log-fn*
+  "Called with the event keyword and its data map. Set to nil to silence logging."
+  (fn [event data]
+    (println (str "WARN " event " " (pr-str data)))))
+
+(defn warn
+  "Reports an event with its data."
+  ([event] (warn event {}))
+  ([event data]
+   (when *log-fn*
+     (*log-fn* event data))
+   nil))

@@ -1,0 +1,45 @@
+;; Ported from com.wsscode.promesa.macros (pathom3), MPL-2.0, onto Yakusoku.
+
+(ns pathim.promise-macros
+  "Macros that let one body of code serve both synchronous and asynchronous resolvers.
+
+   `clet` only reaches for a promise if a binding actually produces one, so sync code pays
+   nothing; `ctry` catches from either world. Upstream builds these on promesa -- here they
+   are built on Yakusoku, which is the same shape."
+  (:require
+    [yakusoku.core :as p]))
+
+(defmacro clet
+  "Like let, but a binding that produces a promise is awaited before the rest runs, and the
+   whole form then yields a promise. If no binding produces one, this behaves exactly like
+   let and returns a plain value."
+  [bindings & body]
+  (assert (even? (count bindings)) "clet requires an even number of binding forms")
+  (let [binds (reverse (partition 2 bindings))]
+    (reduce
+      (fn [acc [l r]]
+        `(let [r# ~r]
+           (if (p/promise? r#)
+             (p/then r# (fn [~l] ~acc))
+             (let [~l r#]
+               ~acc))))
+      `(do ~@body)
+      binds)))
+
+(defmacro ctry
+  "Like try, but also catches a rejection when the body yields a promise.
+
+      (ctry
+        (clet [x (maybe-async-op)]
+          (handle x))
+        (catch cpp/jank.runtime.object_ref e
+          :error))"
+  [& body]
+  (let [[_ ex-kind ex-sym & ex-body] (last body)
+        body (butlast body)]
+    `(try
+       (let [res# (do ~@body)]
+         (if (p/promise? res#)
+           (p/catch res# (fn [~ex-sym] ~@ex-body))
+           res#))
+       (catch ~ex-kind ~ex-sym ~@ex-body))))

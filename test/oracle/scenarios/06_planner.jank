@@ -1,0 +1,43 @@
+;; The planner's own output. This is the part of Pathom most likely to drift in a port:
+;; 2400 lines of graph building whose result is a data structure, not a behaviour.
+(ns oracle.06-planner
+  (:require [pathim.connect.operation :as pco]
+            [pathim.connect.indexes :as pci]
+            [pathim.connect.planner :as pcp]
+            [pathim.eql :as eql]))
+
+(pco/defresolver a->b [{:keys [a]}] {:b (inc a)})
+(pco/defresolver b->c [{:keys [b]}] {:c (inc b)})
+(pco/defresolver a->d [{:keys [a]}] {:d (inc a)})
+(pco/defresolver cd->e [{:keys [c d]}] {:e 1})
+(pco/defresolver alt-c [{:keys [z]}] {:c 99})
+
+(def env (pci/register [a->b b->c a->d cd->e alt-c]))
+
+(defn plan [available query]
+  (let [graph (pcp/compute-run-graph
+                (assoc env
+                  :edn-query-language.ast/node (eql/query->ast query)
+                  ::pcp/available-data available))]
+    ;; the whole graph carries functions and volatile ids; these are the stable parts
+    {:ops        (sort (map str (keep :pathim.connect.operation/op-name
+                                      (vals (::pcp/nodes graph)))))
+     :node-count (count (::pcp/nodes graph))
+     :root?      (boolean (::pcp/root graph))
+     :unreachable (::pcp/unreachable-paths graph)
+     :index-attrs (into (sorted-map)
+                        (map (fn [[k v]] [k (if (set? v) (sort v) v)]))
+                        (::pcp/index-attrs graph))}))
+
+;; a straight chain: a -> b -> c
+(prn (plan {:a {}} [:c]))
+;; a diamond: c and d both needed for e
+(prn (plan {:a {}} [:e]))
+;; several independent attributes
+(prn (plan {:a {}} [:b :d]))
+;; already-available data needs no resolver
+(prn (plan {:a {} :b {}} [:b]))
+;; a choice between two resolvers for the same attribute
+(prn (plan {:a {} :z {}} [:c]))
+;; nothing to do
+(prn (plan {:a {}} [:a]))

@@ -1,0 +1,11 @@
+;; Ported from com.wsscode.misc.macros (cljc-misc), MPL-2.0.
+
+(ns pathim.misc.macros)
+
+(defn full-symbol
+  "Expands a symbol during macro compilation: a qualified symbol is returned as is,
+   otherwise fallback-ns becomes its namespace."
+  [sym fallback-ns]
+  (if (namespace sym)
+    sym
+    (symbol fallback-ns (name sym))))

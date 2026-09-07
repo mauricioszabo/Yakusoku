@@ -1,0 +1,33 @@
+;; What happens when resolvers fail or attributes cannot be reached.
+(ns oracle.03-errors
+  (:require [pathim.connect.operation :as pco]
+            [pathim.connect.indexes :as pci]
+            [pathim.interface.eql :as p.eql]))
+
+(pco/defresolver boom [{:keys [id]}]
+  {::pco/output [:explodes]}
+  (throw (ex-info "resolver failed" {:id id})))
+
+(pco/defresolver fine [{:keys [id]}]
+  {:doubled (* 2 id)})
+
+(pco/defresolver optional-dep [{:keys [id] :as input}]
+  {::pco/input  [:id (pco/? :maybe-missing)]
+   ::pco/output [:with-optional]}
+  {:with-optional (str id "/" (:maybe-missing input "none"))})
+
+(def env (pci/register [boom fine optional-dep]))
+
+;; a resolver that throws
+(prn (try (p.eql/process env {:id 1} [:explodes])
+          (catch cpp/jank.runtime.object_ref e [:error (ex-message e)])))
+;; the failure does not stop a sibling attribute from resolving
+(prn (try (p.eql/process env {:id 1} [:doubled])
+          (catch cpp/jank.runtime.object_ref e [:error (ex-message e)])))
+;; an optional input that is absent
+(prn (p.eql/process env {:id 7} [:with-optional]))
+;; an optional input that is present
+(prn (p.eql/process env {:id 7 :maybe-missing "here"} [:with-optional]))
+;; querying an attribute no resolver provides
+(prn (try (p.eql/process env {:id 1} [:nonexistent])
+          (catch cpp/jank.runtime.object_ref e [:error (ex-message e)])))

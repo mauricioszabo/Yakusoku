@@ -1,0 +1,154 @@
+(ns pathim.plugin
+  (:require
+    [pathim.misc :refer [raise!]]
+    [pathim.misc.coll :as coll]
+    [pathim.misc.macros :as macros]))
+
+
+
+
+
+
+
+
+
+
+
+
+
+(defn compile-extensions
+  "Given a function and a list of extension wrappers, call then in order to create
+  a composed functions of them."
+  [f extension-wrappers]
+  (reduce
+    (fn [f wrapper]
+      (wrapper f))
+    f
+    extension-wrappers))
+
+(defn compile-env-extensions
+  [env plugin-type f]
+  (if-let [plugins (get-in env [::plugin-actions plugin-type])]
+    (compile-extensions f plugins)
+    f))
+
+(defn build-plugin-actions [{::keys [plugin-order index-plugins] :as env} k]
+  (assoc-in env [::plugin-actions k]
+    (into
+      []
+      (keep
+        (fn [{::keys [id]}]
+          (get-in index-plugins [id k])))
+      (rseq plugin-order))))
+
+(defn add-plugin-at-order
+  [{::keys [plugin-order] :as env} {::keys [id add-before add-after]}]
+  (assert (or (not (or add-before add-after))
+              (not (and add-before add-after)))
+    "You can provide add-before or add-after, but not both at the same time.")
+  (let [ref-id       (or add-before add-after)
+        ref-position (coll/index-of plugin-order {::id ref-id})]
+    (cond-> env
+      add-before
+      (update-in [::plugin-order] coll/conj-at-index ref-position {::id id})
+
+      add-after
+      (update-in [::plugin-order] coll/conj-at-index (inc ref-position) {::id id})
+
+      (not (or add-before add-after))
+      (update-in [::plugin-order] coll/vconj {::id id}))))
+
+(defn plugin-extensions [plugin]
+  (keys (coll/filter-vals fn? plugin)))
+
+(defn refresh-actions-from-plugin [env plugin]
+  (reduce
+    build-plugin-actions
+    env
+    (plugin-extensions plugin)))
+
+(defn register-plugin
+  "Add a new plugin to the end. This will create the appropriated structures to optimize
+  the plugin call speed."
+  ([plugin]
+   (register-plugin {} plugin))
+  ([env {::keys [id] :as plugin}]
+   (assert (nil? (get-in env [::index-plugins id]))
+     (str "Tried to add duplicated plugin: " id))
+   (let [env' (-> env
+                  (assoc-in [::index-plugins id] plugin)
+                  (add-plugin-at-order plugin))]
+     (refresh-actions-from-plugin env' plugin))))
+
+(defn register-before
+  ([env ref-id plugin]
+   (register-plugin env (assoc plugin ::add-before ref-id))))
+
+(defn register-after
+  ([env ref-id plugin]
+   (register-plugin env (assoc plugin ::add-after ref-id))))
+
+(defn register
+  "Add one or many plugins."
+  ([plugins] (register {} plugins))
+  ([env plugins]
+   (cond
+     (::id plugins)
+     (register-plugin env plugins)
+
+     (sequential? plugins)
+     (reduce
+       (fn [e p] (register e p))
+       env
+       plugins)
+
+     :else
+     (raise!
+       (ex-info "Invalid plugin, make sure you set the ::p.plugin/id on it."
+                {:plugin plugins})))))
+
+(defn remove-plugin
+  "Remove a plugin."
+  [env plugin-id]
+  (if-let [{::keys [id] :as plugin} (get-in env [::index-plugins plugin-id])]
+    (let [env' (-> env
+                   (update ::index-plugins dissoc id)
+                   (update ::plugin-order #(into [] (remove #{{::id id}}) %)))]
+      (refresh-actions-from-plugin env' plugin))
+    env))
+
+(defn run-with-plugins
+  "Run some operation f wrapping it with the plugins of a given plugin-type installed
+  in the environment."
+  ([env plugin-type f]
+   (let [augmented-v (compile-env-extensions env plugin-type f)]
+     (augmented-v)))
+  ([env plugin-type f a1]
+   (let [augmented-v (compile-env-extensions env plugin-type f)]
+     (augmented-v a1)))
+  ([env plugin-type f a1 a2]
+   (let [augmented-v (compile-env-extensions env plugin-type f)]
+     (augmented-v a1 a2)))
+  ([env plugin-type f a1 a2 a3]
+   (let [augmented-v (compile-env-extensions env plugin-type f)]
+     (augmented-v a1 a2 a3)))
+  ([env plugin-type f a1 a2 a3 a4]
+   (let [augmented-v (compile-env-extensions env plugin-type f)]
+     (augmented-v a1 a2 a3 a4)))
+  ([env plugin-type f a1 a2 a3 a4 a5]
+   (let [augmented-v (compile-env-extensions env plugin-type f)]
+     (augmented-v a1 a2 a3 a4 a5)))
+  ;; Upstream carries fixed arities through a8 plus a variadic one. jank allows at most 10
+  ;; parameters per arity, and requires the variadic arity to be no shorter than the
+  ;; longest fixed one, so the tail arities collapse into this variadic one. Pathom's own
+  ;; wrappers pass at most two arguments, so nothing in practice reaches it.
+  ([env plugin-type f a1 a2 a3 a4 a5 & args]
+   (apply (compile-env-extensions env plugin-type f) a1 a2 a3 a4 a5 args)))
+
+(defmacro defplugin
+  ([id doc options]
+   (let [fqsym (macros/full-symbol id (str *ns*))]
+     `(def ~id ~doc (merge {::id '~fqsym} ~options))))
+  ([id options]
+   (let [fqsym (macros/full-symbol id (str *ns*))]
+     `(def ~id (merge {::id '~fqsym} ~options)))))

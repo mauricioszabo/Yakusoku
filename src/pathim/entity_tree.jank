@@ -1,0 +1,54 @@
+(ns pathim.entity-tree
+  (:require
+    [pathim.misc.refs :as refs]))
+
+
+
+
+(defn entity
+  "Returns the entity tree value from env"
+  [{::keys [entity-tree*]}]
+  (some-> entity-tree* deref))
+
+(defn create-entity [x]
+  (atom x))
+
+(defn with-entity
+  "Set the entity in the environment. Note in this function you must send the cache-tree
+  as a map, not as an atom."
+  [env entity-tree]
+  (assoc env ::entity-tree* (atom entity-tree)))
+
+(defn reset-entity!
+  [{::keys [entity-tree*]} entity-tree]
+  (reset! entity-tree* entity-tree))
+
+(defn swap-entity!
+  "Swap cache-tree at the current path. Returns the updated whole cache-tree."
+  ([{::keys [entity-tree*]} f]
+   (swap! entity-tree* f))
+  ([{::keys [entity-tree*]} f x]
+   (swap! entity-tree* f x))
+  ([{::keys [entity-tree*]} f x y]
+   (swap! entity-tree* f x y))
+  ([{::keys [entity-tree*]} f x y & args]
+   (apply swap! entity-tree* f x y args)))
+
+(defn vswap-entity!
+  "Swap cache-tree at the current path. Returns the updated whole cache-tree."
+  ([{::keys [entity-tree*]} f]
+   (vswap! entity-tree* f))
+  ([{::keys [entity-tree*]} f x]
+   (vswap! entity-tree* f x))
+  ([{::keys [entity-tree*]} f x y]
+   (vswap! entity-tree* f x y))
+  ([{::keys [entity-tree*]} f x y & args]
+   (vreset! entity-tree* (apply f @entity-tree* x y args))))
+
+(defn merge-entity-data
+  "Specialized merge versions that work on entity data."
+  [entity new-data]
+  (reduce-kv
+    assoc
+    entity
+    new-data))

@@ -1,0 +1,31 @@
+;; The built-in resolvers (pbir).
+(ns oracle.07-built-ins
+  (:require [pathim.connect.operation :as pco]
+            [pathim.connect.indexes :as pci]
+            [pathim.connect.built-in.resolvers :as pbir]
+            [pathim.interface.eql :as p.eql]))
+
+(def env
+  (pci/register
+    [(pbir/constantly-resolver :pi 3.14)
+     (pbir/alias-resolver :customer/id :user/id)
+     (pbir/single-attr-resolver :user/id :user/label str)
+     (pbir/static-table-resolver :user/id
+       {1 {:user/name "Ada"}
+        2 {:user/name "Grace"}})
+     (pbir/global-data-resolver {:app/name "demo"})]))
+
+;; a constant
+(prn (p.eql/process env [:pi]))
+;; an alias between attributes
+(prn (p.eql/process env {:customer/id 1} [:user/id]))
+;; a table lookup
+(prn (p.eql/process env {:user/id 2} [:user/name]))
+;; alias feeding a table lookup
+(prn (p.eql/process env {:customer/id 1} [:user/name]))
+;; a derived single attribute
+(prn (p.eql/process env {:user/id 1} [:user/label]))
+;; global data
+(prn (p.eql/process env [:app/name]))
+;; all of it at once
+(prn (p.eql/process env {:customer/id 2} [:pi :app/name :user/name :user/label]))

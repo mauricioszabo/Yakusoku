@@ -1,0 +1,100 @@
+(ns pathim.error
+  (:require
+    [pathim.misc.coll :as coll]
+    [pathim.attribute :as p.attr]
+    [pathim.connect.planner :as pcp]
+    [pathim.plugin :as p.plugin]))
+
+
+
+
+
+
+
+(defn- optional? [index-ast attribute]
+  (get-in index-ast [attribute :params :pathim.connect.operation/optional?]))
+
+(defn attribute-node-error
+  [{:pathim.connect.runner/keys [node-run-stats]
+    ::p.attr/keys                            [attribute]
+    ::pcp/keys                               [index-ast]
+    :as                                      graph} node-id]
+  (let [{:pathim.connect.runner/keys [node-error node-run-finish-ms]} (get node-run-stats node-id)]
+    (cond
+      node-error
+      (coll/make-map-entry
+        node-id
+        {::cause     ::node-exception
+         ::exception node-error})
+
+      node-run-finish-ms
+      (if-not (optional? index-ast attribute)
+        (coll/make-map-entry
+          node-id
+          {::cause ::attribute-missing}))
+
+      :else
+      (if-let [[node-id' error] (->> (pcp/node-ancestors graph node-id)
+                                     (keep (fn [node-id]
+                                             (if-let [error (get-in node-run-stats [node-id :pathim.connect.runner/node-error])]
+                                               [node-id error])))
+                                     first)]
+        (coll/make-map-entry
+          node-id
+          {::cause             ::ancestor-error
+           ::error-ancestor-id node-id'
+           ::exception         error})))))
+
+(defn attribute-error
+  "Return the attribute error, in case it failed."
+  [response attribute]
+  (if (contains? response attribute)
+    nil
+    (let [{:pathim.connect.planner/keys [index-ast index-attrs] :as run-stats}
+          (-> response meta :pathim.connect.runner/run-stats)]
+      (if (contains? index-ast attribute)
+        (if-let [nodes (get index-attrs attribute)]
+          (let [run-stats (assoc run-stats ::p.attr/attribute attribute)
+                errors    (into {} (keep #(attribute-node-error run-stats %)) nodes)]
+            (if (seq errors)
+              {::cause              ::node-errors
+               ::node-error-details errors}))
+          (if-not (optional? index-ast attribute)
+            {::cause ::attribute-unreachable}))
+        {::cause ::attribute-not-requested}))))
+
+(defn scan-for-errors? [response]
+  ; some node error?
+  ; something unreachable?
+
+  ; is there a way to know if there wasn't any error without checking each attribute?
+
+  ; check if map has meta
+  (some-> response meta (contains? :pathim.connect.runner/run-stats)))
+
+(defn process-entity-errors [env entity]
+  (if (scan-for-errors? entity)
+    (let [ast    (-> entity meta
+                     :pathim.connect.runner/run-stats
+                     :pathim.connect.planner/index-ast)
+          errors (into {}
+                       (keep (fn [k]
+                               (if-let [error (p.plugin/run-with-plugins env ::wrap-attribute-error
+                                                attribute-error entity k)]
+                                 (coll/make-map-entry k error))))
+                       (keys ast))]
+      (cond-> entity
+        (seq errors)
+        (assoc :pathim.connect.runner/attribute-errors errors)))
+    entity))
+
+(defn error-stack
+  "Upstream renders a host stack trace here. jank throws its own runtime objects, which
+   carry no stack, so there is nothing honest to return."
+  [_err]
+  nil)
+
+(defn datafy-processor-error [^Throwable err]
+  {::error-message (ex-message err)
+   ::error-data    (ex-data err)
+   ::error-stack   (error-stack err)})

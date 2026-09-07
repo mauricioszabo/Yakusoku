@@ -1,0 +1,33 @@
+;; Ported from com.wsscode.pathom3.connect.operation.protocols, MPL-2.0.
+
+(ns pathim.connect.operation.protocols
+  "Upstream defines IOperation, IResolver and IMutation as protocols, implemented by the
+   Resolver and Mutation records. jank has neither protocols nor records, so an operation
+   is a map carrying its type, its config and its function, and these are plain functions
+   reading those keys.
+
+   The keys belong to pathim.connect.operation; they are spelled out here rather than
+   required, to avoid a circular dependency.")
+
+(def ^:private op-type-key :pathim.connect.operation/op-type)
+(def ^:private op-config-key :pathim.connect.operation/op-config)
+(def ^:private op-fn-key :pathim.connect.operation/op-fn)
+
+(defn operation?
+  "True if x is a Pathom operation -- a resolver or a mutation."
+  [x]
+  (and (map? x) (contains? x op-type-key)))
+
+(defn -operation-config [this] (get this op-config-key))
+
+(defn -operation-type [this] (get this op-type-key))
+
+(defn -operation-fn [this] (get this op-fn-key))
+
+;; Named -op-resolve rather than upstream's -resolve: jank's lexer reads a leading "-r" as
+;; the start of a radix literal (as in 2r1010) and rejects the symbol outright. -op-mutate
+;; follows for symmetry.
+
+(defn -op-resolve [this env input] ((get this op-fn-key) env input))
+
+(defn -op-mutate [this env params] ((get this op-fn-key) env params))

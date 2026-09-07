@@ -1,0 +1,15 @@
+;; Ported from com.wsscode.misc.time (cljc-misc), MPL-2.0.
+
+(ns pathim.misc.time
+  "Timing helpers. jank has no System/nanoTime or system-time, so both come from the
+   runtime's own C++ clock -- the same one clojure.core/time uses.")
+
+(defn now-ms
+  "Milliseconds from a monotonic high-resolution clock, as a double."
+  []
+  (/ (double (cpp/clojure.core_native.current_time)) 1000000.0))
+
+(defn sleep-ms
+  "Blocks the calling thread for ms milliseconds."
+  [ms]
+  (cpp/clojure.core_native.sleep ms))
