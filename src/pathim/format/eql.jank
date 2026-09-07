@@ -277,12 +277,19 @@
   (-> (data->query {::temp coll})
       ffirst val))
 
-(defn map-children->children [map-children]
-  (reduce-kv
-    (fn [children _ ast]
+(defn map-children->children
+  "Turns the key->node index back into a children vector, recursively.
+
+   Upstream reduce-kv's over the argument, which Clojure accepts for a vector as well as a
+   map (using indices as keys). jank's reduce-kv handles maps only, and this function
+   recurses on :children, which is a vector -- so the values are taken explicitly and
+   reduced as a sequence, which behaves identically for both shapes."
+  [map-children]
+  (reduce
+    (fn [children ast]
       (conj children (cond-> ast (:children ast) (update :children (fn [c] (map-children->children c))))))
     []
-    map-children))
+    (if (map? map-children) (vals map-children) map-children)))
 
 (defn merge-ast-children [ast1 ast2]
   (let [idx  (coll/index-by :key (:children ast1))
