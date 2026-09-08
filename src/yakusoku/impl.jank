@@ -117,7 +117,7 @@
 
 (defn stop!
   "Stops without waiting for pending timers. Work already submitted to the pool still runs
-   to completion -- an enqueued oneTBB task cannot be recalled."
+   to completion -- a submitted FastQueue task cannot be recalled."
   [p]
   (cpp/yakusoku.pool_stop (::pool p)))
 

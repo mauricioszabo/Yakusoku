@@ -12,13 +12,14 @@
 //      condition variable give us atomic settling and, crucially, a *timeout-capable*
 //      blocking wait, which jank's own `deref` does not support (it stubs the 3-arity out).
 //
-//   2. `pool` -- a oneTBB `task_arena`, whose workers each own a deque and steal from one
-//      another. We do not write a scheduler; oneTBB has one. The timer wheel above it is
-//      ours, since oneTBB schedules work but has no clock.
+//   2. `pool` -- a FastQueue thread pool with work stealing turned on, whose workers each
+//      own a deque and steal from one another. We do not write a scheduler; FastQueue has
+//      one. The timer wheel above it is ours, since FastQueue schedules work but has no
+//      clock.
 //
-//      oneTBB itself is not visible from this file: it sits behind three plain declarations
-//      in yakusoku_pool.hpp, reached through a `void *` and a function pointer, so jank
-//      never parses it. Everything jank-shaped stays here.
+//      FastQueue itself is not visible from this file: it sits behind three plain
+//      declarations in yakusoku_pool.hpp, reached through a `void *` and a function pointer.
+//      Everything jank-shaped stays here.
 //
 // Two rules govern every allocation below, both imposed by BDWGC:
 //
@@ -28,7 +29,7 @@
 //     `object_ref` across the queue boundary is allocated with GC_MALLOC_UNCOLLECTABLE,
 //     which is both a root and traced, and is freed once the handler has run.
 //
-//   * Worker threads are oneTBB's, not jank's. Work stealing needs per-worker deques
+//   * Worker threads are FastQueue's, not jank's. Work stealing needs per-worker deques
 //     bound to worker identity, so a stealing pool has to own its threads -- which is the
 //     one thing Asio did not require. `ensure_gc_registered` below is what makes that safe:
 //     each worker registers its stack with BDWGC the first time it runs a task.
@@ -229,20 +230,20 @@ namespace yakusoku
 
   /* Registers the calling thread with BDWGC, once.
 
-     oneTBB owns its worker threads -- work stealing needs per-worker deques bound to
+     FastQueue owns its worker threads -- work stealing needs per-worker deques bound to
      worker identity, so every stealing pool creates its own. That breaks the rule this file
      opened with, and the rule existed for a reason: BDWGC scans the stacks of threads it
      knows about, and a jank `object_ref` living on the stack of a thread it does not know
      can be collected while still in use.
 
      Registering lazily from inside the task is what makes library-owned threads safe. It is
-     done here rather than through oneTBB's `task_scheduler_observer` deliberately: Taskflow
-     spells the same hook differently and FastQueue has none at all, so keeping it in the
-     task path means all three ports share one mechanism instead of three.
+     done in the task path because FastQueue offers nowhere else to do it: it has no
+     per-worker start hook at all, where Taskflow has `tf::WorkerInterface` and oneTBB has
+     `task_scheduler_observer`. One mechanism serves all three ports.
 
      A thread that registers MUST unregister before it exits. Leaving a dead thread
      registered makes every later collection try to signal it, and BDWGC gives up with
-     "Signals delivery fails constantly at GC #41". The arena's workers never exit -- pools
+     "Signals delivery fails constantly at GC #41". The pool's workers never exit -- pools
      are uncollectable and never destroyed -- so they have nothing to undo; the timer thread
      is joined on shutdown and does, which is what release_gc_registration is for. */
   /* BDWGC will not accept registrations from threads it did not create until it has been
@@ -356,12 +357,12 @@ namespace yakusoku
 
   struct pool
   {
-    /* oneTBB's task_arena, held opaquely. Each worker owns a deque and steals
+    /* FastQueue's work-stealing pool, held opaquely. Each worker owns a deque and steals
        from others when its own runs dry, which is what an Asio io_context -- one shared FIFO
        queue -- does not do. */
     void *backend;
 
-    /* Timers. oneTBB schedules work but has no clock, so the wheel is ours: one thread
+    /* Timers. FastQueue schedules work but has no clock, so the wheel is ours: one thread
        per pool sleeping until the earliest deadline. Fired callbacks are posted to the
        executor rather than run here, matching how Asio ran timer handlers on pool
        workers. */
@@ -634,7 +635,7 @@ namespace yakusoku
       p->timer_thread.join();
     }
 
-    /* oneTBB has no "abandon queued work": an enqueued task cannot be recalled. shutdown-now therefore differs from Asio's, which
+    /* FastQueue has no "abandon queued work": a submitted task cannot be recalled. shutdown-now therefore differs from Asio's, which
        could drop a queued handler -- it stops accepting new timer work and waits out what is
        already running. Documented rather than faked. */
     backend::pool_wait_idle(p->backend);

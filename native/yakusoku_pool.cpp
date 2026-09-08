@@ -3,76 +3,50 @@
 // If a copy of the MPL was not distributed with this file, You can obtain one at
 // http://mozilla.org/MPL/2.0/.
 //
-// The oneTBB half of the pool, compiled ahead of time.
+// The FastQueue half of the pool, compiled ahead of time.
 //
-// oneTBB is the closest thing in C++ to the JVM's ForkJoinPool -- the same per-worker deques
-// and the same random stealing -- which makes it the most direct answer to "why is
-// parallel/many faster on the JVM".
+// FastQueue is a C library, so its headers would very likely survive jank's JIT where
+// Taskflow's did not. It is kept behind the same boundary anyway: the three ports then
+// differ in exactly one file, which is the point of comparing them.
 //
-// It is separate from yakusoku.hpp for the same reason the Taskflow version was: jank cannot
-// JIT-compile a library of this size safely, and keeping it out of jank's compiler entirely
-// is cheaper than finding out which part it chokes on. Deliberately this file knows nothing
-// about jank -- no object_ref, no GC, no boxing -- and crosses into yakusoku.hpp as an
-// opaque `void *` behind a plain function pointer.
+// Work stealing is off by default -- it lives on the scheduler config, not on the plain
+// fq_thread_pool_create_ex constructor -- so the pool is built through
+// fq_thread_pool_create_configured with it explicitly on. Building it any other way would
+// have measured a FIFO queue and called it work stealing.
 //
-// Submission uses `task_arena::enqueue`, which is fire-and-forget and, unlike
-// `task_arena::execute`, does not make the calling thread join the arena. That matters:
-// pool_submit is called from pool workers and from the timer thread, and neither should be
-// conscripted into running someone else's work. Since enqueue tracks nothing, the outstanding
-// count is ours.
+// One convenience the other two ports lack: fq_task_fn is already void (*)(void *), the same
+// shape as our boundary, so tasks cross without a wrapper.
 
-#include <atomic>
-#include <condition_variable>
-#include <mutex>
-
-#include <oneapi/tbb/task_arena.h>
+#include <fastqueue/thread_pool.h>
+#include <fastqueue/scheduler.h>
+#include <fastqueue/types.h>
 
 #include "yakusoku_pool.hpp"
 
 namespace yakusoku::backend
 {
-  namespace
-  {
-    struct arena_pool
-    {
-      tbb::task_arena arena;
-      std::mutex mutex;
-      std::condition_variable idle;
-      long outstanding{ 0 };
-
-      explicit arena_pool(unsigned const workers)
-        : arena{ static_cast<int>(workers) }
-      {
-      }
-    };
-  }
-
   void *pool_new(unsigned const workers)
   {
-    return new arena_pool{ workers > 0 ? workers : 1 };
+    fq_scheduler_config_t config;
+    fq_scheduler_config_default(&config);
+    config.thread_count = workers > 0 ? workers : 1;
+    config.enable_work_stealing = FQ_TRUE;
+
+    fq_thread_pool_t *pool{ nullptr };
+    if(fq_thread_pool_create_configured(&pool, &config) != FQ_OK)
+    {
+      return nullptr;
+    }
+    return pool;
   }
 
   void pool_submit(void * const pool, task_fn const fn, void * const arg)
   {
-    auto * const p{ static_cast<arena_pool *>(pool) };
-    {
-      std::lock_guard<std::mutex> const lock{ p->mutex };
-      ++p->outstanding;
-    }
-    p->arena.enqueue([p, fn, arg] {
-      fn(arg);
-      {
-        std::lock_guard<std::mutex> const lock{ p->mutex };
-        --p->outstanding;
-      }
-      p->idle.notify_all();
-    });
+    fq_thread_pool_submit_fn(static_cast<fq_thread_pool_t *>(pool), fn, arg);
   }
 
   void pool_wait_idle(void * const pool)
   {
-    auto * const p{ static_cast<arena_pool *>(pool) };
-    std::unique_lock<std::mutex> lock{ p->mutex };
-    p->idle.wait(lock, [p] { return p->outstanding == 0; });
+    fq_thread_pool_wait_idle(static_cast<fq_thread_pool_t *>(pool));
   }
 }
