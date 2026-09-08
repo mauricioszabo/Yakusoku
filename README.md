@@ -154,9 +154,11 @@ them. All were reproduced against `jank 0.1-noble`.
 2. **A self-referential `fn` nested in another `fn` crashes the compiler** in
    `ir::hoist_scoped_values` (`unordered_map::at`). `p/loop` therefore drives its iterations
    from a top-level `run-loop` function rather than a nested named `fn`.
-3. **A macro named `do` wins over the special form** for the rest of the namespace, so every
-   subsequent `when`, multi-form `defn` body and anything else expanding to a bare `do`
-   becomes a promise chain. `p/do` is consequently the last form in `core.jank`.
+3. **A macro named `do` makes the namespace unloadable from an ahead-of-time build.**
+   Loading it fails with "Invalid call to `var_unbound_root`" — jank's own module
+   initialisation appears to go through a `do` and pick up the user's macro. It shows up
+   only in a consumer running `lein compile`, never under `jank run`. promesa spells this
+   both `p/do` and `p/do!`; only `p/do!` exists here.
 4. **A header included by two namespaces breaks the incremental parser.** jank's C++
    environment is global, so a second `#include` contributes nothing and leaves the parser
    mid-expression, miscompiling the next form. Only `yakusoku.impl` includes the header.

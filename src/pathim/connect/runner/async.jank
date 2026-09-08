@@ -659,13 +659,22 @@
 
 (defn warm-path!
   "Runs one throwaway query through this runner, on the calling thread, once per process.
-  Public because the parallel runner needs the same paths compiled."
+  Public because the parallel runner needs the same paths compiled.
+
+  Best-effort, and deliberately swallows anything it throws. This is an optimisation --
+  it exists so that later queries do not compile on a worker -- so a failure here must
+  cost the pre-compilation and nothing else. It is not hypothetical: when the library is
+  consumed as an ahead-of-time compiled dependency (a `lein compile`d jar), this query
+  threw, and an uncaught throw out of a warm-up aborted the whole program before the
+  caller's first real query ran."
   []
   (when (compare-and-set! warmed false true)
-    (run-graph!
-      (pci/register [warm-up-resolver warm-up-batch-resolver])
-      (eql/query->ast [{::warm-items [::warm-value ::warm-batch-value]}])
-      (p.ent/create-entity {::warm-items [{::warm-id 1} {::warm-id 2}]})))
+    (try
+      (run-graph!
+        (pci/register [warm-up-resolver warm-up-batch-resolver])
+        (eql/query->ast [{::warm-items [::warm-value ::warm-batch-value]}])
+        (p.ent/create-entity {::warm-items [{::warm-id 1} {::warm-id 2}]}))
+      (catch cpp/jank.runtime.object_ref _ nil)))
   nil)
 
 (defn run-graph!

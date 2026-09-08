@@ -300,10 +300,10 @@
                                      b (p/delay 40 2)]
                               (+ a b))))))
 
-  (testing "p/do sequences forms and yields the last"
+  (testing "p/do! sequences forms and yields the last"
     (let [order (atom [])]
       (is (= [:ok :third]
-             (settled (p/do
+             (settled (p/do!
                         (swap! order conj :first)
                         (p/delay 20 (swap! order conj :second))
                         (do (swap! order conj :third) :third)))))

@@ -637,27 +637,14 @@
   nil)
 
 (defmacro do!
-  "Alias of `do`. promesa carries both spellings, and code ported from it uses each.
+  "Evaluates each form in order, waiting for any promise a form yields before moving to the
+   next, and resolves with the last one's value.
 
-   Written out rather than delegating to `do` so that it can live *before* it: `do` has to
-   remain the last form in this namespace, and a macro cannot expand into one that is not
-   defined yet."
-  [& body]
-  (clojure.core/reduce (fn [acc form]
-                         `(then ~acc (fn [_#] ~form)))
-                       `(resolved nil)
-                       body))
-
-;; ---------------------------------------------------------------------- do ----
-;;
-;; Defined last, deliberately. jank resolves a macro named `do` ahead of the special form,
-;; so from this point on any `when`, multi-form `defn` body or anything else that expands
-;; to a bare `do` inside this namespace would expand into a promise chain instead. Nothing
-;; follows it, so nothing is affected; call sites reference it qualified, as `p/do`.
-
-(defmacro do
-  "Evaluates each form in order, waiting for any promise a form yields before moving to
-   the next, and resolves with the last one's value."
+   promesa spells this both `p/do` and `p/do!`. Only `p/do!` exists here: defining a macro
+   named `do` makes the namespace impossible to load from an ahead-of-time build. jank's
+   AOT module initialisation goes through a `do` of its own, which the macro then expands
+   into a promise chain, and loading dies with \"Invalid call to `var_unbound_root`\". It
+   only shows up in a consumer running `lein compile`, never under `jank run`."
   [& body]
   (clojure.core/reduce (fn [acc form]
                          `(then ~acc (fn [_#] ~form)))

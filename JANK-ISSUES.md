@@ -18,7 +18,8 @@ Entries are grouped by how well they reproduce **on that build, today**. That di
 matters: three of these were recorded earlier in the port and two of them no longer
 reproduce, so they are held back rather than filed. Issues 7 and 8 came out of writing the
 benchmark in `examples/`, after the rest; issue 9 came out of rewriting that benchmark
-around a duck-repled-shaped resolver graph.
+around a duck-repled-shaped resolver graph; issues 10 and 11 came out of a consumer
+project depending on the published jar, which is a path none of the others exercise.
 
 ---
 
@@ -306,6 +307,75 @@ So the branch value is being emitted unboxed and then assigned to an `oref`. Int
 not the test.
 
 **Workaround:** `cond`, or bind the literal to a var first.
+
+---
+
+### 10. A macro named `do` makes a namespace impossible to load from an AOT build
+
+**Severity:** high for anyone shipping a library — it only appears in a *consumer's* build,
+never in the author's `jank run`.
+
+```clojure
+;; mylib/core.jank
+(ns mylib.core)
+(defmacro do
+  "A promise-chaining `do`, as promesa spells it."
+  [& body]
+  (clojure.core/reduce (fn [acc form] `(list :chained ~acc ~form)) nil body))
+```
+
+Depend on that from another project and `lein compile` it (or `jank compile-module` the
+consumer's entry namespace):
+
+```
+─ runtime/unable-to-load-module ────────────────────────────────────────────────
+error: Invalid call to `var_unbound_root` with `1` args provided.
+```
+
+**Expected:** the namespace loads, as it does under `jank run`.
+
+**Actual:** loading the AOT-compiled module fails. Renaming the macro to anything else —
+`do!`, `do*` — makes the same build compile and run. The module has no top-level forms
+beyond `def`, `defn`, `defmacro` and `declare`, so nothing in the source is calling
+anything at load time; the call appears to come from jank's own module-initialisation
+codegen, which goes through a `do` and picks up the user's macro.
+
+**Where it came from:** Yakusoku had `p/do` alongside `p/do!`, matching promesa's two
+spellings. Everything worked under `jank run`, in the test suite and in the benchmark. The
+first consumer to run `lein compile` could not load the library at all. `p/do` has been
+removed; `p/do!` remains.
+
+---
+
+### 11. lein-jank cannot pass `--eagerness`, which async programs need
+
+**Severity:** medium, and it is the difference between "works" and "segfaults" for any
+program that resolves promises on worker threads.
+
+Issue 3 above means such a program has to run with `--eagerness eager`. `lein-jank`'s
+`build-declarative-flag` recognises `:target-dir`, `:build-dir`, `:name`, `:direct-call`,
+`:optimization-level`, `:runtime`, `:defines`, `:include-dirs`, `:library-dirs`,
+`:linked-libraries`, `:linked-static-libraries`, `:linked-frameworks` and `:static?` — there
+is no key for eagerness, and an unrecognised key only warns.
+
+So `lein run` on a program using this library's async or parallel runner dies with `double
+free or corruption`, while the identical program run as
+
+```
+jank run-main --eagerness eager --module-path <same> … <ns>
+```
+
+completes. The flag is accepted after the subcommand, which is exactly where lein-jank
+already inserts its declarative flags, so adding
+
+```clojure
+:eagerness ["--eagerness" (name value)]
+```
+
+to that `case` would be enough.
+
+**Workaround today:** `lein compile` and run the resulting binary, which does not need the
+flag, or take the command from `lein run --verbose` and re-run it with the flag inserted.
 
 ---
 

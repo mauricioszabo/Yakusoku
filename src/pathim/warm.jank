@@ -44,6 +44,10 @@
    Guarded by a compare-and-set rather than a delay: a delay defined at namespace level
    does not memoise across namespaces in jank -- yakusoku.impl hit exactly that."
   []
+  ;; Best-effort, like pathim.connect.runner.async/warm-path!: this only pre-compiles, so
+  ;; a failure must not be able to take the caller's program down with it.
   (when (compare-and-set! warmed false true)
-    (warm-up!))
+    (try
+      (warm-up!)
+      (catch cpp/jank.runtime.object_ref _ nil)))
   nil)
