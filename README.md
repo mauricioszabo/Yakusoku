@@ -84,8 +84,8 @@ Blocking — `p/await!`, `p/deref`, `p/await-for!`, `p/wait!`.
 
 Timing — `p/delay`, `p/timeout`.
 
-Macros — `p/let`, `p/plet`, `p/do`, `p/->`, `p/->>`, `p/loop` / `p/recur`, `p/doseq`,
-`p/future`, `p/via`.
+Macros — `p/let`, `p/plet`, `p/do!`, `p/->`, `p/->>`, `p/loop` / `p/recur`, `p/doseq`,
+`p/future`, `p/thread`, `p/vthread`.
 
 ```clojure
 (p/loop [n 0]
@@ -94,20 +94,48 @@ Macros — `p/let`, `p/plet`, `p/do`, `p/->`, `p/->>`, `p/loop` / `p/recur`, `p/
     n))
 ```
 
-Executors (`yakusoku.exec`):
+### Executors (`yakusoku.exec`)
+
+`p/future` runs on a **pool sized to the machine's core count**, exactly as promesa's does
+on the JVM. A thousand `p/future`s cost a thousand queue slots and one thread per core —
+not a thousand threads. When you genuinely want a thread of your own, that is `p/thread`.
 
 ```clojure
-(exec/inline-executor)   ; runs on the settling thread — the default
-(exec/thread-executor)   ; one jank future, i.e. one OS thread, per task
-(exec/pool 4)            ; Asio io_context with 4 workers
-(exec/shutdown! pool)    ; drain and join; shutdown-now! abandons queued work
+(p/future  (crunch))    ; the default pool — use this
+(p/thread  (block-on-io)) ; one OS thread, safe to block, never queued
 ```
-
-Every chaining function takes an optional trailing executor:
 
 ```clojure
-(p/then p f pool)   ; run this callback on the pool
+(exec/fixed-executor)                 ; a pool, core-count workers
+(exec/fixed-executor {:parallelism 4}); a pool of exactly 4
+(exec/single-executor)                ; one worker: ordered, never overlapping
+(exec/cached-executor)                ; one OS thread per task, unbounded
+(exec/current-thread-executor)        ; runs inline on the caller
+(exec/shutdown pool)                  ; drain and join; shutdown-now abandons queued work
 ```
+
+Submission mirrors `promesa.exec`: `submit` (promise of the value), `run` (promise of nil),
+`exec` (fire and forget), `schedule`, `with-executor`, `with-dispatch`, `pmap`.
+
+```clojure
+(exec/submit (fn [] (crunch)))                 ; on the default pool
+(exec/with-executor (exec/fixed-executor {:parallelism 2})
+  (p/await! (p/future (crunch))))              ; rebinds *default-executor*
+```
+
+Every chaining function takes an optional trailing executor, which may be an executor or one
+of promesa's keywords (`:default`, `:cached`, `:thread`, `:same-thread`, …):
+
+```clojure
+(p/then p f pool)       ; run this callback on the pool
+(p/then p f :default)   ; …or on the default pool, by name
+```
+
+Two documented departures from promesa, both forced by jank: constructors take an options
+**map** (`(fixed-executor {:parallelism 4})`) because jank has no keyword-argument
+destructuring, and a submitted task does **not** inherit the submitting thread's dynamic
+bindings, because jank exposes no `push-thread-bindings` to rebuild them with. `:vthread`
+resolves to a real OS thread, jank having no virtual threads.
 
 ## Things to know
 
@@ -117,10 +145,18 @@ extensible from user code, so nothing we can construct carries deref behaviour. 
 jank's own `(deref ref ms val)` is an unimplemented stub that returns `nil`.
 
 **Callbacks run on the settling thread by default**, as in promesa. A chain of ten `then`s
-costs no threads unless you pass an executor — which matters here, because jank's `future`
-spawns a raw `std::thread` per call with no pooling.
+costs no threads unless you pass an executor. This is *not* the same as the default
+executor: `p/future` and `exec/submit` go to the pool, while an un-suffixed `then` runs
+wherever the promise happened to complete.
 
-**Shut pools down when you are done with them** — `(exec/shutdown! pool)` drains queued work
+**Do not block on a pool worker.** The pool has one worker per core, so a worker waiting on
+a promise cannot run the task that would settle it — block them all and the pool wedges
+silently. `p/await!`, `p/wait!` and `p/await-for!` therefore throw rather than block when
+called from a worker. Chain with `then`, or move the blocking work to `p/thread`, which
+takes a real thread precisely so it may block. promesa has the identical trap on its
+ForkJoinPool; the difference is that here it tells you.
+
+**Shut pools down when you are done with them** — `(exec/shutdown pool)` drains queued work
 and joins the workers. You no longer *have* to: pools stop themselves at process exit, and
 exit waits (up to two seconds) for workers to leave Asio's event loop. Without that,
 a program that used nothing but `p/delay` segfaulted on exit, since workers were still

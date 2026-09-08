@@ -420,6 +420,24 @@ namespace yakusoku
     tm->t.cancel();
   }
 
+  /* Set for as long as a thread is inside pool_run, so that a blocking wait can tell it is
+     about to deadlock.
+
+     A pool has a fixed number of workers. Blocking one of them on a promise that another
+     queued task must resolve costs a worker; doing it on all of them at once wedges the
+     pool with no error and no output. Yakusoku's await! reads this flag and throws instead,
+     which turns an unexplained hang into a message naming the mistake. */
+  inline bool &pool_worker_flag()
+  {
+    static thread_local bool flag{ false };
+    return flag;
+  }
+
+  inline bool on_pool_worker()
+  {
+    return pool_worker_flag();
+  }
+
   /* Called on jank-created worker threads. A handler that throws something we did not
      anticipate must not silently retire a worker, so we resume the loop. */
   inline void pool_run(object_ref const handle)
@@ -429,6 +447,7 @@ namespace yakusoku
       std::lock_guard<std::mutex> const lock{ p->mutex };
       ++p->running;
     }
+    pool_worker_flag() = true;
 
     for(;;)
     {
@@ -442,6 +461,7 @@ namespace yakusoku
       }
     }
 
+    pool_worker_flag() = false;
     {
       std::lock_guard<std::mutex> const lock{ p->mutex };
       --p->running;

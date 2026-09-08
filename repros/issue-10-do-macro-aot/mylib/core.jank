@@ -1,0 +1,12 @@
+(ns mylib.core)
+
+(defn resolved [x] [:resolved x])
+
+(defn hello [] :hello)
+
+;; Rename this to `do!` and the binary below runs. That one character is the whole bug.
+;;
+;; It must expand into a call to a var in *this* namespace: a `do` macro that only
+;; references clojure.core compiles and runs fine.
+(defmacro do [& body]
+  `(resolved ~(clojure.core/last body)))

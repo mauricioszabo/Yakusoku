@@ -59,6 +59,12 @@ Each runs once to warm up (discarded) and then seven times; the table shows the 
 
 ## Results
 
+> **These numbers are stale and must be re-measured.** They were taken when `p/future` on
+> jank meant "one raw OS thread per call" and the benchmark worked around it by threading an
+> explicit `yakusoku.exec/pool` through `p/via`. `p/future` is now the core-sized default
+> pool on both sides, and `p/via` is gone, so the async and parallel rows in particular no
+> longer describe the code above. Re-run both files and replace this table.
+
 Measured on a quiet 4-core box, medians of seven passes, jank 0.1-noble against OpenJDK 21:
 
 | benchmark | jank (pathim) | Clojure (Pathom 3) | jank / Clojure |
@@ -95,9 +101,9 @@ table and the most obvious place to look for wins.
 **Parallelism helps both, and helps the JVM more.** `parallel/many` against `sync/many` is
 1.1× faster on jank and 2.1× on Clojure, on four cores. The chain is mostly serial — each
 step needs the one before it — so the only thing to overlap is the 24 tasks in the join, and
-each of those pays a thread hop per expensive resolver. The jank side hands its work to a
-`yakusoku.exec/pool` rather than `p/future`, because jank's `future` spawns a raw OS thread
-per call with no pooling; measuring through that would have measured thread creation.
+each of those pays a thread hop per expensive resolver. Both sides call `p/future`, and on
+both sides that means a fixed pool sized to the core count — promesa's default executor on
+the JVM, Yakusoku's on jank. Neither file plumbs an executor by hand.
 
 A single query spends most of its time *planning* — `sync/chain` is several times
 `raw/chain` on both runtimes — because nothing here caches plans between calls. That is why

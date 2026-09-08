@@ -20,114 +20,233 @@
                 (recur (- remaining 10))))))
 
 (deftest executors
-  (testing "the inline executor runs on the calling thread"
+  (testing "the current-thread executor runs on the calling thread"
     (let [where (atom nil)
           here (cpp/yakusoku.thread_id)]
-      (exec/exec! (exec/inline-executor)
-                  (fn [] (reset! where (cpp/yakusoku.thread_id))))
+      (exec/exec (exec/current-thread-executor)
+                 (fn [] (reset! where (cpp/yakusoku.thread_id))))
       (is (= here (deref where)))))
 
-  (testing "the thread executor runs elsewhere"
+  (testing "the cached executor runs elsewhere"
     (let [done (promise)
           here (cpp/yakusoku.thread_id)]
-      (exec/exec! (exec/thread-executor)
-                  (fn [] (deliver done (= here (cpp/yakusoku.thread_id)))))
+      (exec/exec (exec/cached-executor)
+                 (fn [] (deliver done (= here (cpp/yakusoku.thread_id)))))
       (is (false? (deref done)))))
 
   (testing "executor? recognises executors"
-    (is (exec/executor? (exec/inline-executor)))
+    (is (exec/executor? (exec/current-thread-executor)))
     (is (not (exec/executor? {:kind :nope})))
     (is (not (exec/executor? 42))))
 
-  (testing "available-parallelism reports something usable"
-    (is (pos? (exec/available-parallelism)))))
+  (testing "get-available-processors reports something usable"
+    (is (pos? (exec/get-available-processors)))))
+
+(deftest resolve-executor-test
+  (testing "an executor passes through unchanged"
+    (let [ex (exec/current-thread-executor)]
+      (is (= ex (exec/resolve-executor ex)))))
+
+  (testing "nil and :default both mean the process-wide pool"
+    (is (= (exec/default-executor) (exec/resolve-executor nil)))
+    (is (= (exec/default-executor) (exec/resolve-executor :default))))
+
+  (testing "promesa's thread keywords resolve to a thread per task"
+    (doseq [k [:cached :thread :platform :vthread :virtual]]
+      (is (= :thread (::exec/kind (exec/resolve-executor k)))
+          (str k " should be a thread-per-task executor"))))
+
+  (testing "promesa's same-thread keywords resolve to the calling thread"
+    (doseq [k [:same-thread :current-thread]]
+      (is (= :inline (::exec/kind (exec/resolve-executor k))))))
+
+  (testing "an unknown keyword is rejected rather than silently defaulted"
+    (is (= :err (nth (impl/attempt (exec/resolve-executor :nonsense)) 0)))))
+
+(deftest submission
+  (testing "submit resolves with the function's value"
+    (is (= 42 (p/await-for! (exec/submit (fn [] 42)) 5000 ::timeout))))
+
+  (testing "run discards the value and resolves with nil"
+    (is (nil? (p/await-for! (exec/run (fn [] 42)) 5000 ::timeout))))
+
+  (testing "a throw becomes a rejection rather than escaping the worker"
+    (let [out (exec/submit (fn [] (throw (ex-info "nope" {}))))]
+      (p/wait! out 5000)
+      (is (= :rejected (p/state out)))))
+
+  (testing "submit does not unwrap a promise the function returns"
+    ;; Matches promesa since 9.0.462. Chain with `then` when flattening is wanted.
+    (let [inner (p/resolved :inner)
+          out (exec/submit (fn [] inner))]
+      (is (= inner (p/await-for! out 5000 ::timeout)))))
+
+  (testing "with-executor rebinds the default and restores it afterwards"
+    (let [pool (exec/fixed-executor {:parallelism 2})
+          before (exec/resolve-executor)]
+      (try
+        (exec/with-executor pool
+          (is (= pool (exec/resolve-executor))))
+        (is (= before (exec/resolve-executor)) "the binding must not leak")
+        (finally
+          (exec/shutdown pool)))))
+
+  (testing "shutdown? reports what shutdown did"
+    (let [pool (exec/fixed-executor {:parallelism 1})]
+      (is (false? (exec/shutdown? pool)))
+      (exec/shutdown pool)
+      (is (true? (exec/shutdown? pool)))))
+
+  (testing "pmap runs every element and keeps their order"
+    (is (= [0 1 4 9 16] (exec/pmap (fn [n] (* n n)) (range 5))))))
+
+;; ---------------------------------------------------------------------------------
+;; The regression this whole API exists for. `p/future` was wired to jank's unbounded
+;; `future`, so it cost one OS thread per call and timed identically to calling
+;; `clojure.core/future` directly -- a promise library with a thread pool that its own
+;; headline function never used. These two tests are the difference, stated as thread
+;; identity rather than as timing, so they cannot pass by accident on a fast machine.
+;; ---------------------------------------------------------------------------------
+
+(deftest future-is-pooled
+  (testing "p/future multiplexes many tasks onto the default pool"
+    (let [n 200
+          ps (doall (clojure.core/map
+                      (fn [_] (p/future
+                                (cpp/clojure.core_native.sleep 2)
+                                (cpp/yakusoku.thread_id)))
+                      (range n)))
+          ids (p/await-for! (p/all ps) 30000 ::timeout)]
+      (is (not= ::timeout ids) "every task must finish")
+      (is (= n (count ids)))
+      (is (<= (count (set ids)) (exec/get-available-processors))
+          (str "p/future must not spawn a thread per call: " n " tasks touched "
+               (count (set ids)) " threads, with only "
+               (exec/get-available-processors) " cores"))))
+
+  (testing "p/thread is the unpooled escape hatch, one thread per call"
+    (let [n 8
+          ;; Sleeping keeps them all alive at once, so their ids cannot be reused.
+          ps (doall (clojure.core/map
+                      (fn [_] (p/thread
+                                (cpp/clojure.core_native.sleep 100)
+                                (cpp/yakusoku.thread_id)))
+                      (range n)))
+          ids (p/await-for! (p/all ps) 30000 ::timeout)]
+      (is (not= ::timeout ids))
+      (is (= n (count (set ids))) "p/thread must give each call its own thread"))))
+
+(deftest blocking-on-a-worker-is-refused
+  (testing "await! inside a pool task throws instead of wedging the pool"
+    (let [out (p/future (p/await! (p/resolved 1)))]
+      (p/wait! out 5000)
+      (is (= :rejected (p/state out))
+          "blocking a worker must fail loudly, not deadlock")))
+
+  (testing "the pool still works afterwards"
+    (is (= 7 (p/await-for! (p/future 7) 5000 ::timeout)))))
 
 (deftest pool-execution
   (testing "a pool runs far more tasks than it has workers"
-    (let [pool (exec/pool 3)
+    (let [pool (exec/fixed-executor {:parallelism 3})
           done (atom 0)]
       (try
         (dotimes [_ 500]
-          (exec/exec! pool (fn [] (swap! done inc))))
+          (exec/exec pool (fn [] (swap! done inc))))
         (is (wait-for 5000 (fn [] (= 500 (deref done)))))
         (finally
-          (exec/shutdown! pool)))))
+          (exec/shutdown pool)))))
 
   (testing "work spreads across workers"
-    (let [pool (exec/pool 4)
+    (let [pool (exec/fixed-executor {:parallelism 4})
           threads (atom #{})
           done (atom 0)]
       (dotimes [_ 200]
-        (exec/exec! pool (fn []
-                           (swap! threads conj (cpp/yakusoku.thread_id))
-                           (cpp/clojure.core_native.sleep 1)
-                           (swap! done inc))))
-      (exec/shutdown! pool)
+        (exec/exec pool (fn []
+                          (swap! threads conj (cpp/yakusoku.thread_id))
+                          (cpp/clojure.core_native.sleep 1)
+                          (swap! done inc))))
+      (exec/shutdown pool)
       (is (= 200 (deref done)))
       (is (< 1 (count (deref threads)))
           "more than one worker should have participated")))
 
-  (testing "shutdown! drains queued work before returning"
-    (let [pool (exec/pool 2)
+  (testing "shutdown drains queued work before returning"
+    (let [pool (exec/fixed-executor {:parallelism 2})
           done (atom 0)]
       (dotimes [_ 100]
-        (exec/exec! pool (fn [] (cpp/clojure.core_native.sleep 1) (swap! done inc))))
-      (exec/shutdown! pool)
+        (exec/exec pool (fn [] (cpp/clojure.core_native.sleep 1) (swap! done inc))))
+      (exec/shutdown pool)
       (is (= 100 (deref done)) "every queued task must have run before shutdown returned")))
 
+  (testing "a single-executor never overlaps its tasks"
+    (let [pool (exec/single-executor)
+          threads (atom #{})]
+      (dotimes [_ 50]
+        (exec/exec pool (fn [] (swap! threads conj (cpp/yakusoku.thread_id)))))
+      (exec/shutdown pool)
+      (is (= 1 (count (deref threads))))))
+
   (testing "a task that throws does not take down its worker"
-    (let [pool (exec/pool 2)
+    (let [pool (exec/fixed-executor {:parallelism 2})
           done (atom 0)]
       (try
         (dotimes [_ 20]
-          (exec/exec! pool (fn [] (throw (ex-info "task blew up" {})))))
+          (exec/exec pool (fn [] (throw (ex-info "task blew up" {})))))
         (dotimes [_ 20]
-          (exec/exec! pool (fn [] (swap! done inc))))
+          (exec/exec pool (fn [] (swap! done inc))))
         (is (wait-for 5000 (fn [] (= 20 (deref done))))
             "the pool must keep working after a task throws")
         (finally
-          (exec/shutdown! pool))))))
+          (exec/shutdown pool))))))
 
 (deftest scheduling
   (testing "scheduled work runs after the delay, not before"
-    (let [pool (exec/pool 1)
+    (let [pool (exec/fixed-executor {:parallelism 1})
           fired (atom false)]
       (try
-        (exec/schedule! pool 150 (fn [] (reset! fired true)))
+        (exec/schedule pool 150 (fn [] (reset! fired true)))
         (cpp/clojure.core_native.sleep 50)
         (is (false? (deref fired)) "must not fire early")
         (is (wait-for 2000 (fn [] (deref fired))) "must fire eventually")
         (finally
-          (exec/shutdown! pool)))))
+          (exec/shutdown pool)))))
+
+  (testing "schedule resolves with the callback's value"
+    (let [pool (exec/fixed-executor {:parallelism 1})]
+      (try
+        (is (= :done (p/await-for! (exec/schedule pool 20 (fn [] :done)) 5000 ::timeout)))
+        (finally
+          (exec/shutdown pool)))))
 
   (testing "timers fire in deadline order, not submission order"
-    (let [pool (exec/pool 1)
+    (let [pool (exec/fixed-executor {:parallelism 1})
           order (atom [])]
       (try
-        (exec/schedule! pool 200 (fn [] (swap! order conj :third)))
-        (exec/schedule! pool 50 (fn [] (swap! order conj :first)))
-        (exec/schedule! pool 120 (fn [] (swap! order conj :second)))
+        (exec/schedule pool 200 (fn [] (swap! order conj :third)))
+        (exec/schedule pool 50 (fn [] (swap! order conj :first)))
+        (exec/schedule pool 120 (fn [] (swap! order conj :second)))
         (is (wait-for 3000 (fn [] (= 3 (count (deref order))))))
         (is (= [:first :second :third] (deref order)))
         (finally
-          (exec/shutdown! pool))))))
+          (exec/shutdown pool))))))
 
 (deftest promises-across-pool-threads
   (testing "promises resolved from pool workers are seen by the waiting thread"
-    (let [pool (exec/pool 4)]
+    (let [pool (exec/fixed-executor {:parallelism 4})]
       (try
         (let [ps (doall (clojure.core/map (fn [i]
                                             (let [d (p/deferred)]
-                                              (exec/exec! pool (fn [] (p/resolve! d (* i 2))))
+                                              (exec/exec pool (fn [] (p/resolve! d (* i 2))))
                                               d))
                                           (range 200)))]
           (is (= (vec (clojure.core/map (fn [i] (* i 2)) (range 200)))
                  (p/await-for! (p/all ps) 10000 ::timeout))))
         (finally
-          (exec/shutdown! pool)))))
+          (exec/shutdown pool)))))
 
   (testing "callbacks can be dispatched onto an executor"
-    (let [pool (exec/pool 2)]
+    (let [pool (exec/fixed-executor {:parallelism 2})]
       (try
         (let [ran-on (atom nil)
               here (cpp/yakusoku.thread_id)
@@ -137,14 +256,23 @@
           (is (= 1 (p/await-for! out 5000 ::timeout)))
           (is (false? (deref ran-on)) "the callback should have run on a pool thread"))
         (finally
-          (exec/shutdown! pool))))))
+          (exec/shutdown pool)))))
+
+  (testing "a chaining executor may be given as a promesa keyword"
+    (let [here (cpp/yakusoku.thread_id)
+          ran-on (atom nil)
+          out (p/then (p/resolved 1)
+                      (fn [v] (reset! ran-on (= here (cpp/yakusoku.thread_id))) v)
+                      :default)]
+      (is (= 1 (p/await-for! out 5000 ::timeout)))
+      (is (false? (deref ran-on))))))
 
 (deftest gc-stress
   ;; The native layer keeps queued jank values alive with GC_MALLOC_UNCOLLECTABLE. If that
   ;; discipline were wrong, a collection landing while tasks sit in Asio's queue would
   ;; free values still in flight -- so this forces exactly that situation.
   (testing "queued values survive collections happening mid-flight"
-    (let [pool (exec/pool 4)
+    (let [pool (exec/fixed-executor {:parallelism 4})
           n 2000
           ;; Record which task indices ran and how many times each did, rather than only
           ;; counting: that distinguishes a task that ran twice from one that never ran,
@@ -153,13 +281,13 @@
           bad (atom 0)]
       (dotimes [i n]
         (let [expected (str "payload-" i)]
-          (exec/exec! pool (fn []
-                             (when (not= expected (str "payload-" i))
-                               (swap! bad inc))
-                             (swap! runs (fn [m] (assoc m i (inc (get m i 0))))))))
+          (exec/exec pool (fn []
+                            (when (not= expected (str "payload-" i))
+                              (swap! bad inc))
+                            (swap! runs (fn [m] (assoc m i (inc (get m i 0))))))))
         (when (zero? (mod i 200))
           (cpp/GC_gcollect)))
-      (exec/shutdown! pool)
+      (exec/shutdown pool)
       (cpp/GC_gcollect)
       (let [counts (deref runs)
             ran-twice (filter (fn [i] (< 1 (get counts i 0))) (range n))
@@ -169,11 +297,11 @@
         (is (zero? (deref bad)) "no queued value may be corrupted by a collection"))))
 
   (testing "promise chains survive collections"
-    (let [pool (exec/pool 4)]
+    (let [pool (exec/fixed-executor {:parallelism 4})]
       (try
         (let [ps (doall (clojure.core/map
                           (fn [i]
-                            (p/then (p/via pool (str "chain-" i))
+                            (p/then (exec/with-dispatch pool (str "chain-" i))
                                     (fn [s] (str s "-done"))))
                           (range 300)))]
           (cpp/GC_gcollect)
@@ -182,19 +310,19 @@
             (is (= "chain-0-done" (first result)))
             (is (= 300 (count result)))))
         (finally
-          (exec/shutdown! pool))))))
+          (exec/shutdown pool))))))
 
 (deftest timer-test
   (testing "a timer fires after its delay"
-    (let [pool (exec/pool 2)]
+    (let [pool (exec/fixed-executor {:parallelism 2})]
       (try
         (let [fired (atom false)]
           (exec/restart! (exec/timer pool) 30 (fn [] (reset! fired true)))
           (is (wait-for 3000 (fn [] (deref fired)))))
-        (finally (exec/shutdown-now! pool)))))
+        (finally (exec/shutdown-now pool)))))
 
   (testing "restarting defers the callback rather than firing twice"
-    (let [pool (exec/pool 2)]
+    (let [pool (exec/fixed-executor {:parallelism 2})]
       (try
         (let [t (exec/timer pool)
               runs (atom 0)
@@ -207,10 +335,10 @@
           ;; Give any cancelled wait ample time to fire late, if it were going to.
           (cpp/clojure.core_native.sleep 200)
           (is (= 1 (deref runs)) "a cancelled wait must not run its callback"))
-        (finally (exec/shutdown-now! pool)))))
+        (finally (exec/shutdown-now pool)))))
 
   (testing "cancel drops the callback"
-    (let [pool (exec/pool 2)]
+    (let [pool (exec/fixed-executor {:parallelism 2})]
       (try
         (let [t (exec/timer pool)
               fired (atom false)]
@@ -224,11 +352,11 @@
           (exec/cancel-timer! t)
           (cpp/clojure.core_native.sleep 1400)
           (is (false? (deref fired))))
-        (finally (exec/shutdown-now! pool))))))
+        (finally (exec/shutdown-now pool))))))
 
 (deftest debouncer-test
   (testing "a quiet window flushes the buffer, once, in arrival order"
-    (let [pool (exec/pool 2)]
+    (let [pool (exec/fixed-executor {:parallelism 2})]
       (try
         (let [batches (atom [])
               push! (exec/debouncer pool (fn [items] (swap! batches conj items)) 60 nil)]
@@ -239,10 +367,10 @@
           (cpp/clojure.core_native.sleep 200)
           (is (= [[0 1 2 3 4]] (deref batches))
               "one flush, holding every item in the order it arrived"))
-        (finally (exec/shutdown-now! pool)))))
+        (finally (exec/shutdown-now pool)))))
 
   (testing "two bursts separated by quiet produce two batches"
-    (let [pool (exec/pool 2)]
+    (let [pool (exec/fixed-executor {:parallelism 2})]
       (try
         (let [batches (atom [])
               push! (exec/debouncer pool (fn [items] (swap! batches conj items)) 40 nil)]
@@ -252,10 +380,10 @@
           (push! :c)
           (is (wait-for 3000 (fn [] (= 2 (count (deref batches))))))
           (is (= [[:a :b] [:c]] (deref batches))))
-        (finally (exec/shutdown-now! pool)))))
+        (finally (exec/shutdown-now pool)))))
 
   (testing "the threshold flushes before the window elapses"
-    (let [pool (exec/pool 2)]
+    (let [pool (exec/fixed-executor {:parallelism 2})]
       (try
         (let [batches (atom [])
               ;; A window long enough that a timer flush inside the assertion would be a
@@ -266,10 +394,10 @@
           (push! 3)
           (is (wait-for 3000 (fn [] (seq (deref batches)))))
           (is (= [[1 2 3]] (deref batches))))
-        (finally (exec/shutdown-now! pool)))))
+        (finally (exec/shutdown-now pool)))))
 
   (testing "every item is delivered exactly once under a burst"
-    (let [pool (exec/pool 4)]
+    (let [pool (exec/fixed-executor {:parallelism 4})]
       (try
         (let [n 500
               seen (atom [])
@@ -281,4 +409,4 @@
           (is (wait-for 5000 (fn [] (= n (count (deref seen))))))
           (is (= (set (range n)) (set (deref seen))) "every item arrives")
           (is (= n (count (deref seen))) "no item arrives twice"))
-        (finally (exec/shutdown-now! pool))))))
+        (finally (exec/shutdown-now pool))))))

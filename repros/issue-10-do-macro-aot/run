@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Reproduces: a macro named `do` makes its namespace impossible to load from an AOT build.
+#
+# Needs `jank` on PATH. Nothing else -- no lein, no dependencies.
+set -uo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+echo "== JIT: jank run-main =="
+jank run-main --module-path . app.main
+echo "   exit: $?  (expected: prints ':hello', exit 0)"
+
+echo
+echo "== AOT: jank compile, then run the binary =="
+rm -rf target
+jank compile --module-path . app.main && echo "   compiled cleanly"
+./target/a.out
+status=$?
+echo "   exit: $status  (expected: 'Invalid call to var_unbound_root with 1 args provided')"
+echo "   note: the binary reports that error and still exits 0."

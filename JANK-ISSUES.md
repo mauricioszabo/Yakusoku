@@ -15,11 +15,14 @@ Ubuntu 24.04.4 LTS, x86_64
 ```
 
 Entries are grouped by how well they reproduce **on that build, today**. That distinction
-matters: three of these were recorded earlier in the port and two of them no longer
-reproduce, so they are held back rather than filed. Issues 7 and 8 came out of writing the
-benchmark in `examples/`, after the rest; issue 9 came out of rewriting that benchmark
-around a duck-repled-shaped resolver graph; issues 10 and 11 came out of a consumer
-project depending on the published jar, which is a path none of the others exercise.
+matters: two entries recorded earlier in the port did not reproduce as written and are held
+back rather than filed. Issues 7 and 8 came out of writing the benchmark in `examples/`,
+after the rest; issue 9 came out of rewriting that benchmark around a duck-repled-shaped
+resolver graph; issues 10 and 11 came out of a consumer project depending on the published
+jar, which is a path none of the others exercise.
+
+Issues 10 and 11 have self-contained runnable reproductions in
+[`repros/`](repros) — neither depends on this project.
 
 ---
 
@@ -315,30 +318,57 @@ not the test.
 **Severity:** high for anyone shipping a library — it only appears in a *consumer's* build,
 never in the author's `jank run`.
 
+**Runnable repro:** [`repros/issue-10-do-macro-aot/`](repros/issue-10-do-macro-aot) —
+`bash repros/issue-10-do-macro-aot/run`. Two files, no dependencies, no lein.
+
 ```clojure
 ;; mylib/core.jank
 (ns mylib.core)
-(defmacro do
-  "A promise-chaining `do`, as promesa spells it."
-  [& body]
-  (clojure.core/reduce (fn [acc form] `(list :chained ~acc ~form)) nil body))
+
+(defn resolved [x] [:resolved x])
+
+(defn hello [] :hello)
+
+(defmacro do [& body]
+  `(resolved ~(clojure.core/last body)))
 ```
 
-Depend on that from another project and `lein compile` it (or `jank compile-module` the
-consumer's entry namespace):
+```clojure
+;; app/main.jank
+(ns app.main (:require [mylib.core :as lib]))
+
+(defn -main [& _] (println "app says:" (lib/hello)))
+```
 
 ```
-─ runtime/unable-to-load-module ────────────────────────────────────────────────
+$ jank run-main --module-path . app.main
+app says: :hello
+
+$ jank compile --module-path . app.main     # compiles cleanly
+$ ./target/a.out
 error: Invalid call to `var_unbound_root` with `1` args provided.
 ```
 
-**Expected:** the namespace loads, as it does under `jank run`.
+**Expected:** the binary loads the module and prints `app says: :hello`, as `jank run-main`
+does.
 
-**Actual:** loading the AOT-compiled module fails. Renaming the macro to anything else —
-`do!`, `do*` — makes the same build compile and run. The module has no top-level forms
-beyond `def`, `defn`, `defmacro` and `declare`, so nothing in the source is calling
-anything at load time; the call appears to come from jank's own module-initialisation
-codegen, which goes through a `do` and picks up the user's macro.
+**Actual:** loading the AOT-compiled module fails. Note the binary still exits 0 after
+printing that error, which is arguably a second bug.
+
+Bisected:
+
+| variant | result |
+| --- | --- |
+| `do` macro expanding only into `clojure.core` calls | works |
+| `do` macro expanding into a call to a var in its own namespace | **fails** |
+| the same file with the macro renamed `do!` | works |
+| the same file with the macro deleted | works |
+| a `declare` before the macro | no difference either way |
+
+So it takes both the name `do` *and* an expansion referencing the namespace's own vars.
+`mylib.core` has no top-level forms beyond `defn` and `defmacro`, so nothing in the source
+is calling anything at load time; the call appears to come from jank's own
+module-initialisation codegen, which goes through a `do` and picks up the user's macro.
 
 **Where it came from:** Yakusoku had `p/do` alongside `p/do!`, matching promesa's two
 spellings. Everything worked under `jank run`, in the test suite and in the benchmark. The
@@ -347,32 +377,74 @@ removed; `p/do!` remains.
 
 ---
 
-### 11. lein-jank cannot pass `--eagerness`, which async programs need
+### 11. lein-jank cannot pass `--eagerness`, and an unrecognised `:jank` key breaks the build
 
 **Severity:** medium, and it is the difference between "works" and "segfaults" for any
-program that resolves promises on worker threads.
+program that first-compiles functions on more than one thread.
 
-Issue 3 above means such a program has to run with `--eagerness eager`. `lein-jank`'s
-`build-declarative-flag` recognises `:target-dir`, `:build-dir`, `:name`, `:direct-call`,
-`:optimization-level`, `:runtime`, `:defines`, `:include-dirs`, `:library-dirs`,
-`:linked-libraries`, `:linked-static-libraries`, `:linked-frameworks` and `:static?` — there
-is no key for eagerness, and an unrecognised key only warns.
+This is two bugs in `lein-jank` (`org.jank-lang/lein-jank "2026.09-7"`), both in
+`build-declarative-flag`.
 
-So `lein run` on a program using this library's async or parallel runner dies with `double
-free or corruption`, while the identical program run as
+**Runnable repro:** [`repros/issue-11-lein-jank-eagerness/`](repros/issue-11-lein-jank-eagerness) —
+`bash repros/issue-11-lein-jank-eagerness/run`. Needs `lein` and `jank`; the program itself
+has no dependencies.
+
+`src/app/main.jank` is thirty-two never-called functions, each first called from its own
+`future`:
+
+```clojure
+(ns app.main)
+
+(defn work-0  [n] (loop [i n acc 0] (if (zero? i) acc (recur (dec i) (+ acc i)))))
+;; ... work-1 through work-31, identical ...
+
+(def all [work-0 work-1 #_… work-31])
+
+(defn -main [& _]
+  (let [fs (doall (map (fn [f] (future (f 10000))) all))]
+    (println "sum:" (reduce + (map deref fs)))))
+```
+
+jank compiles a function on its first call, so this puts several threads into the compiler
+at once — issue 3 above — and `--eagerness eager` is what avoids it.
+
+**(a) There is no key for eagerness.** `build-declarative-flag` recognises `:target-dir`,
+`:output-dir`, `:build-dir`, `:name`, `:direct-call`, `:optimization-level`, `:runtime`,
+`:defines`, `:include-dirs`, `:library-dirs`, `:linked-libraries`,
+`:linked-static-libraries`, `:linked-frameworks` and `:static?`. So:
 
 ```
-jank run-main --eagerness eager --module-path <same> … <ns>
+$ lein run
+fatal error: malformed or corrupted precompiled file: 'Invalid abbrev number'
+[SIGSEGV]
+
+$ jank run-main --eagerness eager --module-path src app.main
+sum: 1600160000
 ```
 
-completes. The flag is accepted after the subcommand, which is exactly where lein-jank
-already inserts its declarative flags, so adding
+The flag is accepted immediately after the subcommand, which is exactly where lein-jank
+already inserts its declarative flags, so one clause fixes it:
 
 ```clojure
 :eagerness ["--eagerness" (name value)]
 ```
 
-to that `case` would be enough.
+**(b) An unrecognised key injects an empty argument.** It does not degrade to "ignored" —
+it warns and then emits `""` into the command line, so jank fails with an error naming the
+wrong thing:
+
+```clojure
+:jank {:target-dir "target/debug" :optimization-level 0 :eagerness :eager}
+```
+
+```
+$ lein run
+Unknown flag :eagerness
+error: Extra positional args: app.main
+```
+
+This half is the worse of the two: any typo in a `:jank` map produces a confusing jank
+error rather than a lein warning. The fallthrough should produce no argument.
 
 **Workaround today:** `lein compile` and run the resulting binary, which does not need the
 flag, or take the command from `lein run --verbose` and re-run it with the flag inserted.
@@ -381,20 +453,19 @@ flag, or take the command from `lein run --verbose` and re-run it with the flag 
 
 ---
 
-## Recorded during the port, but **not reproducible today** — do not file without re-verifying
+## Recorded during the port, but **not reproducible as recorded** — do not file without re-verifying
 
-These two are in this project's `README.md` / `PATHIM.md` as jank limitations, and the
-codebase still carries workarounds for them. I could not reproduce either on the build
-above. They are listed so the workarounds can be removed once someone confirms they are
-gone, and so nobody files a stale report.
+These are in this project's `README.md` / `PATHIM.md` as jank limitations, and the codebase
+still carries workarounds for them. They are listed so the workarounds can be removed once
+someone confirms they are gone, and so nobody files a stale report.
 
-### A macro named `do` overriding the special form — **did not reproduce**
+### A macro named `do` overriding the special form — **reproduces under AOT, not under `jank run`**
 
 The recorded claim: defining `(defmacro do …)` makes every subsequent `when`, multi-form
-`defn` body, or bare `do` in that namespace expand through the macro. Yakusoku's `p/do` is
+`defn` body, or bare `do` in that namespace expand through the macro. Yakusoku's `p/do` was
 consequently the last form in `core.jank`.
 
-Four shapes were tried today; the special form won every time:
+Under `jank run`, four shapes were tried and the special form won every time:
 
 ```clojure
 (ns repro)
@@ -405,8 +476,14 @@ Four shapes were tried today; the special form won every time:
 (defn whn      [] (when true 1 2))                    ;; => 2
 ```
 
-All four returned the special-form answer, so the macro is simply ignored. Either this was
-fixed, or the original diagnosis attributed some other misbehaviour to it.
+**That was the wrong conclusion, and this entry corrected it.** Under whole-file AOT
+compilation the macro *does* win: a sibling macro in the same namespace whose body
+syntax-quotes `` `(do ~@body) `` expanded through the user's `do`, printing
+`(:chained (:chained nil :a) :b)` where the special form gives `:b`. So the shadowing is
+real; it is the *evaluation mode* that decides, not the shape of the call site. It is folded
+into issue 10 above, which has the runnable repro — the two are almost certainly the same
+underlying defect, since issue 10's failure is jank's own module-init `do` picking up the
+user's macro.
 
 ### A header `#include`d from two namespaces breaking the incremental parser — **did not reproduce**
 

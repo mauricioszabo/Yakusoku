@@ -1,0 +1,5 @@
+(ns app.main
+  (:require [mylib.core :as lib]))
+
+(defn -main [& _]
+  (println "app says:" (lib/hello)))

@@ -48,8 +48,7 @@
     [pathim.connect.indexes :as pci]
     [pathim.interface.eql :as p.eql]
     [pathim.interface.async.eql :as p.a.eql]
-    [yakusoku.core :as p]
-    [yakusoku.exec :as exec]))
+    [yakusoku.core :as p]))
 
 ;; ---------------------------------------------------------------- platform ----
 
@@ -228,6 +227,10 @@
 ;; `p/future` is what lets independent branches of one query occupy different cores, so
 ;; this is the version where "parallel" can mean parallel for CPU work rather than for
 ;; waiting.
+;;
+;; `p/future` is the same call on both sides of this benchmark, and on both sides it means
+;; a fixed pool sized to the core count -- promesa's default executor on the JVM, Yakusoku's
+;; on jank. Nothing here plumbs an executor by hand.
 
 (pco/defresolver sum-from-memo-async [env input]
   {::pco/input    [:calc/operands (pco/? :calc/memo)]
@@ -237,22 +240,16 @@
     (when-let [hit (get memo (:calc/operands input))]
       (p/resolved {:calc/sum hit}))))
 
-(def worker-pool
-  "A pool, rather than `p/future`: jank's `future` spawns a raw OS thread per call with no
-   pooling, so measuring through it would measure thread creation. promesa's `p/future` on
-   the JVM is already pooled, so this is the like-for-like arrangement."
-  (exec/pool))
-
 (pco/defresolver sum-from-peano-async [env input]
   {::pco/input    [:calc/operands]
    ::pco/output   [:calc/sum]
    ::pco/priority 10}
-  (p/via worker-pool {:calc/sum (reduce (fn [acc n] (peano-add n acc)) 0 (:calc/operands input))}))
+  (p/future {:calc/sum (reduce (fn [acc n] (peano-add n acc)) 0 (:calc/operands input))}))
 
 (pco/defresolver signature-async [env input]
   {::pco/input  [:calc/product]
    ::pco/output [:calc/signature]}
-  (p/via worker-pool {:calc/signature (peano-fib (+ fib-n (wrap (:calc/product input) 3)))}))
+  (p/future {:calc/signature (peano-fib (+ fib-n (wrap (:calc/product input) 3)))}))
 
 (def async-env
   (pci/register [data-from-registry data-from-parity data-from-default

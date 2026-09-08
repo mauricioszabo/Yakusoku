@@ -103,6 +103,15 @@
   [p]
   (cpp/yakusoku.pool_run (::pool p)))
 
+(defn on-pool-worker?
+  "True when the calling thread is inside a pool's event loop.
+
+   Blocking such a thread on a promise is how a fixed pool deadlocks: the worker cannot run
+   the task that would settle what it is waiting for. yakusoku.core's blocking waits check
+   this so the failure says what it is."
+  []
+  (cpp/yakusoku.on_pool_worker))
+
 (defn drain!
   "Releases the work guard: workers return once queued work and pending timers finish."
   [p]
@@ -197,6 +206,7 @@
     (native-promise? p)
     (native-future? p)
     (pool? pool)
+    (on-pool-worker?)
     (post! pool (fn [] nil))
     (schedule! pool 0 (fn [] nil))
     (let [t (make-timer pool)]

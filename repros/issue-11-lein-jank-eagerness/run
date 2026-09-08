@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Reproduces: lein-jank cannot pass `--eagerness`, and an unrecognised `:jank` key injects
+# an empty argument rather than being ignored.
+#
+# Needs `lein` and `jank` on PATH. Step 1 downloads the lein-jank plugin on first run.
+set -uo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+restore() { cp project-plain.clj project.clj 2>/dev/null; rm -f project-plain.clj; }
+trap restore EXIT
+
+echo "== 1. lein run, no eagerness asked for =="
+lein run
+echo "   exit: $?  (expected: SIGSEGV / 'malformed or corrupted precompiled file')"
+
+echo
+echo "== 2. lein run, with :jank {:eagerness :eager} =="
+cp project.clj project-plain.clj
+cp project-with-eagerness.clj project.clj
+lein run
+echo "   exit: $?  (expected: 'Unknown flag :eagerness', then jank's"
+echo "              'Extra positional args: app.main' from the empty argument)"
+restore
+
+echo
+echo "== 3. the same program, jank run-main --eagerness eager =="
+jank run-main --eagerness eager --module-path src app.main
+echo "   exit: $?  (expected: 'sum: 1600160000', exit 0)"

@@ -3,16 +3,33 @@
 ;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 (ns yakusoku.exec
-  "Executors and scheduling.
+  "Executors and scheduling, following promesa.exec.
 
    An executor is a plain map carrying a ::kind, dispatched by an ordinary function --
-   jank has no protocols, and none are needed for three cases.
+   jank has no protocols, and none are needed for three kinds:
 
-   The pool is Asio's io_context. Its worker threads are jank futures, not threads Asio
-   made for itself: jank's `future` registers the thread with the garbage collector and
-   conveys dynamic bindings, and borrowing it means Yakusoku inherits both instead of
-   reimplementing them."
-  (:refer-clojure :exclude [pool])
+     :pool    an Asio io_context with a fixed set of workers
+     :thread  one jank future -- one raw OS thread -- per task
+     :inline  the calling thread
+
+   The default executor is a :pool sized to the machine's core count, and `submit`, `run`
+   and `exec` go to it unless told otherwise. That is the whole point of this namespace:
+   `p/future` should cost a queue slot, not a thread.
+
+   Pool workers are jank futures rather than threads Asio made for itself, because jank's
+   `future` registers the thread with the garbage collector and conveys dynamic bindings.
+   Borrowing it means Yakusoku inherits both instead of reimplementing them.
+
+   Two deliberate departures from promesa, both because jank cannot do otherwise:
+
+   * Constructors take an options MAP, not keyword arguments: `(fixed-executor
+     {:parallelism 4})` where promesa writes `(px/fixed-executor :parallelism 4)`. jank has
+     no `& {:keys [...]}` destructuring.
+   * A task does NOT inherit the submitting thread's dynamic bindings. promesa wraps every
+     submitted task with `wrap-bindings`; jank exposes no `get-thread-bindings` /
+     `push-thread-bindings` to build that on. Bind inside the task body, or close over the
+     value before submitting."
+  (:refer-clojure :exclude [pmap sleep])
   (:require [yakusoku.impl :as impl]))
 
 (cpp/raw "#include <yakusoku.hpp>")
@@ -31,92 +48,347 @@
   [x]
   (and (map? x) (contains? x ::kind)))
 
-(defn inline-executor
-  "An executor that runs each task immediately, on the calling thread. This is the
-   default: a promise chain should not cost a thread hop per link unless asked to."
-  []
-  {::kind :inline})
-
-(defn thread-executor
-  "An executor that runs each task on its own thread, via clojure.core/future.
-
-   jank's `future` spawns a raw std::thread per call with no pooling, so this costs one
-   OS thread per task. Use it for a handful of blocking operations; use a pool for
-   anything with volume."
-  []
-  {::kind :thread})
-
-(defn available-parallelism
+(defn get-available-processors
   "The reported core count, or 4 when the platform will not say."
   []
   (let [n (cpp/yakusoku.hardware_threads)]
     (if (pos? n) n 4)))
 
-(defn pool
-  "Creates a thread pool of n workers (default: available-parallelism).
+;; --------------------------------------------------------------- constructors ----
 
-   Returns an executor that must eventually be shut down -- its workers are live threads
-   and the process will not exit while they are running."
-  ([]
-   (pool (available-parallelism)))
-  ([n]
-   (impl/ensure-warm!)
-   (let [p (impl/make-pool)
-         ;; One definition, used for both the warm-up call and the real workers.
-         make-worker (fn [ctx] (fn [] (impl/run-loop! ctx)))]
-     ;; Compile the worker on THIS thread before any other thread can call it. jank
-     ;; compiles a function on first call, and several threads entering that compilation
-     ;; at once corrupts the JIT (interleaved Clang errors, then a segfault). Running the
-     ;; worker against an already-stopped context returns immediately and leaves the code
-     ;; compiled, so the real workers only ever execute it. yakusoku.impl warms its own
-     ;; functions the same way when it loads.
-     (let [warm (impl/make-pool)]
-       (impl/stop! warm)
-       ((make-worker warm)))
-     {::kind :pool
-      ::pool p
-      ::workers (doall (map (fn [_] (future-call (make-worker p))) (range n)))})))
+(defn current-thread-executor
+  "An executor that runs each task immediately, on the calling thread.
 
-(def ^:private default-pool-delay
-  (delay (pool)))
-
-(defn default-pool
-  "A process-wide pool, created on first use so that merely requiring Yakusoku never
-   starts threads. Also backs scheduling."
+   This is what promesa calls :same-thread / :current-thread. It is NOT the default here,
+   any more than it is there -- but it is what an un-suffixed `then` or `map` uses, since
+   those run on whichever thread completed the promise."
   []
-  (deref default-pool-delay))
+  {::kind :inline})
 
-(defn exec!
-  "Submits a zero-arity function for execution. Returns nil."
-  [executor f]
-  (case (::kind executor)
-    :inline (do (f) nil)
-    :thread (do (impl/ensure-warm!) (future (f)) nil)
-    :pool (impl/post! (::pool executor) f)
-    (throw (ex-info "Not an executor" {:executor executor}))))
+(defn cached-executor
+  "An executor that runs each task on its own thread, via clojure.core/future.
 
-(defn schedule!
-  "Runs a zero-arity function after ms milliseconds, on a pool. Timing comes from Asio's
-   steady_timer, so there is no polling and no timer thread of our own.
+   The nearest jank has to promesa's cached pool: jank's `future` spawns a raw std::thread
+   per call with no pooling, so this costs one OS thread per task and never queues. Right
+   for a handful of blocking operations -- `p/thread`, and waiting on a jank-native promise
+   -- and wrong for anything with volume, which is what the default pool is for.
 
-   Scheduled work is never cancelled at the timer; Yakusoku cancels at the promise
-   instead, and the callback finds it already settled and does nothing."
-  ([ms f]
-   (schedule! (default-pool) ms f))
-  ([executor ms f]
-   (let [p (if (= :pool (::kind executor))
-             (::pool executor)
-             (::pool (default-pool)))]
-     (impl/schedule! p ms f))))
+   Takes an options map for signature compatibility with promesa; nothing in it is read."
+  ([] (cached-executor {}))
+  ([_options] {::kind :thread}))
 
-(defn- pool-of
-  "The io_context behind an executor: its own if it is a pool, the default pool's
-   otherwise. Timers need a real event loop, and the inline and thread executors have
-   none."
+(defn fixed-executor
+  "Creates a pool of :parallelism workers, defaulting to the machine's core count.
+
+     (fixed-executor)
+     (fixed-executor {:parallelism 4})
+
+   Tasks queue on an Asio io_context and are taken by whichever worker is free, so N tasks
+   cost N queue slots rather than N threads. Shut it down when done -- `shutdown` drains,
+   `shutdown-now` abandons -- though a pool left running will not hold the process open:
+   the native core registers an atexit handler that stops every pool it made."
+  ([] (fixed-executor {}))
+  ([options]
+   (let [n (or (:parallelism options) (get-available-processors))]
+     (impl/ensure-warm!)
+     (let [p (impl/make-pool)
+           ;; One definition, used for both the warm-up call and the real workers.
+           make-worker (fn [ctx] (fn [] (impl/run-loop! ctx)))]
+       ;; Compile the worker on THIS thread before any other thread can call it. jank
+       ;; compiles a function on first call, and several threads entering that compilation
+       ;; at once corrupts the JIT (interleaved Clang errors, then a segfault). Running the
+       ;; worker against an already-stopped context returns immediately and leaves the code
+       ;; compiled, so the real workers only ever execute it. yakusoku.impl warms its own
+       ;; functions the same way when it loads.
+       (let [warm (impl/make-pool)]
+         (impl/stop! warm)
+         ((make-worker warm)))
+       {::kind :pool
+        ::pool p
+        ::shut (atom false)
+        ::workers (doall (map (fn [_] (future-call (make-worker p))) (range n)))}))))
+
+(defn single-executor
+  "A pool with exactly one worker, so its tasks run in submission order and never overlap."
+  ([] (single-executor {}))
+  ([options] (fixed-executor (assoc options :parallelism 1))))
+
+(defn scheduled-executor
+  "A pool used as a timer source.
+
+   promesa keeps a separate scheduled executor; here the pool IS the timer source -- Asio's
+   io_context owns both the work queue and the steady_timers -- so this is `fixed-executor`
+   under promesa's name."
+  ([] (scheduled-executor {}))
+  ([options] (fixed-executor options)))
+
+(defn forkjoin-executor
+  "A pool, under promesa's name for its ForkJoinPool.
+
+   Named for source compatibility only. It does NOT work-steal: Asio's io_context is a
+   single shared FIFO queue that every worker pulls from, so there are no per-worker deques
+   and nothing to steal from. For the coarse tasks a promise library submits that mostly
+   does not matter, but do not reach for this expecting fork/join semantics."
+  ([] (forkjoin-executor {}))
+  ([options] (fixed-executor options)))
+
+(defn work-stealing-executor
+  "Alias of forkjoin-executor -- which, as its docstring says, does not actually steal."
+  ([] (forkjoin-executor {}))
+  ([options] (forkjoin-executor options)))
+
+;; ------------------------------------------------------------------ shutdown ----
+
+(defn shutdown
+  "Drains a pool: workers finish queued work and pending timers, then stop. Blocks until
+   every worker has exited. A no-op for the cached and current-thread executors."
+  [executor]
+  (when (= :pool (::kind executor))
+    (reset! (::shut executor) true)
+    (impl/drain! (::pool executor))
+    (doseq [w (::workers executor)]
+      (deref w)))
+  nil)
+
+(defn shutdown-now
+  "Stops a pool immediately, abandoning queued work. Blocks until workers exit."
+  [executor]
+  (when (= :pool (::kind executor))
+    (reset! (::shut executor) true)
+    (impl/stop! (::pool executor))
+    (doseq [w (::workers executor)]
+      (deref w)))
+  nil)
+
+(defn shutdown?
+  "True once shutdown or shutdown-now has been called on this executor. Always false for
+   the cached and current-thread executors, which own nothing to shut down."
   [executor]
   (if (= :pool (::kind executor))
-    (::pool executor)
-    (::pool (default-pool))))
+    (deref (::shut executor))
+    false))
+
+;; ----------------------------------------------------------- default executor ----
+
+(def ^:dynamic *default-executor*
+  "The executor `submit`, `run` and `exec` use when given none. nil means the process-wide
+   default pool; bind it with `with-executor`."
+  nil)
+
+;; Held in an atom rather than a delay. A namespace-level `(def x (delay ...))` does not
+;; memoise across namespaces in jank -- every deref from another namespace re-runs the body
+;; -- which for a pool would mean a fresh set of OS threads per call. yakusoku.impl's
+;; ensure-warm! is guarded the same way, for the same reason.
+(def ^:private default-executor-box (atom nil))
+
+(defn default-executor
+  "The process-wide pool, sized to the core count and created on first use, so that merely
+   requiring Yakusoku never starts threads."
+  []
+  (or (deref default-executor-box)
+      (let [candidate (fixed-executor)]
+        (if (compare-and-set! default-executor-box nil candidate)
+          candidate
+          ;; Another thread got there first. Ours is surplus; stop its workers rather than
+          ;; leaking a pool's worth of threads.
+          (do (shutdown-now candidate)
+              (deref default-executor-box))))))
+
+(defn configure-default-executor
+  "Replaces the process-wide default pool, shutting down the one it displaces.
+
+     (configure-default-executor {:parallelism 16})
+
+   Call it before anything has been submitted; work already queued on the old pool is
+   drained, not moved."
+  ([] (configure-default-executor {}))
+  ([options]
+   (let [previous (deref default-executor-box)
+         next-executor (fixed-executor options)]
+     (reset! default-executor-box next-executor)
+     (when previous
+       (shutdown previous))
+     next-executor)))
+
+(defn resolve-executor
+  "Turns an executor, nil, or one of promesa's keywords into an executor.
+
+     :default                 the process-wide pool
+     :cached                  thread per task, unbounded
+     :thread / :platform      thread per task, unbounded
+     :vthread / :virtual      thread per task -- SEE BELOW
+     :same-thread / :current-thread   the calling thread
+
+   jank has no virtual threads, so :vthread and :virtual resolve to a real OS thread. That
+   is a substitution, not an equivalence: code that fans out thousands of :vthread tasks
+   expecting them to be cheap will spawn thousands of OS threads here. Say :default and use
+   the pool."
+  ([] (resolve-executor *default-executor*))
+  ([executor]
+   (cond
+     (executor? executor) executor
+     (nil? executor) (default-executor)
+     (= :default executor) (default-executor)
+     (= :cached executor) (cached-executor)
+     (= :thread executor) (cached-executor)
+     (= :platform executor) (cached-executor)
+     (= :vthread executor) (cached-executor)
+     (= :virtual executor) (cached-executor)
+     (= :same-thread executor) (current-thread-executor)
+     (= :current-thread executor) (current-thread-executor)
+     :else (throw (ex-info "Invalid executor" {:executor executor})))))
+
+;; ---------------------------------------------------------------- submission ----
+
+(defn- dispatch!
+  "Runs a zero-arity thunk on a resolved executor. Returns nil."
+  [executor f]
+  (cond
+    (= :inline (::kind executor)) (do (f) nil)
+    (= :thread (::kind executor)) (do (impl/ensure-warm!) (future (f)) nil)
+    (= :pool (::kind executor)) (impl/post! (::pool executor) f)
+    :else (throw (ex-info "Not an executor" {:executor executor}))))
+
+(defn- settled
+  "A promise already settled with v under the given status code."
+  [status-code v]
+  (let [p (impl/make-promise)]
+    (impl/settle! p status-code v)
+    p))
+
+(defn exec
+  "Runs a zero-arity function on an executor. Fire and forget: the returned promise says
+   the task was accepted, not that it finished. Never throws -- a rejected promise carries
+   anything raised while submitting."
+  ([f] (exec (resolve-executor) f))
+  ([executor f]
+   (let [r (impl/attempt (dispatch! (resolve-executor executor) f))]
+     (if (= :ok (nth r 0))
+       (settled impl/resolved nil)
+       (settled impl/rejected (nth r 1))))))
+
+(defn submit
+  "Runs a zero-arity function on an executor and returns a promise of its value.
+
+   A value the function returns is delivered as-is; a promise it returns is NOT unwrapped,
+   matching promesa since 9.0.462. Chain with `p/then` if you want flattening."
+  ([f] (submit (resolve-executor) f))
+  ([executor f]
+   (let [out (impl/make-promise)
+         task (fn []
+                (let [r (impl/attempt (f))]
+                  (if (= :ok (nth r 0))
+                    (impl/settle! out impl/resolved (nth r 1))
+                    (impl/settle! out impl/rejected (nth r 1)))))
+         submitted (impl/attempt (dispatch! (resolve-executor executor) task))]
+     (when (= :err (nth submitted 0))
+       (impl/settle! out impl/rejected (nth submitted 1)))
+     out)))
+
+(defn run
+  "Like submit, but discards the function's value: the promise resolves to nil once it has
+   run."
+  ([f] (run (resolve-executor) f))
+  ([executor f]
+   (submit executor (fn [] (f) nil))))
+
+(defn schedule
+  "Runs a zero-arity function after ms milliseconds and returns a promise of its value.
+
+   Timing comes from Asio's steady_timer, so there is no polling and no timer thread of our
+   own. Scheduled work is never cancelled at the timer; Yakusoku cancels at the promise
+   instead, and the callback finds it already settled and does nothing."
+  ([ms f] (schedule (resolve-executor) ms f))
+  ([executor ms f]
+   (let [ex (resolve-executor executor)
+         ctx (if (= :pool (::kind ex))
+               (::pool ex)
+               (::pool (default-executor)))
+         out (impl/make-promise)]
+     (impl/schedule! ctx ms
+                     (fn []
+                       (let [r (impl/attempt (f))]
+                         (if (= :ok (nth r 0))
+                           (impl/settle! out impl/resolved (nth r 1))
+                           (impl/settle! out impl/rejected (nth r 1))))))
+     out)))
+
+;; Scheduling needs a real event loop, so a scheduler is always a pool.
+(defn resolve-scheduler
+  "Like resolve-executor, but never yields something without an event loop: the cached and
+   current-thread executors cannot hold a timer, so they resolve to the default pool."
+  ([] (resolve-scheduler nil))
+  ([scheduler]
+   (let [ex (resolve-executor scheduler)]
+     (if (= :pool (::kind ex))
+       ex
+       (default-executor)))))
+
+;; --------------------------------------------------------------- conveniences ----
+
+(defmacro with-executor
+  "Binds *default-executor* to executor for the body.
+
+   `^:shutdown` on the executor form drains it afterwards, `^:interrupt` stops it at once:
+
+     (with-executor ^:shutdown (fixed-executor {:parallelism 2})
+       (p/await! (p/future (heavy))))"
+  [executor & body]
+  (let [interrupt? (-> executor meta :interrupt)
+        down? (-> executor meta :shutdown)
+        sym (gensym "executor")]
+    `(clojure.core/let [~sym ~executor
+                        ~sym (if (fn? ~sym) (~sym) ~sym)]
+       (binding [*default-executor* ~sym]
+         (try
+           ~@body
+           (finally
+             ~(when (or down? interrupt?)
+                (if interrupt?
+                  `(shutdown-now ~sym)
+                  `(shutdown ~sym)))))))))
+
+(defmacro with-dispatch
+  "Runs body on the given executor, returning a promise of its value."
+  [executor & body]
+  `(submit ~executor (fn [] ~@body)))
+
+(defn sleep
+  "Blocks the calling thread for ms milliseconds. Never call this on a pool worker -- it
+   holds the worker without doing work; `p/delay` is the non-blocking form."
+  [ms]
+  (cpp/clojure.core_native.sleep ms)
+  nil)
+
+(defn pmap
+  "Maps f over coll on the default executor and returns a vector of the results, in order.
+
+   Eager and blocking, unlike clojure.core/pmap and unlike promesa's, which is lazy: jank
+   has no chunked-seq machinery to pace it with, and a lazy parallel map whose realisation
+   is what submits the work is a trap. Blocks the calling thread until every element is
+   done, so do not call it from a pool worker."
+  [f coll]
+  (let [promises (doall (map (fn [x] (submit (fn [] (f x)))) coll))]
+    (mapv (fn [p]
+            (impl/await! p)
+            (if (= :rejected (impl/status p))
+              (throw (impl/value p))
+              (impl/value p)))
+          promises)))
+
+;; -------------------------------------------------------------------- timers ----
+;;
+;; Yakusoku extensions. promesa has no equivalent; these back the batching the parallel
+;; Pathom runner needs, which upstream builds out of core.async.
+
+(defn- context-of
+  "The io_context behind an executor: its own if it is a pool, the default pool's
+   otherwise. Timers need a real event loop."
+  [executor]
+  (let [ex (resolve-executor executor)]
+    (if (= :pool (::kind ex))
+      (::pool ex)
+      (::pool (default-executor)))))
 
 (defn timer
   "Creates a restartable timer on a pool.
@@ -125,10 +397,10 @@
    debouncing is. Timers are permanent -- see native/yakusoku.hpp -- so make one per
    long-lived thing that needs to debounce, not one per event."
   ([]
-   (timer (default-pool)))
+   (timer nil))
   ([executor]
    (impl/ensure-warm!)
-   (impl/make-timer (pool-of executor))))
+   (impl/make-timer (context-of executor))))
 
 (defn restart!
   "Arms a timer to run a zero-arity function after ms milliseconds, dropping whatever was
@@ -151,11 +423,12 @@
    This is the shape batching wants: producers push work items in as they discover them,
    and f sees each burst as one call."
   ([f window-ms]
-   (debouncer (default-pool) f window-ms nil))
+   (debouncer nil f window-ms nil))
   ([f window-ms threshold]
-   (debouncer (default-pool) f window-ms threshold))
+   (debouncer nil f window-ms threshold))
   ([executor f window-ms threshold]
-   (let [ex (if (= :pool (::kind executor)) executor (default-pool))
+   (let [ex (let [candidate (resolve-executor executor)]
+              (if (= :pool (::kind candidate)) candidate (default-executor)))
          t (timer ex)
          buffer (atom [])
          ;; One atomic take, so a flush and a concurrent push cannot lose an item between
@@ -175,25 +448,6 @@
              (cancel-timer! t)
              (let [items (take!)]
                (when (seq items)
-                 (exec! ex (fn [] (f items))))))
+                 (exec ex (fn [] (f items))))))
            (restart! t window-ms flush!)))
        nil))))
-
-(defn shutdown!
-  "Drains a pool: workers finish queued work and pending timers, then stop. Blocks until
-   every worker has exited. A no-op for the inline and thread executors."
-  [executor]
-  (when (= :pool (::kind executor))
-    (impl/drain! (::pool executor))
-    (doseq [w (::workers executor)]
-      (deref w)))
-  nil)
-
-(defn shutdown-now!
-  "Stops a pool immediately, abandoning queued work. Blocks until workers exit."
-  [executor]
-  (when (= :pool (::kind executor))
-    (impl/stop! (::pool executor))
-    (doseq [w (::workers executor)]
-      (deref w)))
-  nil)

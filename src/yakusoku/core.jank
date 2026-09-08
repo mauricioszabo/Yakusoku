@@ -100,7 +100,14 @@
    thread settles p -- or immediately, on this thread, if p is already settled."
   [p executor f]
   (clojure.core/let [callback (if executor
-                                (fn [] (exec/exec! executor f))
+                                ;; Resolved here, not at the call site, so every executor
+                                ;; arity in this namespace accepts promesa's keywords --
+                                ;; (p/then p f :default) as well as (p/then p f a-pool).
+                                ;; nil never reaches this branch: no executor means the
+                                ;; completing thread, which is promesa's default too, and
+                                ;; is NOT the same as (resolve-executor nil).
+                                (clojure.core/let [ex (exec/resolve-executor executor)]
+                                  (fn [] (exec/exec ex f)))
                                 f)]
     ;; attach! returns true when the promise was already settled, in which case nothing
     ;; was registered and we run the callback ourselves. That return value is decided
@@ -127,15 +134,20 @@
 
 (defn- from-blocking
   "Wraps a jank-native promise or future. Costs one thread: jank's own promises expose no
-   completion callback, only a blocking deref."
+   completion callback, only a blocking deref.
+
+   The one place in Yakusoku that deliberately takes a whole OS thread rather than the
+   pool. The thread does nothing but block, and a pool has a fixed number of workers, so
+   putting this on the pool would spend a worker per wrapped promise and deadlock as soon
+   as there were more of them than cores."
   [x]
   (clojure.core/let [out (deferred)]
-    (exec/exec! (exec/thread-executor)
-                (fn []
-                  (clojure.core/let [r (impl/attempt (clojure.core/deref x))]
-                    (if (= :ok (nth r 0))
-                      (deliver-value! out (nth r 1))
-                      (reject! out (nth r 1))))))
+    (exec/exec (exec/cached-executor)
+               (fn []
+                 (clojure.core/let [r (impl/attempt (clojure.core/deref x))]
+                   (if (= :ok (nth r 0))
+                     (deliver-value! out (nth r 1))
+                     (reject! out (nth r 1))))))
     out))
 
 ;; ----------------------------------------------------------- coercion ----
@@ -155,7 +167,9 @@
 
      (p/create (fn [resolve reject] (resolve 42)))
 
-   With an executor, the function runs there rather than on the calling thread."
+   With an executor, the function runs there rather than on the calling thread. The
+   executor may be an executor map or one of promesa's keywords (:default, :thread,
+   :same-thread and the rest -- see yakusoku.exec/resolve-executor)."
   ([f] (create f nil))
   ([f executor]
    (clojure.core/let [out (deferred)
@@ -167,7 +181,7 @@
                               (when (= :err (nth r 0))
                                 (reject! out (nth r 1)))))]
      (if executor
-       (exec/exec! executor run)
+       (exec/exec (exec/resolve-executor executor) run)
        (run))
      out)))
 
@@ -387,12 +401,33 @@
 
 ;; ---------------------------------------------------------------- blocking ----
 
+(defn- check-not-on-worker!
+  "Refuses to block a pool worker.
+
+   The default executor is a pool with one worker per core. A worker that blocks on a
+   promise cannot run the task that would settle it, so blocking every worker at once
+   wedges the pool -- silently, with no output and no error, which is the worst way for a
+   program to fail. promesa has the identical trap on its ForkJoinPool.
+
+   The fix in calling code is not to block: chain with `then`, or hand the blocking work to
+   `p/thread`, which takes a real OS thread precisely so it may block."
+  [where]
+  (when (impl/on-pool-worker?)
+    (throw (ex-info (str where " would block a pool worker, deadlocking the executor. "
+                         "Chain with then instead, or run the blocking work on p/thread.")
+                    {:type ::blocking-on-pool-worker
+                     :operation where})))
+  nil)
+
 (defn await!
   "Blocks the calling thread until p settles, then returns its value. Rethrows the
    rejection reason; returns nil for a cancelled promise.
 
-   This is what `@promise` would be if jank let us define deref on our own types."
+   This is what `@promise` would be if jank let us define deref on our own types.
+
+   Throws rather than blocking when called on a pool worker -- see check-not-on-worker!."
   [p]
+  (check-not-on-worker! "await!")
   (clojure.core/let [src (promise p)]
     (impl/await! src)
     (case (impl/status src)
@@ -411,9 +446,11 @@
    Unlike await!, this reports settlement without looking at the outcome and without
    rethrowing a rejection -- useful when you want to inspect `state` yourself."
   ([p]
+   (check-not-on-worker! "wait!")
    (impl/await! (promise p))
    true)
   ([p ms]
+   (check-not-on-worker! "wait!")
    (impl/await-for! (promise p) ms)))
 
 (defn await-for!
@@ -424,6 +461,7 @@
    wait with a timeout."
   ([p ms] (await-for! p ms nil))
   ([p ms timeout-val]
+   (check-not-on-worker! "await-for!")
    (clojure.core/let [src (promise p)]
      (if (impl/await-for! src ms)
        (case (impl/status src)
@@ -436,11 +474,15 @@
 
 (defn delay
   "A promise that resolves with v (nil by default) after ms milliseconds. Timing comes
-   from Asio's steady_timer."
-  ([ms] (delay ms nil))
-  ([ms v]
+   from Asio's steady_timer.
+
+   Takes an optional scheduler, as promesa does. Only a pool can hold a timer, so a
+   scheduler that is not one falls back to the default pool."
+  ([ms] (delay ms nil nil))
+  ([ms v] (delay ms v nil))
+  ([ms v scheduler]
    (clojure.core/let [out (deferred)]
-     (exec/schedule! ms (fn [] (resolve! out v)))
+     (exec/schedule (exec/resolve-scheduler scheduler) ms (fn [] (resolve! out v)))
      out)))
 
 (defn timeout
@@ -449,15 +491,16 @@
 
    Nothing is cancelled at the timer: whichever of the two finishes first settles the
    promise, and the loser finds it settled and does nothing."
-  ([p ms] (timeout p ms nil))
-  ([p ms timeout-val]
+  ([p ms] (timeout p ms nil nil))
+  ([p ms timeout-val] (timeout p ms timeout-val nil))
+  ([p ms timeout-val scheduler]
    (clojure.core/let [src (promise p)
                       out (deferred)]
      (on-settle src nil (fn [] (copy-settlement! src out)))
-     (exec/schedule! ms
-                     (fn []
-                       (reject! out (or timeout-val
-                                        (ex-info "Operation timed out" {:timeout ms})))))
+     (exec/schedule (exec/resolve-scheduler scheduler) ms
+                    (fn []
+                      (reject! out (or timeout-val
+                                       (ex-info "Operation timed out" {:timeout ms})))))
      out)))
 
 ;; ----------------------------------------------------------------- macros ----
@@ -483,26 +526,56 @@
              (clojure.core/let [~names values#]
                ~@body)))))
 
-(defmacro future
-  "Runs body on its own thread and returns a promise of its value. One OS thread per
-   call, since that is what jank's future costs; prefer `via` with a pool for volume."
-  [& body]
-  `(create (fn [resolve# reject#]
-             (clojure.core/let [r# (impl/attempt (clojure.core/let [v# ((fn [] ~@body))] v#))]
-               (if (= :ok (nth r# 0))
-                 (resolve# (nth r# 1))
-                 (reject# (nth r# 1)))))
-           (exec/thread-executor)))
+(defn thread-call
+  "Runs a zero-arity function on an executor and returns a promise of its value. The
+   function form of `future` and `thread`, and the same name promesa gives it.
 
-(defmacro via
-  "Runs body on the given executor and returns a promise of its value."
-  [executor & body]
-  `(create (fn [resolve# reject#]
-             (clojure.core/let [r# (impl/attempt (clojure.core/let [v# ((fn [] ~@body))] v#))]
-               (if (= :ok (nth r# 0))
-                 (resolve# (nth r# 1))
-                 (reject# (nth r# 1)))))
-           ~executor))
+   With one argument it uses a thread of its own, as promesa's does. The executor may be an
+   executor or one of promesa's keywords."
+  ([f] (thread-call :thread f))
+  ([executor f]
+   ;; Every promise in this namespace is normally born in `deferred`, which is what
+   ;; guarantees the namespace is compiled before a worker touches it. These submissions
+   ;; build their promise inside yakusoku.exec instead, so the warm-up has to happen here:
+   ;; without it the first `p/future` of a process can have a pool worker first-compiling
+   ;; this namespace, which corrupts the heap rather than failing.
+   (ensure-warm!)
+   (exec/submit executor f)))
+
+(defmacro future
+  "Runs body on the default executor and returns a promise of its value.
+
+   The default executor is a pool with one worker per core, so a thousand calls cost a
+   thousand queue slots and `(get-available-processors)` threads -- not a thousand threads.
+   This is promesa's `p/future`, which submits to its own default executor.
+
+   A promise the body returns is NOT unwrapped, matching promesa since 9.0.462; chain with
+   `then` if you want flattening.
+
+   Do not block in here. A worker blocked on a promise cannot run the task that would
+   settle it, and blocking every worker wedges the pool; `await!` throws rather than let
+   that happen silently. Blocking work belongs on `thread`."
+  [& body]
+  `(thread-call :default (fn [] ~@body)))
+
+(defmacro thread
+  "Runs body on a thread of its own and returns a promise of its value.
+
+   promesa's escape hatch, and the right thing for work that blocks: one OS thread per
+   call, never queued behind anything, safe to block. It is also what `future` used to do
+   here -- wrongly, since that made a pooled promise library into a wrapper over jank's
+   unbounded `future`."
+  [& body]
+  `(thread-call :thread (fn [] ~@body)))
+
+(defmacro vthread
+  "Alias of `thread`.
+
+   promesa runs this on a virtual thread. jank has none, so this is a real OS thread: the
+   name is here for source compatibility, and code that fans out thousands of them will
+   spawn thousands of threads. Use `future` for that."
+  [& body]
+  `(thread ~@body))
 
 (defmacro ->
   "Like clojure.core/->, threading through then: each step receives the resolved value

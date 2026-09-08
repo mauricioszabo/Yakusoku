@@ -318,17 +318,27 @@
                                        vec)))))
 
   (testing "p/future runs on another thread"
-    (is (= [:ok 3] (settled (p/future (+ 1 2))))))
+    (let [here (cpp/yakusoku.thread_id)]
+      (is (= [:ok 3] (settled (p/future (+ 1 2)))))
+      (is (= [:ok false] (settled (p/future (= here (cpp/yakusoku.thread_id))))))))
 
   (testing "p/future captures a throw as a rejection"
     (is (= :err (nth (settled (p/future (throw (ex-info "in-future" {})))) 0))))
 
-  (testing "p/via runs on a given executor"
-    (let [pool (exec/pool 2)]
+  (testing "p/thread runs on another thread"
+    (let [here (cpp/yakusoku.thread_id)]
+      (is (= [:ok 9] (settled (p/thread (* 3 3)))))
+      (is (= [:ok false] (settled (p/thread (= here (cpp/yakusoku.thread_id))))))))
+
+  (testing "p/vthread is p/thread, jank having no virtual threads"
+    (is (= [:ok 4] (settled (p/vthread (+ 2 2))))))
+
+  (testing "exec/with-dispatch runs on a given executor"
+    (let [pool (exec/fixed-executor {:parallelism 2})]
       (try
-        (is (= [:ok 9] (settled (p/via pool (* 3 3)))))
+        (is (= [:ok 9] (settled (exec/with-dispatch pool (* 3 3)))))
         (finally
-          (exec/shutdown! pool))))))
+          (exec/shutdown pool))))))
 
 ;; ------------------------------------------------------------------ create ----
 
