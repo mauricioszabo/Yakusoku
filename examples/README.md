@@ -59,51 +59,50 @@ Each runs once to warm up (discarded) and then seven times; the table shows the 
 
 ## Results
 
-> **These numbers are stale and must be re-measured.** They were taken when `p/future` on
-> jank meant "one raw OS thread per call" and the benchmark worked around it by threading an
-> explicit `yakusoku.exec/pool` through `p/via`. `p/future` is now the core-sized default
-> pool on both sides, and `p/via` is gone, so the async and parallel rows in particular no
-> longer describe the code above. Re-run both files and replace this table.
-
 Measured on a quiet 4-core box, medians of seven passes, jank 0.1-noble against OpenJDK 21:
 
 | benchmark | jank (pathim) | Clojure (Pathom 3) | jank / Clojure |
 | --- | ---: | ---: | ---: |
-| raw / chain | 2.0 | 1.8 | 1.1× |
-| raw / many | 57.1 | 53.1 | 1.08× |
-| sync / chain | 11.6 | 13.3 | 0.9× |
-| sync / chain-fallback | 11.5 | 8.9 | 1.3× |
-| sync / many | 80.6 | 51.7 | 1.6× |
-| async / chain | 20.4 | 11.9 | 1.7× |
-| async / many | 150.6 | 88.2 | 1.7× |
-| parallel / chain | 17.0 | 9.3 | 1.8× |
-| parallel / many | 88.1 | 25.2 | 3.5× |
+| raw / chain | 2.1 | 2.5 | 0.84× |
+| raw / many | 57.5 | 73.5 | 0.78× |
+| sync / chain | 23.7 | 14.9 | 1.6× |
+| sync / chain-fallback | 12.5 | 12.1 | 1.03× |
+| sync / many | 75.8 | 66.3 | 1.14× |
+| async / chain | 14.0 | 12.1 | 1.16× |
+| async / chain-fallback | 15.6 | 12.2 | 1.28× |
+| async / many | 132.0 | 90.7 | 1.46× |
+| parallel / chain | 12.6 | 10.8 | 1.17× |
+| parallel / chain-fallback | 15.1 | 9.8 | 1.54× |
+| parallel / many | 69.9 | 28.6 | 2.44× |
 
 Treat these as indicative rather than precise: run them yourself. Timings on this workload
 move by a factor of two depending on what else the machine is doing, which is why the
 benchmark takes a median and why the interesting readings below are ratios between rows of
-the same run rather than absolute numbers.
+the same run rather than absolute numbers. `sync/chain` on jank is the one row not to read
+too closely — at 23.7 ms it is nearly twice its own `chain-fallback`, which is the harder
+query, so most of it is first-call compilation the single warm-up pass did not cover.
 
 Three things stand out.
 
-**jank runs this arithmetic at roughly JVM speed.** That is the `raw` row — no Pathom, no
-promises, just Peano addition, multiplication and a doubly-recursive Fibonacci — and jank is
-within about 10% of the JVM on it. Tight integer loops and self-recursive calls are what
+**jank runs this arithmetic faster than the JVM.** That is the `raw` row — no Pathom, no
+promises, just Peano addition, multiplication and a doubly-recursive Fibonacci — and jank
+comes in at 0.78–0.84× of OpenJDK 21. Tight integer loops and self-recursive calls are what
 jank's ahead-of-time C++ codegen should be good at, and it is.
 
-**The cost shows up once the graph machinery is involved, and grows with concurrency.**
-`sync/many` is 1.6× the JVM, `async/many` 1.7×, `parallel/many` 3.5×. Since the arithmetic
-underneath is at parity, that spread is the port and the promise layer: allocation,
-map-heavy plan bookkeeping, and — for the parallel row — Yakusoku scheduling through Asio
-against promesa on a JVM thread pool. The `parallel/many` gap is the widest number in the
-table and the most obvious place to look for wins.
+**The cost is in the graph machinery, and it grows with concurrency.** `sync/many` is 1.14×
+the JVM, `async/many` 1.46×, `parallel/many` 2.44×. Since the arithmetic underneath is
+*ahead*, that spread is entirely the port and the promise layer: allocation, map-heavy plan
+bookkeeping, and — for the parallel row — Yakusoku scheduling through an Asio `io_context`
+against promesa on a ForkJoinPool. The `parallel/many` gap is the widest number in the table
+and the most obvious place to look for wins; a plausible part of it is that the Asio pool is
+one shared FIFO queue, where ForkJoinPool gives each worker its own deque and steals.
 
-**Parallelism helps both, and helps the JVM more.** `parallel/many` against `sync/many` is
-1.1× faster on jank and 2.1× on Clojure, on four cores. The chain is mostly serial — each
-step needs the one before it — so the only thing to overlap is the 24 tasks in the join, and
-each of those pays a thread hop per expensive resolver. Both sides call `p/future`, and on
-both sides that means a fixed pool sized to the core count — promesa's default executor on
-the JVM, Yakusoku's on jank. Neither file plumbs an executor by hand.
+**Parallelism helps both, and helps the JVM far more.** `parallel/many` against `sync/many`
+is 1.08× faster on jank and 2.3× on Clojure, on four cores. The chain is mostly serial —
+each step needs the one before it — so the only thing to overlap is the 24 tasks in the
+join, and each of those pays a hop through the pool per expensive resolver. Both sides call
+`p/future`, and on both sides that means a fixed pool sized to the core count — promesa's
+default executor on the JVM, Yakusoku's on jank. Neither file plumbs an executor by hand.
 
 A single query spends most of its time *planning* — `sync/chain` is several times
 `raw/chain` on both runtimes — because nothing here caches plans between calls. That is why
