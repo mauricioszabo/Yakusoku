@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Builds the native support library Yakusoku links against, and vendors Taskflow if needed.
+# Builds the native support library Yakusoku links against.
 #
-# Taskflow is header-only, but it cannot be left header-only here: jank's JIT cannot compile
-# it (see native/yakusoku_pool.cpp). So the Taskflow-facing half is compiled ahead of time
-# into this library, and jank only ever sees the three declarations in
-# native/yakusoku_pool.hpp.
+# The oneTBB-facing half is compiled ahead of time into this library so that jank never has
+# to parse oneTBB; jank only ever sees the three declarations in native/yakusoku_pool.hpp.
+# oneTBB comes from the system (Debian/Ubuntu: apt install libtbb-dev).
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,29 +11,16 @@ out="${root}/target/native"
 cxx="$(dirname "$(readlink -f "$(command -v jank)")")/../lib/jank/0.1/bin/clang++"
 [ -x "$cxx" ] || cxx="/usr/local/lib/jank/0.1/bin/clang++"
 
-# Prefer a vendored Taskflow, fall back to a system one, and fetch it if neither is there.
-if [ ! -f "${root}/third-party/taskflow/taskflow/taskflow.hpp" ] \
-   && [ ! -f /usr/local/include/taskflow/taskflow.hpp ] \
-   && [ ! -f /usr/include/taskflow/taskflow.hpp ]; then
-  echo "fetching Taskflow into third-party/taskflow…"
-  mkdir -p "${root}/third-party"
-  git clone --depth 1 -q https://github.com/taskflow/taskflow.git \
-    "${root}/third-party/taskflow"
-fi
-
-if [ -f "${root}/third-party/taskflow/taskflow/taskflow.hpp" ]; then
-  tf_include="${root}/third-party/taskflow"
-elif [ -f /usr/local/include/taskflow/taskflow.hpp ]; then
-  tf_include="/usr/local/include"
-else
-  tf_include="/usr/include"
+if [ ! -f /usr/include/oneapi/tbb/task_arena.h ] && [ ! -f /usr/local/include/oneapi/tbb/task_arena.h ]; then
+  echo "error: oneTBB not found. Install it (Debian/Ubuntu: apt install libtbb-dev)." >&2
+  exit 1
 fi
 
 mkdir -p "$out"
 
-"$cxx" -std=c++20 -fPIC -O2 -w -I "$tf_include" -I "${root}/native" \
+"$cxx" -std=c++20 -fPIC -O2 -w -I "${root}/native" \
   -c "${root}/native/yakusoku_pool.cpp" -o "${out}/yakusoku_pool.o"
 
-"$cxx" -shared -fPIC -o "${out}/libyakusoku-asio.so" "${out}/yakusoku_pool.o" -lpthread
+"$cxx" -shared -fPIC -o "${out}/libyakusoku-asio.so" "${out}/yakusoku_pool.o" -ltbb -lpthread
 
-echo "built ${out}/libyakusoku-asio.so (taskflow headers: ${tf_include})"
+echo "built ${out}/libyakusoku-asio.so (oneTBB)"

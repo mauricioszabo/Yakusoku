@@ -3,46 +3,76 @@
 // If a copy of the MPL was not distributed with this file, You can obtain one at
 // http://mozilla.org/MPL/2.0/.
 //
-// The Taskflow half of the pool, compiled ahead of time.
+// The oneTBB half of the pool, compiled ahead of time.
 //
-// It is separate from yakusoku.hpp for one reason, and not a stylistic one: jank cannot
-// JIT-compile Taskflow. Including <taskflow/taskflow.hpp> from a header jank parses and
-// then constructing a tf::Executor fails at JIT link time with
+// oneTBB is the closest thing in C++ to the JVM's ForkJoinPool -- the same per-worker deques
+// and the same random stealing -- which makes it the most direct answer to "why is
+// parallel/many faster on the JVM".
 //
-//   JIT session error: Symbols not found:
-//     [ __emutls_v._ZSt15__once_callable, __emutls_v._ZSt11__once_call ]
+// It is separate from yakusoku.hpp for the same reason the Taskflow version was: jank cannot
+// JIT-compile a library of this size safely, and keeping it out of jank's compiler entirely
+// is cheaper than finding out which part it chokes on. Deliberately this file knows nothing
+// about jank -- no object_ref, no GC, no boxing -- and crosses into yakusoku.hpp as an
+// opaque `void *` behind a plain function pointer.
 //
-// because jank's JIT emits emulated-TLS accesses for std::call_once while the system
-// libstdc++ provides native TLS. Plain std::thread from a JIT'd header is fine -- it is
-// Taskflow specifically -- so the fix is to keep Taskflow out of jank's compiler entirely.
-//
-// Deliberately this file knows nothing about jank. No object_ref, no GC, no boxing: all of
-// that stays in yakusoku.hpp where it is readable, and crosses into here as an opaque
-// `void *` behind a plain function pointer. That keeps the ahead-of-time half small enough
-// to hold in your head, and means this file compiles with nothing but Taskflow on the
-// include path.
+// Submission uses `task_arena::enqueue`, which is fire-and-forget and, unlike
+// `task_arena::execute`, does not make the calling thread join the arena. That matters:
+// pool_submit is called from pool workers and from the timer thread, and neither should be
+// conscripted into running someone else's work. Since enqueue tracks nothing, the outstanding
+// count is ours.
 
-#include <taskflow/taskflow.hpp>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+
+#include <oneapi/tbb/task_arena.h>
 
 #include "yakusoku_pool.hpp"
 
 namespace yakusoku::backend
 {
+  namespace
+  {
+    struct arena_pool
+    {
+      tbb::task_arena arena;
+      std::mutex mutex;
+      std::condition_variable idle;
+      long outstanding{ 0 };
+
+      explicit arena_pool(unsigned const workers)
+        : arena{ static_cast<int>(workers) }
+      {
+      }
+    };
+  }
+
   void *pool_new(unsigned const workers)
   {
-    return new tf::Executor{ workers > 0 ? workers : 1 };
+    return new arena_pool{ workers > 0 ? workers : 1 };
   }
 
   void pool_submit(void * const pool, task_fn const fn, void * const arg)
   {
-    static_cast<tf::Executor *>(pool)->silent_async([fn, arg] { fn(arg); });
+    auto * const p{ static_cast<arena_pool *>(pool) };
+    {
+      std::lock_guard<std::mutex> const lock{ p->mutex };
+      ++p->outstanding;
+    }
+    p->arena.enqueue([p, fn, arg] {
+      fn(arg);
+      {
+        std::lock_guard<std::mutex> const lock{ p->mutex };
+        --p->outstanding;
+      }
+      p->idle.notify_all();
+    });
   }
 
-  /* Blocks until every submitted task has finished. Taskflow offers no way to recall work
-     already submitted, which is why Yakusoku's shutdown-now cannot drop a queued task the
-     way Asio's could. */
   void pool_wait_idle(void * const pool)
   {
-    static_cast<tf::Executor *>(pool)->wait_for_all();
+    auto * const p{ static_cast<arena_pool *>(pool) };
+    std::unique_lock<std::mutex> lock{ p->mutex };
+    p->idle.wait(lock, [p] { return p->outstanding == 0; });
   }
 }

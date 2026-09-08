@@ -8,7 +8,7 @@
    An executor is a plain map carrying a ::kind, dispatched by an ordinary function --
    jank has no protocols, and none are needed for three kinds:
 
-     :pool    a Taskflow work-stealing executor, per-worker deques and all
+     :pool    a oneTBB task_arena, per-worker deques and random stealing
      :thread  one jank future -- one raw OS thread -- per task
      :inline  the calling thread
 
@@ -117,9 +117,9 @@
 (defn forkjoin-executor
   "A pool, under promesa's name for its ForkJoinPool.
 
-   Unlike most of the compatibility names here this one is honest: the pool underneath is
-   Taskflow's work-stealing executor, per-worker deques and all, which is the same shape as
-   the ForkJoinPool promesa uses on the JVM."
+   Unlike most of the compatibility names here this one is honest: the pool underneath is a
+   oneTBB task_arena, which is the same design as the ForkJoinPool promesa uses on the JVM
+   -- per-worker deques, random victim stealing."
   ([] (forkjoin-executor {}))
   ([options] (fixed-executor options)))
 
@@ -141,8 +141,8 @@
 
 (defn shutdown-now
   "Stops a pool without waiting on its pending timers, then blocks until its workers are
-   idle. Work already handed to the pool still runs: Taskflow cannot recall a submitted
-   task, so unlike Asio this does not drop the queue."
+   idle. Work already handed to the pool still runs: an enqueued oneTBB task cannot be
+   recalled, so unlike Asio this does not drop the queue."
   [executor]
   (when (= :pool (::kind executor))
     (reset! (::shut executor) true)

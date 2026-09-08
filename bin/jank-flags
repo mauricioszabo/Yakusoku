@@ -4,13 +4,5 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-if [ -f "${root}/third-party/taskflow/taskflow/taskflow.hpp" ]; then
-  tf_include="${root}/third-party/taskflow"
-elif [ -f /usr/local/include/taskflow/taskflow.hpp ]; then
-  tf_include="/usr/local/include"
-else
-  tf_include="/usr/include"
-fi
-
-echo -n "-I ${tf_include} -I ${root}/native "
+echo -n "-I ${root}/native "
 echo -n "-L ${root}/target/native -l yakusoku-asio"

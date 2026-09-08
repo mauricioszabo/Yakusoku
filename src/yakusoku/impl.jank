@@ -117,7 +117,7 @@
 
 (defn stop!
   "Stops without waiting for pending timers. Work already submitted to the pool still runs
-   to completion -- Taskflow has no way to recall a submitted task."
+   to completion -- an enqueued oneTBB task cannot be recalled."
   [p]
   (cpp/yakusoku.pool_stop (::pool p)))
 
