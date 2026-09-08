@@ -82,10 +82,14 @@
   (and (map? x) (contains? x ::pool)))
 
 (defn make-pool
-  "Creates an Asio io_context with a work guard. It has no threads of its own until
-   run! is called on threads supplied by the caller."
-  []
-  {::pool (cpp/yakusoku.pool_create)})
+  "Creates a work-stealing pool of n worker threads, started immediately.
+
+   Unlike the Asio io_context this replaced, the pool owns its threads: work stealing needs
+   a deque per worker, so the workers cannot be supplied by the caller. Each registers
+   itself with the collector the first time it runs a task -- see ensure_gc_registered in
+   native/yakusoku.hpp."
+  [n]
+  {::pool (cpp/yakusoku.pool_create (cpp/cast cpp/long n))})
 
 (defn post!
   "Queues a zero-arity function to run on a pool worker."
@@ -97,12 +101,6 @@
   [p ms f]
   (cpp/yakusoku.pool_schedule (::pool p) (cpp/cast cpp/long ms) f))
 
-(defn run-loop!
-  "Runs the pool's event loop on the calling thread. Returns when the pool is drained
-   or stopped."
-  [p]
-  (cpp/yakusoku.pool_run (::pool p)))
-
 (defn on-pool-worker?
   "True when the calling thread is inside a pool's event loop.
 
@@ -113,12 +111,13 @@
   (cpp/yakusoku.on_pool_worker))
 
 (defn drain!
-  "Releases the work guard: workers return once queued work and pending timers finish."
+  "Lets queued work and pending timers finish, then stops the workers."
   [p]
   (cpp/yakusoku.pool_drain (::pool p)))
 
 (defn stop!
-  "Stops immediately, abandoning queued work."
+  "Stops without waiting for pending timers. Work already submitted to the pool still runs
+   to completion -- Taskflow has no way to recall a submitted task."
   [p]
   (cpp/yakusoku.pool_stop (::pool p)))
 
@@ -195,7 +194,7 @@
    Everything here is thrown away; the pool never runs a worker and is stopped at once."
   []
   (let [p (make-promise)
-        pool (make-pool)]
+        pool (make-pool 1)]
     (promise? p)
     (status p)
     (attach! p (fn [] nil))
@@ -215,9 +214,6 @@
       (cancel-timer! t))
     (drain! pool)
     (stop! pool)
-    ;; The context is already stopped, so this returns immediately -- but it leaves the
-    ;; worker loop compiled, which is what pool workers will call.
-    (run-loop! pool)
     nil))
 
 (def ^:private warmed (atom false))

@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Builds the Asio support library Yakusoku links against.
+# Builds the native support library Yakusoku links against, and vendors Taskflow if needed.
 #
-# Yakusoku uses Asio in ASIO_SEPARATE_COMPILATION mode rather than header-only. That is
-# not an optimisation: jank's incremental C++ parser rejects asio/impl/cancellation_signal.ipp
-# ("'auto_delete_helper' is a private member"), which regular Clang accepts. Compiling
-# Asio's sources ahead of time keeps those .ipp files away from the JIT entirely -- and
-# cuts load time, since the JIT then only parses declarations.
+# Taskflow is header-only, but it cannot be left header-only here: jank's JIT cannot compile
+# it (see native/yakusoku_pool.cpp). So the Taskflow-facing half is compiled ahead of time
+# into this library, and jank only ever sees the three declarations in
+# native/yakusoku_pool.hpp.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,27 +12,29 @@ out="${root}/target/native"
 cxx="$(dirname "$(readlink -f "$(command -v jank)")")/../lib/jank/0.1/bin/clang++"
 [ -x "$cxx" ] || cxx="/usr/local/lib/jank/0.1/bin/clang++"
 
-# Prefer a vendored Asio, fall back to the system one (libasio-dev, homebrew asio, nix).
-if [ -f "${root}/third-party/asio/asio/include/asio.hpp" ]; then
-  asio_include="${root}/third-party/asio/asio/include"
-elif [ -f /usr/include/asio.hpp ]; then
-  asio_include="/usr/include"
-elif [ -f /usr/local/include/asio.hpp ]; then
-  asio_include="/usr/local/include"
+# Prefer a vendored Taskflow, fall back to a system one, and fetch it if neither is there.
+if [ ! -f "${root}/third-party/taskflow/taskflow/taskflow.hpp" ] \
+   && [ ! -f /usr/local/include/taskflow/taskflow.hpp ] \
+   && [ ! -f /usr/include/taskflow/taskflow.hpp ]; then
+  echo "fetching Taskflow into third-party/taskflow…"
+  mkdir -p "${root}/third-party"
+  git clone --depth 1 -q https://github.com/taskflow/taskflow.git \
+    "${root}/third-party/taskflow"
+fi
+
+if [ -f "${root}/third-party/taskflow/taskflow/taskflow.hpp" ]; then
+  tf_include="${root}/third-party/taskflow"
+elif [ -f /usr/local/include/taskflow/taskflow.hpp ]; then
+  tf_include="/usr/local/include"
 else
-  echo "error: standalone Asio not found. Install it (Debian/Ubuntu: apt install libasio-dev," >&2
-  echo "       macOS: brew install asio) or vendor it at third-party/asio." >&2
-  exit 1
+  tf_include="/usr/include"
 fi
 
 mkdir -p "$out"
-echo "#include <asio/impl/src.hpp>" > "${out}/asio_src.cpp"
 
-"$cxx" -std=c++20 -fPIC -O2 -w \
-  -DASIO_STANDALONE -DASIO_NO_DEPRECATED -DASIO_SEPARATE_COMPILATION \
-  -I "$asio_include" \
-  -c "${out}/asio_src.cpp" -o "${out}/asio_src.o"
+"$cxx" -std=c++20 -fPIC -O2 -w -I "$tf_include" -I "${root}/native" \
+  -c "${root}/native/yakusoku_pool.cpp" -o "${out}/yakusoku_pool.o"
 
-"$cxx" -shared -fPIC -o "${out}/libyakusoku-asio.so" "${out}/asio_src.o" -lpthread
+"$cxx" -shared -fPIC -o "${out}/libyakusoku-asio.so" "${out}/yakusoku_pool.o" -lpthread
 
-echo "built ${out}/libyakusoku-asio.so (asio headers: ${asio_include})"
+echo "built ${out}/libyakusoku-asio.so (taskflow headers: ${tf_include})"

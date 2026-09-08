@@ -8,7 +8,7 @@
    An executor is a plain map carrying a ::kind, dispatched by an ordinary function --
    jank has no protocols, and none are needed for three kinds:
 
-     :pool    an Asio io_context with a fixed set of workers
+     :pool    a Taskflow work-stealing executor, per-worker deques and all
      :thread  one jank future -- one raw OS thread -- per task
      :inline  the calling thread
 
@@ -16,9 +16,9 @@
    and `exec` go to it unless told otherwise. That is the whole point of this namespace:
    `p/future` should cost a queue slot, not a thread.
 
-   Pool workers are jank futures rather than threads Asio made for itself, because jank's
-   `future` registers the thread with the garbage collector and conveys dynamic bindings.
-   Borrowing it means Yakusoku inherits both instead of reimplementing them.
+   The pool owns its worker threads: work stealing needs a deque bound to each worker, so
+   unlike the Asio io_context this replaced, they cannot be supplied from outside. Each
+   registers itself with the garbage collector before running its first task.
 
    Two deliberate departures from promesa, both because jank cannot do otherwise:
 
@@ -83,30 +83,23 @@
      (fixed-executor)
      (fixed-executor {:parallelism 4})
 
-   Tasks queue on an Asio io_context and are taken by whichever worker is free, so N tasks
-   cost N queue slots rather than N threads. Shut it down when done -- `shutdown` drains,
-   `shutdown-now` abandons -- though a pool left running will not hold the process open:
-   the native core registers an atexit handler that stops every pool it made."
+   Each worker owns a deque and steals from the others when its own runs dry, so a burst of
+   tasks spreads without every worker contending on one queue. Shut it down when done --
+   `shutdown` drains, `shutdown-now` stops waiting on timers -- though a pool left running
+   will not hold the process open: the native core registers an atexit handler that stops
+   every pool it made.
+
+   The pool owns its threads, unlike the Asio io_context this replaced, where workers were
+   jank futures running the event loop. Work stealing needs a deque bound to each worker, so
+   the threads cannot come from outside; each one registers itself with the collector before
+   it runs its first task."
   ([] (fixed-executor {}))
   ([options]
    (let [n (or (:parallelism options) (get-available-processors))]
      (impl/ensure-warm!)
-     (let [p (impl/make-pool)
-           ;; One definition, used for both the warm-up call and the real workers.
-           make-worker (fn [ctx] (fn [] (impl/run-loop! ctx)))]
-       ;; Compile the worker on THIS thread before any other thread can call it. jank
-       ;; compiles a function on first call, and several threads entering that compilation
-       ;; at once corrupts the JIT (interleaved Clang errors, then a segfault). Running the
-       ;; worker against an already-stopped context returns immediately and leaves the code
-       ;; compiled, so the real workers only ever execute it. yakusoku.impl warms its own
-       ;; functions the same way when it loads.
-       (let [warm (impl/make-pool)]
-         (impl/stop! warm)
-         ((make-worker warm)))
-       {::kind :pool
-        ::pool p
-        ::shut (atom false)
-        ::workers (doall (map (fn [_] (future-call (make-worker p))) (range n)))}))))
+     {::kind :pool
+      ::pool (impl/make-pool n)
+      ::shut (atom false)})))
 
 (defn single-executor
   "A pool with exactly one worker, so its tasks run in submission order and never overlap."
@@ -116,24 +109,22 @@
 (defn scheduled-executor
   "A pool used as a timer source.
 
-   promesa keeps a separate scheduled executor; here the pool IS the timer source -- Asio's
-   io_context owns both the work queue and the steady_timers -- so this is `fixed-executor`
-   under promesa's name."
+   promesa keeps a separate scheduled executor; here every pool carries its own timer
+   thread, so this is `fixed-executor` under promesa's name."
   ([] (scheduled-executor {}))
   ([options] (fixed-executor options)))
 
 (defn forkjoin-executor
   "A pool, under promesa's name for its ForkJoinPool.
 
-   Named for source compatibility only. It does NOT work-steal: Asio's io_context is a
-   single shared FIFO queue that every worker pulls from, so there are no per-worker deques
-   and nothing to steal from. For the coarse tasks a promise library submits that mostly
-   does not matter, but do not reach for this expecting fork/join semantics."
+   Unlike most of the compatibility names here this one is honest: the pool underneath is
+   Taskflow's work-stealing executor, per-worker deques and all, which is the same shape as
+   the ForkJoinPool promesa uses on the JVM."
   ([] (forkjoin-executor {}))
   ([options] (fixed-executor options)))
 
 (defn work-stealing-executor
-  "Alias of forkjoin-executor -- which, as its docstring says, does not actually steal."
+  "Alias of forkjoin-executor."
   ([] (forkjoin-executor {}))
   ([options] (forkjoin-executor options)))
 
@@ -145,19 +136,17 @@
   [executor]
   (when (= :pool (::kind executor))
     (reset! (::shut executor) true)
-    (impl/drain! (::pool executor))
-    (doseq [w (::workers executor)]
-      (deref w)))
+    (impl/drain! (::pool executor)))
   nil)
 
 (defn shutdown-now
-  "Stops a pool immediately, abandoning queued work. Blocks until workers exit."
+  "Stops a pool without waiting on its pending timers, then blocks until its workers are
+   idle. Work already handed to the pool still runs: Taskflow cannot recall a submitted
+   task, so unlike Asio this does not drop the queue."
   [executor]
   (when (= :pool (::kind executor))
     (reset! (::shut executor) true)
-    (impl/stop! (::pool executor))
-    (doseq [w (::workers executor)]
-      (deref w)))
+    (impl/stop! (::pool executor)))
   nil)
 
 (defn shutdown?
@@ -295,8 +284,8 @@
 (defn schedule
   "Runs a zero-arity function after ms milliseconds and returns a promise of its value.
 
-   Timing comes from Asio's steady_timer, so there is no polling and no timer thread of our
-   own. Scheduled work is never cancelled at the timer; Yakusoku cancels at the promise
+   Each pool carries a timer thread that sleeps until the earliest deadline, so there is no
+   polling. Scheduled work is never cancelled at the timer; Yakusoku cancels at the promise
    instead, and the callback finds it already settled and does nothing."
   ([ms f] (schedule (resolve-executor) ms f))
   ([executor ms f]
