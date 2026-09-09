@@ -13,4 +13,4 @@ else
 fi
 
 echo -n "-I ${tf_include} -I ${root}/native "
-echo -n "-L ${root}/target/native -l yakusoku-asio"
+echo -n "-L ${root}/target/native -l yakusoku-pool"

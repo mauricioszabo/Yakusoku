@@ -35,6 +35,6 @@ mkdir -p "$out"
 "$cxx" -std=c++20 -fPIC -O2 -w -I "$tf_include" -I "${root}/native" \
   -c "${root}/native/yakusoku_pool.cpp" -o "${out}/yakusoku_pool.o"
 
-"$cxx" -shared -fPIC -o "${out}/libyakusoku-asio.so" "${out}/yakusoku_pool.o" -lpthread
+"$cxx" -shared -fPIC -o "${out}/libyakusoku-pool.so" "${out}/yakusoku_pool.o" -lpthread
 
-echo "built ${out}/libyakusoku-asio.so (taskflow headers: ${tf_include})"
+echo "built ${out}/libyakusoku-pool.so (taskflow headers: ${tf_include})"
