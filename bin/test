@@ -3,7 +3,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-[ -f "${root}/target/native/libyakusoku-asio.so" ] || "${root}/bin/build-native"
+[ -f "${root}/target/native/libyakusoku-pool.so" ] || "${root}/bin/build-native"
 
 exec jank run $("${root}/bin/jank-flags") \
   --module-path "${root}/src:${root}/test" \
