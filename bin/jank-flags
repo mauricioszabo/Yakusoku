@@ -5,4 +5,4 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo -n "-I ${root}/native "
-echo -n "-L ${root}/target/native -l yakusoku-asio"
+echo -n "-L ${root}/target/native -l yakusoku-pool"

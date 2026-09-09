@@ -1,17 +1,19 @@
-;; jank's build system runs this script with Babashka before compiling the project. Its
-;; two jobs: build the Asio support library into the out directory, and print the flags
-;; jank needs in order to compile against it.
+;; jank's build system runs this script with Babashka before compiling the project -- both
+;; when building Yakusoku itself and, crucially, when building a project that merely
+;; *depends* on Yakusoku. Its two jobs: compile the native pool backend into the out
+;; directory, and print the flags jank needs in order to compile and link against it.
 ;;
-;; Why a build step at all, when Asio is header-only? Because jank's incremental C++
-;; parser rejects asio/impl/cancellation_signal.ipp ("'auto_delete_helper' is a private
-;; member of 'asio::cancellation_slot'") which ordinary Clang accepts. Compiling Asio
-;; ahead of time in ASIO_SEPARATE_COMPILATION mode keeps those .ipp files away from the
-;; JIT entirely, and has the happy side effect of cutting load time, since the JIT then
-;; parses only declarations.
+;; This is the only thing standing between a consumer and
+;;
+;;   JIT session error: Symbols not found: [ _ZN8yakusoku7backend8pool_newEj, ... ]
+;;
+;; Everything Taskflow/oneTBB/FastQueue-facing lives in native/yakusoku_pool.cpp, declared
+;; but not defined in the header jank parses. A consumer therefore has to compile that file
+;; too, and nothing else does it for them: bin/build-native only serves this repository's
+;; own test and benchmark runs.
 
 (require '[babashka.fs :as fs]
-         '[babashka.process :refer [shell]]
-         '[clojure.string :as str])
+         '[babashka.process :refer [shell]])
 
 (def input *input*)
 (def src-dir (:src-dir input))
@@ -31,45 +33,40 @@
     (or (some (fn [c] (when (fs/executable? c) (str c))) candidates)
         "c++")))
 
-(defn- find-asio
-  "Prefers a vendored Asio, then the usual system locations (libasio-dev, homebrew, nix)."
+(defn- find-tbb
+  "oneTBB comes from the system; there is no vendored copy to fall back on."
   []
-  (let [candidates [(fs/path src-dir "third-party" "asio" "asio" "include")
-                    "/usr/local/include"
-                    "/opt/homebrew/include"
-                    "/usr/include"]]
-    (or (some (fn [dir] (when (fs/exists? (fs/path dir "asio.hpp")) (str dir))) candidates)
-        (throw (ex-info (str "Standalone Asio not found. Install it (Debian/Ubuntu: "
-                             "apt install libasio-dev, macOS: brew install asio) or vendor "
-                             "it at third-party/asio.")
+  (let [candidates ["/usr/include" "/usr/local/include" "/opt/homebrew/include"]]
+    (or (some (fn [dir] (when (fs/exists? (fs/path dir "oneapi" "tbb" "task_arena.h")) (str dir)))
+              candidates)
+        (throw (ex-info (str "oneTBB not found. Install it (Debian/Ubuntu: apt install "
+                             "libtbb-dev, macOS: brew install tbb).")
                         {:searched candidates})))))
 
-(let [asio-include (find-asio)
+(let [tbb-include (find-tbb)
       clang (find-clang)
-      src (fs/path out-dir "asio_src.cpp")
-      obj (fs/path out-dir "asio_src.o")
-      lib (fs/path out-dir "libyakusoku-asio.a")
-      defines ["-DASIO_STANDALONE" "-DASIO_NO_DEPRECATED" "-DASIO_SEPARATE_COMPILATION"]]
+      native (fs/path src-dir "native")
+      src (fs/path native "yakusoku_pool.cpp")
+      obj (fs/path out-dir "yakusoku_pool.o")
+      lib (fs/path out-dir "libyakusoku-pool.a")]
 
   (fs/create-dirs out-dir)
-  (spit (str src) "#include <asio/impl/src.hpp>\n")
 
   (apply shell clang (concat ["-std=c++20" "-fPIC" "-w" (str "-O" optimization-level)]
-                             defines
-                             ["-I" asio-include "-c" (str src) "-o" (str obj)]))
+                             ["-I" tbb-include "-I" (str native)
+                              "-c" (str src) "-o" (str obj)]))
   (shell "ar" "rcs" (str lib) (str obj))
 
-  ;; Flags for jank itself. The defines matter as much as the paths: without
-  ;; ASIO_SEPARATE_COMPILATION the JIT would pull in the .ipp files and fail.
-  (doseq [d defines]
-    (println (str "jank-build::define=" (subs d 2))))
-  (println (str "jank-build::include-dir=" asio-include))
-  (println (str "jank-build::include-dir=" (fs/path src-dir "native")))
+  ;; jank never parses oneTBB -- it only ever sees the three declarations in
+  ;; native/yakusoku_pool.hpp -- so no oneTBB include dir is published here. Only the
+  ;; project's own native directory is.
+  (println (str "jank-build::include-dir=" native))
   (println (str "jank-build::link-dir=" out-dir))
-  (println "jank-build::link-library=yakusoku-asio")
+  (println "jank-build::link-library=yakusoku-pool")
+  (println "jank-build::link-library=tbb")
   (println "jank-build::link-library=pthread")
 
   ;; Only the native layer affects this build; leave the jank sources out of it so an
-  ;; edit to core.jank does not trigger an Asio rebuild.
+  ;; edit to core.jank does not trigger a rebuild of the backend.
   (println "jank-build::rerun-if-changed=native")
   (println "jank-build::rerun-if-changed=jank-build.bb"))

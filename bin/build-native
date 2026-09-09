@@ -21,6 +21,6 @@ mkdir -p "$out"
 "$cxx" -std=c++20 -fPIC -O2 -w -I "${root}/native" \
   -c "${root}/native/yakusoku_pool.cpp" -o "${out}/yakusoku_pool.o"
 
-"$cxx" -shared -fPIC -o "${out}/libyakusoku-asio.so" "${out}/yakusoku_pool.o" -ltbb -lpthread
+"$cxx" -shared -fPIC -o "${out}/libyakusoku-pool.so" "${out}/yakusoku_pool.o" -ltbb -lpthread
 
-echo "built ${out}/libyakusoku-asio.so (oneTBB)"
+echo "built ${out}/libyakusoku-pool.so (oneTBB)"
