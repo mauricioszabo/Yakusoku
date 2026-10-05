@@ -94,7 +94,7 @@
   [_err]
   nil)
 
-(defn datafy-processor-error [^Throwable err]
+(defn datafy-processor-error [err]
   {::error-message (ex-message err)
    ::error-data    (ex-data err)
    ::error-stack   (error-stack err)})
